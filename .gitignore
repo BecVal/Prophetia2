@@ -1,0 +1,45 @@
+# Directorios de datos (No subir archivos masivos, CSVs, Parquet, etc.)
+data/raw/
+data/processed/
+*.parquet
+*.csv
+*.json
+
+# Entornos Virtuales y Variables de Entorno
+.env
+venv/
+env/
+.venv/
+
+# Carpeta de agentes
+.agents/
+
+# Archivos de Python y basura del sistema
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Archivos de SO
+.DS_Store
+Thumbs.db
