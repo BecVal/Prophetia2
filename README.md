@@ -42,7 +42,21 @@ Una vez procesados los datos, proceda a entrenar el modelo XGBoost:
 ```bash
 python core/train.py
 ```
-Este proceso dividira los datos, entrenara el algoritmo y evaluara el Log-Loss. Al finalizar, guardara el modelo matematico compilado (`prophetia_xgb_model.pkl`) en el directorio `core/save_models/`.
+Este proceso dividirá los datos, aplicará selección de características y entrenará un ensamble de algoritmos (VotingClassifier combinando XGBoost y Regresión Logística). Al finalizar, guardará el modelo matemático compilado (`prophetia_xgb_model.pkl`) en el directorio `core/save_models/`.
+
+**¿Qué datos entran al modelo? (Inputs)**
+El modelo consume un array de estadísticas tácticas en formato de *media móvil* (promedio de los últimos 3 partidos) para evitar fugas de datos. Entre las métricas principales ingresan:
+- **Tácticas Base:** Goles esperados (`xg_created`, `xg_conceded`), tiros a puerta, córners, posesión y precisión de pases.
+- **Acciones Defensivas:** Presiones, intercepciones, faltas cometidas y recuperaciones.
+- **Contexto Avanzado:** Días de descanso (`rest_days`) y la **Fuerza Relativa de Ataque** (una métrica que cruza la capacidad ofensiva propia contra la solidez defensiva reciente del oponente).
+
+*Nota: Internamente, el sistema usa `SelectFromModel` para filtrar automáticamente el ruido y quedarse solo con las métricas más predictivas.*
+
+**¿Qué datos expulsa el modelo? (Outputs)**
+En lugar de dar un resultado seco (ej. "Gana el Local"), el modelo expulsa **probabilidades calibradas** (Soft Probabilities) para las tres clases posibles:
+- Probabilidad de Victoria Local (ej. 60.5%)
+- Probabilidad de Empate (ej. 24.5%)
+- Probabilidad de Derrota / Victoria Visitante (ej. 15.0%)
 
 ### 3. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
 El analisis interactivo y las predicciones individuales se gestionan a traves de Jupyter Notebooks. Inicie su servidor de Jupyter:

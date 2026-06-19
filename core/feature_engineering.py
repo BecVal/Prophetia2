@@ -231,6 +231,38 @@ def add_rolling_features(df, window_size=3):
     df = df.sort_values('match_date').reset_index(drop=True)
     return df
 
+def add_contextual_features(df):
+    logger.info("Calculando variables contextuales (Días de descanso y Fuerza del oponente)...")
+    
+    # 1. Días de descanso
+    df = df.sort_values(['team', 'match_date']).reset_index(drop=True)
+    df['rest_days'] = df.groupby('team')['match_date'].diff().dt.days
+    df['rest_days'] = df['rest_days'].fillna(7.0) # Promedio semanal si es el primer partido
+    
+    # 2. Fuerza del Oponente (Traer el historial 'rolling' del rival)
+    rolling_cols = [c for c in df.columns if c.endswith('_rolling')]
+    opp_df = df[['team', 'match_date'] + rolling_cols].copy()
+    
+    # Renombrar columnas para el oponente
+    opp_rename = {c: f"opp_{c}" for c in rolling_cols}
+    opp_rename['team'] = 'opponent'
+    opp_df = opp_df.rename(columns=opp_rename)
+    
+    # Merge con el dataset principal
+    df = pd.merge(df, opp_df, on=['opponent', 'match_date'], how='left')
+    
+    # Rellenar nulos de oponentes nuevos
+    for c in opp_rename.values():
+        if c != 'opponent':
+            df[c] = df[c].fillna(0)
+            
+    # Opcional: Crear métricas de fuerza relativa (Ej: Mi ataque vs Su defensa)
+    if 'xg_created_rolling' in df.columns and 'opp_xg_conceded_rolling' in df.columns:
+        df['relative_attack_strength'] = df['xg_created_rolling'] - df['opp_xg_conceded_rolling']
+        
+    df = df.sort_values('match_date').reset_index(drop=True)
+    return df
+
 def build_processed_dataset():
     if not os.path.exists(MATCHES_METADATA_PATH):
         logger.error(f"No se encontró el archivo de partidos en: {MATCHES_METADATA_PATH}")
@@ -260,6 +292,9 @@ def build_processed_dataset():
     
     # Aplicar promedios móviles históricos (Fase 1)
     final_df = add_rolling_features(final_df, window_size=3)
+    
+    # Añadir contexto competitivo (Descanso y fuerza del rival)
+    final_df = add_contextual_features(final_df)
     
     # Crear directorio si no existe
     processed_dir = os.path.dirname(OUTPUT_PATH)
