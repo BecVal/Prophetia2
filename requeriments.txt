@@ -1,3 +1,9 @@
 statsbombpy
 pandas
 fastparquet
+scikit-learn
+joblib
+matplotlib
+seaborn
+ipywidgets
+xgboost

@@ -37,6 +37,9 @@ def ingest_champions_league_data(limit=None):
     
     total_matches_downloaded = 0
     
+    # Lista para almacenar los metadatos de todos los partidos
+    all_matches_list = []
+    
     # Iterar sobre las temporadas de la Champions
     for _, comp_row in cl_competitions.iterrows():
         if limit and total_matches_downloaded >= limit:
@@ -50,6 +53,7 @@ def ingest_champions_league_data(limit=None):
         
         try:
             matches = sb.matches(competition_id=comp_id, season_id=season_id)
+            all_matches_list.append(matches)
         except Exception as e:
             logger.error(f"Error obteniendo partidos para la temporada {season_name}: {e}")
             continue
@@ -92,6 +96,20 @@ def ingest_champions_league_data(limit=None):
             except Exception as e:
                 logger.error(f"  Error descargando/guardando partido {match_id}: {e}")
                 
+    # Guardar metadatos consolidados de los partidos
+    if all_matches_list:
+        logger.info("Guardando metadatos consolidados de los partidos...")
+        all_matches_df = pd.concat(all_matches_list, ignore_index=True)
+        
+        # Convertir columnas anidadas (ej. managers) a string para Parquet
+        for col in all_matches_df.columns:
+            if all_matches_df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                all_matches_df[col] = all_matches_df[col].astype(str)
+                
+        matches_output_path = '../data/raw/statsbomb/matches.parquet'
+        all_matches_df.to_parquet(matches_output_path, engine='fastparquet', index=False)
+        logger.info(f"Metadatos guardados con éxito en: {matches_output_path}")
+        
     logger.info(f"Ingesta finalizada. Se descargaron eventos de {total_matches_downloaded} partidos nuevos.")
 
 if __name__ == "__main__":
