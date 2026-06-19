@@ -5,6 +5,7 @@ import logging
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
 from sklearn.feature_selection import SelectFromModel
 from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import VotingClassifier
 from xgboost import XGBClassifier
@@ -21,6 +22,54 @@ DATASET_PATH = '../data/processed/matches_dataset.parquet'
 MODEL_SAVE_DIR = '../core/save_models/'
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'prophetia_rf_model.pkl')
 
+FEATURE_DESCRIPTIONS = {
+    'is_home': "Ventaja de localía (1 si juega en su estadio, 0 si es visitante).",
+    'rest_days': "Días de descanso desde el último partido jugado.",
+    'relative_attack_strength': "Fuerza relativa de ataque (xG a favor vs xG en contra del rival).",
+    'team_elo': "Calidad histórica del equipo según el sistema de puntuación ELO.",
+    'opp_elo': "Calidad histórica del equipo rival (ELO).",
+    'elo_diff': "Diferencia de ELO (Ventaja matemática sobre el rival antes del partido).",
+}
+
+def get_feature_description(feat_name):
+    if feat_name in FEATURE_DESCRIPTIONS:
+        return FEATURE_DESCRIPTIONS[feat_name]
+    
+    base_name = feat_name.replace('_ema3', '').replace('_ema5', '')
+    span = "Tendencia reciente (últimos 3 partidos)" if "_ema3" in feat_name else "Tendencia a mediano plazo (últimos 5 partidos)"
+    
+    base_desc = {
+        'xg_created': "Goles Esperados (xG) generados",
+        'xg_conceded': "Goles Esperados (xG) concedidos",
+        'shots_total': "Tiros totales realizados",
+        'shots_on_target': "Tiros a puerta",
+        'passes_total': "Volumen total de pases intentados",
+        'passes_completed': "Pases completados con éxito",
+        'pass_accuracy': "Precisión de pases (% de acierto)",
+        'possession_pct': "Dominio de posesión del balón",
+        'crosses': "Centros al área",
+        'corners': "Tiros de esquina provocados",
+        'through_balls': "Pases filtrados (rompe-líneas)",
+        'key_passes': "Pases clave que terminan en tiro",
+        'dribbles_completed': "Regates completados",
+        'pressures': "Presión ejercida sobre el rival",
+        'interceptions': "Intercepciones tácticas (cortes de pase)",
+        'clearances': "Despejes defensivos",
+        'blocks': "Tiros o pases bloqueados",
+        'ball_recoveries': "Recuperaciones de balón",
+        'actions_under_pressure': "Acciones exitosas bajo presión rival",
+        'fouls_committed': "Faltas tácticas o agresivas cometidas",
+        'fouls_won': "Faltas recibidas",
+        'yellow_cards': "Tarjetas amarillas acumuladas",
+        'red_cards': "Expulsiones",
+        'aerials_won': "Duelos aéreos ganados"
+    }
+    
+    if base_name in base_desc:
+        return f"{base_desc[base_name]} - {span}"
+    
+    return "Métrica táctica avanzada."
+
 
 def train_model():
     if not os.path.exists(DATASET_PATH):
@@ -33,37 +82,19 @@ def train_model():
     logger.info(f"Dimensiones del dataset: {df.shape}")
 
     # Definir las variables independientes (Features - X)
-    # NOTA: Para este MVP (36 filas) usamos las estadísticas del propio partido
-    # para clasificar el resultado. En producción usaremos promedios móviles
-    # históricos.
-    feature_cols = [
-        'is_home',
-        'xg_created_rolling',
-        'xg_conceded_rolling',
-        'shots_total_rolling',
-        'shots_on_target_rolling',
-        'passes_total_rolling',
-        'passes_completed_rolling',
-        'pass_accuracy_rolling',
-        'possession_pct_rolling',
-        'crosses_rolling',
-        'corners_rolling',
-        'through_balls_rolling',
-        'key_passes_rolling',
-        'dribbles_completed_rolling',
-        'pressures_rolling',
-        'interceptions_rolling',
-        'clearances_rolling',
-        'blocks_rolling',
-        'ball_recoveries_rolling',
-        'actions_under_pressure_rolling',
-        'fouls_committed_rolling',
-        'fouls_won_rolling',
-        'yellow_cards_rolling',
-        'red_cards_rolling',
-        'aerials_won_rolling',
-        'rest_days',
-        'relative_attack_strength']
+    base_stats = [
+        'xg_created', 'xg_conceded', 'shots_total', 'shots_on_target',
+        'passes_total', 'passes_completed', 'pass_accuracy', 'possession_pct',
+        'crosses', 'corners', 'through_balls', 'key_passes',
+        'dribbles_completed', 'pressures', 'interceptions', 'clearances',
+        'blocks', 'ball_recoveries', 'actions_under_pressure',
+        'fouls_committed', 'fouls_won', 'yellow_cards', 'red_cards',
+        'aerials_won']
+        
+    feature_cols = ['is_home', 'rest_days', 'relative_attack_strength', 'team_elo', 'opp_elo', 'elo_diff']
+    for stat in base_stats:
+        feature_cols.append(f"{stat}_ema3")
+        feature_cols.append(f"{stat}_ema5")
 
     # Verificar que todas las columnas existan
     missing_cols = [c for c in feature_cols if c not in df.columns]
@@ -91,19 +122,22 @@ def train_model():
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
+    teams_test = df['team'].iloc[split_idx:]
+    opponents_test = df['opponent'].iloc[split_idx:]
+
     logger.info(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
 
     # Definir validación cruzada (StratifiedKFold para dataset pequeño)
     cv_strategy = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 
-    # Definir la grilla de hiperparámetros
+    # Definir la grilla de hiperparámetros (Simplificada para evitar overfitting)
     param_grid = {
-        'max_depth': [3, 5, 7],
+        'max_depth': [2, 3],
         'learning_rate': [0.01, 0.05, 0.1],
-        'n_estimators': [50, 100, 200],
+        'n_estimators': [50, 100],
         'subsample': [0.8, 1.0],
         'colsample_bytree': [0.8, 1.0],
-        'min_child_weight': [1, 3, 5]
+        'min_child_weight': [3, 5]
     }
 
     xgb_base = XGBClassifier(
@@ -168,7 +202,12 @@ def train_model():
         # Fallback
         voting_clf.fit(X_train_sel, y_train)
 
-    final_model = voting_clf
+    logger.info("Aplicando Calibración Probabilística (Platt Scaling)...")
+    # Usaremos el cv_strategy definido arriba para asegurar que los folds tengan todas las clases.
+    calibrated_clf = CalibratedClassifierCV(estimator=voting_clf, method='sigmoid', cv=cv_strategy)
+    calibrated_clf.fit(X_train_sel, y_train)
+
+    final_model = calibrated_clf
 
     # Evaluar
     y_pred = final_model.predict(X_test_sel)
@@ -184,7 +223,47 @@ def train_model():
     logger.info(f"Accuracy Global: {acc:.2f}")
     logger.info(f"Log-Loss (Cuanto más bajo, mejor): {loss:.4f}")
 
-    logger.info("--- Muestra de Probabilidades (Test Set) ---")
+    logger.info("--- Muestra de Predicciones (Set de Prueba) ---")
+    logger.info("Interpretación de Clases: 0 = Derrota Local (o Victoria Visitante), 1 = Empate, 2 = Victoria Local")
+    for i in range(min(5, len(y_test))):
+        p_loss, p_draw, p_win = y_prob[i]
+        real = y_test.iloc[i]
+        
+        team_name = teams_test.iloc[i]
+        opp_name = opponents_test.iloc[i]
+        is_home_flag = X_test['is_home'].iloc[i]
+        
+        if is_home_flag == 1:
+            local = team_name
+            visitante = opp_name
+        else:
+            local = opp_name
+            visitante = team_name
+
+        real_str = f"Victoria {team_name}" if real == 2 else "Empate" if real == 1 else f"Victoria {opp_name}"
+        
+        logger.info(f"Partido {i+1}: {local} (Local) vs {visitante} (Visitante)")
+        logger.info(f"  -> Prob. Victoria {team_name}: {p_win*100:5.1f}%")
+        logger.info(f"  -> Prob. Empate:         {p_draw*100:5.1f}%")
+        logger.info(f"  -> Prob. Victoria {opp_name}: {p_loss*100:5.1f}%")
+        logger.info(f"  => Resultado Real: {real_str} (Clase {real})\n")
+
+    # Feature Importance Final
+    logger.info("=== IMPORTANCIA DE CARACTERÍSTICAS (Base XGBoost) ===")
+    logger.info("¿Qué variables consideró más importantes el modelo para tomar sus decisiones?")
+    
+    importances = best_xgb.feature_importances_
+    sel_importances = importances[selected_mask]
+    indices = np.argsort(sel_importances)[::-1]
+
+    for i in range(len(selected_features)):
+        feat_name = selected_features[indices[i]]
+        feat_imp = sel_importances[indices[i]]
+        desc = get_feature_description(feat_name)
+        logger.info(f"{i + 1}. {feat_name} (Importancia: {feat_imp:.4f})")
+        logger.info(f"   ↳ {desc}")
+
+    logger.info("=== RESULTADOS TÉCNICOS ===")
     logger.info("Derrota% | Empate% | Victoria%  -> Realidad (0=D, 1=E, 2=V)")
     for i in range(min(5, len(y_test))):
         p_loss, p_draw, p_win = y_prob[i]
@@ -192,21 +271,6 @@ def train_model():
         msg = (f"{p_loss*100:6.1f}% | {p_draw*100:6.1f}% | "
                f"{p_win*100:6.1f}%     -> Clase {real}")
         logger.info(msg)
-
-    # Feature Importance Final (Extraído del mejor XGBoost base ya que el
-    # calibrador/ensamble oculta esto)
-    logger.info("=== IMPORTANCIA DE CARACTERÍSTICAS (Base XGBoost) ===")
-    importances = best_xgb.feature_importances_
-    # Ojo: importances es del modelo pre-selección (27 features)
-    # Tenemos que mapearlo
-    # Solo mostramos las seleccionadas
-    sel_importances = importances[selected_mask]
-    indices = np.argsort(sel_importances)[::-1]
-
-    for i in range(len(selected_features)):
-        feat_name = selected_features[indices[i]]
-        feat_imp = sel_importances[indices[i]]
-        logger.info(f"{i + 1}. {feat_name}: {feat_imp:.4f}")
 
     # Guardar el modelo
     if not os.path.exists(MODEL_SAVE_DIR):

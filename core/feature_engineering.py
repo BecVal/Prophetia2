@@ -255,9 +255,9 @@ def process_match(row):
     return rows
 
 
-def add_rolling_features(df, window_size=3):
+def add_ema_features(df, spans=[3, 5]):
     logger.info(
-        f"Calculando promedios móviles históricos (ventana={window_size}) para evitar Data Leakage...")
+        f"Calculando EMA históricos (spans={spans}) para evitar Data Leakage...")
     df = df.sort_values(['team', 'match_date']).reset_index(drop=True)
 
     stats_cols = [
@@ -289,13 +289,73 @@ def add_rolling_features(df, window_size=3):
     roll_cols = [c for c in stats_cols if c in df.columns]
 
     for col in roll_cols:
-        # shift(1) asegura que NO usemos los datos del partido que estamos
-        # prediciendo (Fix Data Leakage)
-        df[f'{col}_rolling'] = df.groupby('team')[col].transform(
-            lambda x: x.shift(1).rolling(window=window_size, min_periods=1).mean()
-        )
+        for span in spans:
+            # shift(1) asegura que NO usemos los datos del partido actual (Fix Data Leakage)
+            df[f'{col}_ema{span}'] = df.groupby('team')[col].transform(
+                lambda x: x.shift(1).ewm(span=span, min_periods=1).mean()
+            )
 
     df = df.sort_values('match_date').reset_index(drop=True)
+    return df
+
+def calculate_expected_score(rating_a, rating_b):
+    """Calcula la probabilidad esperada de victoria para el equipo A frente al B."""
+    return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+
+def update_elo(rating, expected_score, actual_score, k_factor=30):
+    """Actualiza el ELO según el resultado."""
+    return rating + k_factor * (actual_score - expected_score)
+
+def add_elo_ratings(df):
+    logger.info("Calculando ELO ratings secuenciales...")
+    # Asegurar que esté ordenado cronológicamente
+    df = df.sort_values('match_date').reset_index(drop=True)
+    
+    elo_dict = {}  # {team_name: elo}
+    
+    # Necesitamos iterar por partido (2 filas por partido en el df)
+    match_ids = df['match_id'].unique()
+    
+    for match_id in match_ids:
+        match_rows = df[df['match_id'] == match_id]
+        if len(match_rows) != 2:
+            continue # Salto si hay un error en los datos
+            
+        row1 = match_rows.iloc[0]
+        row2 = match_rows.iloc[1]
+        
+        team1 = row1['team']
+        team2 = row2['team']
+        
+        # Inicializar en 1500 si no existe
+        if team1 not in elo_dict:
+            elo_dict[team1] = 1500.0
+        if team2 not in elo_dict:
+            elo_dict[team2] = 1500.0
+            
+        elo1_pre = elo_dict[team1]
+        elo2_pre = elo_dict[team2]
+        
+        # Determinar puntuación real (1 victoria, 0.5 empate, 0 derrota)
+        outcome1 = row1['outcome'] # 1, 0, -1
+        if outcome1 == 1:
+            score1, score2 = 1.0, 0.0
+        elif outcome1 == -1:
+            score1, score2 = 0.0, 1.0
+        else:
+            score1, score2 = 0.5, 0.5
+            
+        exp1 = calculate_expected_score(elo1_pre, elo2_pre)
+        exp2 = calculate_expected_score(elo2_pre, elo1_pre)
+        
+        elo_dict[team1] = update_elo(elo1_pre, exp1, score1)
+        elo_dict[team2] = update_elo(elo2_pre, exp2, score2)
+        
+        # Guardamos para asignar al df original
+        df.loc[df['match_id'] == match_id, 'team_elo'] = [elo1_pre, elo2_pre]
+        df.loc[df['match_id'] == match_id, 'opp_elo'] = [elo2_pre, elo1_pre]
+        df.loc[df['match_id'] == match_id, 'elo_diff'] = [elo1_pre - elo2_pre, elo2_pre - elo1_pre]
+
     return df
 
 
@@ -309,12 +369,12 @@ def add_contextual_features(df):
     # Promedio semanal si es el primer partido
     df['rest_days'] = df['rest_days'].fillna(7.0)
 
-    # 2. Fuerza del Oponente (Traer el historial 'rolling' del rival)
-    rolling_cols = [c for c in df.columns if c.endswith('_rolling')]
-    opp_df = df[['team', 'match_date'] + rolling_cols].copy()
+    # 2. Fuerza del Oponente (Traer el historial 'ema' del rival)
+    ema_cols = [c for c in df.columns if '_ema' in c]
+    opp_df = df[['team', 'match_date'] + ema_cols].copy()
 
     # Renombrar columnas para el oponente
-    opp_rename = {c: f"opp_{c}" for c in rolling_cols}
+    opp_rename = {c: f"opp_{c}" for c in ema_cols}
     opp_rename['team'] = 'opponent'
     opp_df = opp_df.rename(columns=opp_rename)
 
@@ -326,10 +386,10 @@ def add_contextual_features(df):
         if c != 'opponent':
             df[c] = df[c].fillna(0)
 
-    # Opcional: Crear métricas de fuerza relativa (Ej: Mi ataque vs Su defensa)
-    if 'xg_created_rolling' in df.columns and 'opp_xg_conceded_rolling' in df.columns:
-        df['relative_attack_strength'] = df['xg_created_rolling'] - \
-            df['opp_xg_conceded_rolling']
+    # Opcional: Crear métricas de fuerza relativa (Ej: Mi ataque vs Su defensa usando EMA3)
+    if 'xg_created_ema3' in df.columns and 'opp_xg_conceded_ema3' in df.columns:
+        df['relative_attack_strength'] = df['xg_created_ema3'] - \
+            df['opp_xg_conceded_ema3']
 
     df = df.sort_values('match_date').reset_index(drop=True)
     return df
@@ -368,8 +428,11 @@ def build_processed_dataset():
     final_df['match_date'] = pd.to_datetime(final_df['match_date'])
     final_df = final_df.sort_values('match_date').reset_index(drop=True)
 
-    # Aplicar promedios móviles históricos (Fase 1)
-    final_df = add_rolling_features(final_df, window_size=3)
+    # Aplicar promedios exponenciales (EMA)
+    final_df = add_ema_features(final_df, spans=[3, 5])
+    
+    # Calcular ELO ratings
+    final_df = add_elo_ratings(final_df)
 
     # Añadir contexto competitivo (Descanso y fuerza del rival)
     final_df = add_contextual_features(final_df)
@@ -391,10 +454,10 @@ def build_processed_dataset():
         'team',
         'is_home',
         'xg_created',
-        'xg_created_rolling',
-        'corners_rolling',
+        'xg_created_ema3',
+        'team_elo',
         'outcome']
-    print("\nMuestra del dataset con variables históricas (rolling):")
+    print("\nMuestra del dataset con variables EMA y ELO:")
     print(final_df[cols_to_show].head(4))
 
 
