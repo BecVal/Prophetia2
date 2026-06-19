@@ -30,19 +30,26 @@ python ingestion/statsbomb_ingestion.py
 ```
 *Nota sobre el almacenamiento:* Los datos se guardan en formato `.parquet`, que es altamente comprimido. Descargar una buena cantidad de partidos (cientos o miles) ocupara aproximadamente entre **500 MB y 1.5 GB** de espacio en tu disco duro, dependiendo de las competiciones habilitadas en el script.
 
-### 1. Procesamiento de Datos (Feature Engineering)
-Antes de entrenar o predecir, es necesario transformar los eventos crudos en estadisticas consolidadas sin fuga de datos. Ejecute el siguiente script desde la raiz del proyecto:
+### 1. Adaptacion de Datos (Data Adapter)
+Para permitir que Prophetia2 consuma diferentes fuentes de datos (StatsBomb, Understat, football-data, etc.), primero debes estandarizar los eventos crudos en un DataFrame Intermedio Universal. Ejecuta el adaptador:
+```bash
+python core/data_adapter.py
+```
+Este script leera los archivos especificos de tu proveedor de datos (por defecto StatsBomb) y generara un dataset intermedio tabular unificado en `data/interim/intermediate_dataset.parquet`.
+
+### 2. Procesamiento Matematico (Feature Engineering)
+Una vez estandarizados los datos base, el motor de Prophetia2 debe calcular las estadisticas tacticas avanzadas en series temporales (Rolling Averages) y el sistema de rating de calidad de los equipos (ELO) sin fuga de datos. Ejecute el siguiente script:
 ```bash
 python core/feature_engineering.py
 ```
-Este script leera los archivos `.parquet` descargados de StatsBomb, calculara los promedios moviles para cada equipo, y generara el dataset de entrenamiento en la carpeta `data/processed/`.
+Este script consumira el dataset intermedio universal y generara el dataset final de entrenamiento listo para la IA en la carpeta `data/processed/matches_dataset.parquet`.
 
-### 2. Entrenamiento del Modelo de IA
+### 3. Entrenamiento del Modelo de IA
 Una vez procesados los datos, proceda a entrenar el modelo XGBoost:
 ```bash
 python core/train.py
 ```
-Este proceso dividirá los datos, aplicará selección de características y entrenará un ensamble de algoritmos (VotingClassifier combinando XGBoost y Regresión Logística). Al finalizar, guardará el modelo matemático compilado (`prophetia_xgb_model.pkl`) en el directorio `core/save_models/`.
+Este proceso dividira los datos, aplicara seleccion automatica de caracteristicas (Feature Selection) con aceleracion por GPU (CUDA) y entrenara un ensamble de algoritmos (VotingClassifier combinando XGBoost y Regresion Logistica). Al finalizar, guardara el modelo matematico compilado (`prophetia_xgb_model.pkl`) en el directorio `core/save_models/`.
 
 **¿Qué datos entran al modelo? (Inputs)**
 El modelo consume un array de estadísticas tácticas en formato de *media móvil* (promedio de los últimos 3 partidos) para evitar fugas de datos. Entre las métricas principales ingresan:
