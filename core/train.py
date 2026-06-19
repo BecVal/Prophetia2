@@ -143,7 +143,8 @@ def train_model():
     xgb_base = XGBClassifier(
         objective='multi:softprob',
         num_class=3,
-        random_state=42
+        random_state=42,
+        device='cuda'
     )
 
     logger.info(
@@ -184,7 +185,9 @@ def train_model():
         **random_search.best_params_,
         objective='multi:softprob',
         num_class=3,
-        random_state=42)
+        random_state=42,
+        device='cuda'
+    )
     lr_model = LogisticRegression(
         max_iter=1000,
         random_state=42,
