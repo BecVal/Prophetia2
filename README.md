@@ -49,7 +49,7 @@ Una vez procesados los datos, proceda a entrenar el modelo XGBoost:
 ```bash
 python core/train.py
 ```
-Este proceso dividira los datos, aplicara seleccion automatica de caracteristicas (Feature Selection) con aceleracion por GPU (CUDA) y entrenara un ensamble de algoritmos (VotingClassifier combinando XGBoost y Regresion Logistica). Al finalizar, guardara el modelo matematico compilado (`prophetia_xgb_model.pkl`) en el directorio `core/save_models/`.
+Este proceso dividira los datos de forma cronologica, aplicara seleccion automatica de caracteristicas sin fugas de datos (Scikit-Learn Pipelines), utilizara Optuna para buscar hiperparametros que minimicen el Log-Loss y entrenara un ensamble de algoritmos (VotingClassifier combinando XGBoost y Regresion Logistica). Al finalizar, guardara el modelo matematico compilado (`prophetia_xgb_model.pkl`) en el directorio `core/save_models/`.
 
 **¿Qué datos entran al modelo? (Inputs)**
 El modelo consume un array de estadísticas tácticas en formato de *media móvil* (promedio de los últimos 3 partidos) para evitar fugas de datos. Entre las métricas principales ingresan:
