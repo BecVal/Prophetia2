@@ -1,9 +1,16 @@
 # Directorios de datos (No subir archivos masivos, CSVs, Parquet, etc.)
 data/raw/
+data/interim/
 data/processed/
 *.parquet
 *.csv
 *.json
+
+# Modelos Entrenados (No subir pesos ni modelos masivos)
+core/save_models/
+*.pkl
+*.joblib
+*.model
 
 # Entornos Virtuales y Variables de Entorno
 .env
