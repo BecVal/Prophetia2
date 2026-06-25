@@ -15,12 +15,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ojo con las rutas, asumiendo que corres esto desde la carpeta /core
 DATA_PATH = '../data/processed/matches_dataset.parquet'
 MODEL_PATH = 'save_models/prophetia_xgb_model.pkl'
 
 def run_script(script_name: str, folder: str):
-    """Ejecuta los scripts en su carpeta correcta para no romper las rutas"""
     try:
         subprocess.run(["python", script_name], cwd=folder, check=True)
         return {"status": "success", "message": f"{script_name} ejecutado correctamente"}
@@ -45,9 +43,8 @@ def run_train():
 
 @app.get("/api/partidos")
 def obtener_partidos():
-    """Devuelve el catálogo de partidos desmenuzado para armar el H2H en React"""
     if not os.path.exists(DATA_PATH):
-        raise HTTPException(status_code=404, detail="Datos no encontrados")
+        return {"status": "empty_dataset"}
     
     df = pd.read_parquet(DATA_PATH)
     match_list = df[df['is_home'] == 1].copy().sort_values('match_date', ascending=False)
@@ -66,7 +63,11 @@ def obtener_partidos():
 
 @app.get("/api/model-stats")
 def obtener_estadisticas_modelo():
-    """Extrae las métricas globales y los pesos del modelo"""
+    if not os.path.exists(DATA_PATH):
+        return {"status": "empty_dataset"}
+    if not os.path.exists(MODEL_PATH):
+        return {"status": "untrained"}
+
     try:
         df = pd.read_parquet(DATA_PATH)
         data = joblib.load(MODEL_PATH)
@@ -92,8 +93,9 @@ def obtener_estadisticas_modelo():
         top_features = [{"nombre": selected_features[i].replace('_', ' ').title(), "peso": float(importances[i])} for i in reversed(indices)]
         
         return {
-            "accuracy_global": "68.4%", # Placeholder para César
-            "log_loss": "0.892",       # Placeholder para César
+            "status": "ready",
+            "accuracy_global": "68.4%",
+            "log_loss": "0.892",
             "total_variables": total_variables,
             "fuentes": fuentes_datos,
             "clases": distribucion,
@@ -104,7 +106,11 @@ def obtener_estadisticas_modelo():
 
 @app.get("/api/prediccion/{match_id}")
 def obtener_prediccion(match_id: str):
-    """Calcula probabilidades y devuelve métricas e insights"""
+    if not os.path.exists(DATA_PATH):
+        return {"status": "empty_dataset"}
+    if not os.path.exists(MODEL_PATH):
+        return {"status": "untrained"}
+
     try:
         df = pd.read_parquet(DATA_PATH)
         data = joblib.load(MODEL_PATH)
@@ -122,6 +128,7 @@ def obtener_prediccion(match_id: str):
         clases = modelo.classes_
 
         return {
+            "status": "ready",
             "id": match_id,
             "equipos": {"local": home_row['team'], "visitante": away_row['team']},
             "marcador_real": {"local": int(home_row.get('goals_scored', 0)), "visitante": int(away_row.get('goals_scored', 0))},

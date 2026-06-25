@@ -6,17 +6,36 @@ export function useProphetia() {
   const [cargando, setCargando] = useState(false);
   const [ejecutandoScript, setEjecutandoScript] = useState(null);
   const [modelStats, setModelStats] = useState(null);
+  const [appStatus, setAppStatus] = useState('loading'); // 'loading' | 'ready' | 'empty_dataset' | 'untrained'
 
-  const cargarDatosGlobales = () => {
-    fetch('http://127.0.0.1:8000/api/partidos')
-      .then(res => res.json())
-      .then(data => setPartidos(data))
-      .catch(err => console.error("Error cargando partidos:", err));
+  const cargarDatosGlobales = async () => {
+    try {
+      // 1. Verificar Partidos (Dataset)
+      const resPartidos = await fetch('http://127.0.0.1:8000/api/partidos');
+      const dataPartidos = await resPartidos.json();
 
-    fetch('http://127.0.0.1:8000/api/model-stats')
-      .then(res => res.json())
-      .then(data => setModelStats(data))
-      .catch(err => console.error("Error stats:", err));
+      if (dataPartidos.status === 'empty_dataset') {
+        setPartidos([]);
+        setAppStatus('empty_dataset');
+        return; // Detenemos aquí si no hay datos
+      } else {
+        setPartidos(dataPartidos);
+      }
+
+      // 2. Verificar Modelo
+      const resStats = await fetch('http://127.0.0.1:8000/api/model-stats');
+      const dataStats = await resStats.json();
+
+      if (dataStats.status === 'untrained') {
+        setModelStats(null);
+        setAppStatus('untrained');
+      } else {
+        setModelStats(dataStats);
+        setAppStatus('ready');
+      }
+    } catch (err) {
+      console.error("Error cargando estado global:", err);
+    }
   };
 
   useEffect(() => {
@@ -29,7 +48,12 @@ export function useProphetia() {
     try {
       const res = await fetch(`http://127.0.0.1:8000/api/prediccion/${id}`);
       const data = await res.json();
-      setDatosPrediccion(data);
+      
+      if (data.status === 'untrained' || data.status === 'empty_dataset') {
+        setAppStatus(data.status);
+      } else {
+        setDatosPrediccion(data);
+      }
     } catch (err) {
       console.error("Error buscando predicción:", err);
     } finally {
@@ -42,14 +66,16 @@ export function useProphetia() {
     try {
       const res = await fetch(`http://127.0.0.1:8000/api/run/${endpoint}`, { method: 'POST' });
       if (!res.ok) throw new Error("Fallo en la ejecución");
-      alert(`✅ ${nombreScript} ejecutado con éxito.`);
-      if (endpoint === 'train' || endpoint === 'features') cargarDatosGlobales();
+      
+      // Tras terminar el script, recargamos el estado global
+      await cargarDatosGlobales();
+      
     } catch (err) {
-      alert(`❌ Error al ejecutar ${nombreScript}. Revisa la consola de Python.`);
+      alert(`❌ Error al ejecutar ${nombreScript}. Revisa la consola del backend.`);
     } finally {
       setEjecutandoScript(null);
     }
   };
 
-  return { partidos, datosPrediccion, buscarPrediccion, cargando, ejecutarPipeline, ejecutandoScript, modelStats };
+  return { partidos, datosPrediccion, buscarPrediccion, cargando, ejecutarPipeline, ejecutandoScript, modelStats, appStatus };
 }
