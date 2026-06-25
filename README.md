@@ -14,10 +14,8 @@ Se recomienda utilizar un entorno virtual de Python. Para instalar las dependenc
 
 1. Clonar el repositorio.
 2. Crear y activar el entorno virtual (opcional pero recomendado).
-3. Instalar dependencias mediante pip:
-   ```bash
-   pip install -r requeriments.txt
-   ```
+3. Ejecutar el archivo dependencias.bat (Solo la primera vez).
+4. Ejecutar los archivos iniciar_backend.bat y iniciar_frontend.bat
 
 ## Flujo de Ejecucion
 
