@@ -56,66 +56,107 @@ def add_ema_features(df, spans=[3, 5]):
     df = df.sort_values('match_date').reset_index(drop=True)
     return df
 
+def calculate_expected_goals(att_rating, def_rating, is_home=True):
+    # Asumimos una base de goles ligeramente mayor para el local
+    base_goals = 1.45 if is_home else 1.15
+    return base_goals * (10 ** ((att_rating - def_rating) / 400))
+
+def update_rating(rating, expected, actual, k_factor=20):
+    # Limitamos la sorpresa para que goleadas (ej. 8-0) no rompan el sistema
+    diff = np.clip(actual - expected, -3, 3)
+    return rating + k_factor * diff
 
 def calculate_expected_score(rating_a, rating_b):
     """Calcula la probabilidad esperada de victoria para el equipo A frente al B."""
     return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
 
-
 def update_elo(rating, expected_score, actual_score, k_factor=30):
-    """Actualiza el ELO según el resultado."""
+    """Actualiza el ELO clásico según el resultado."""
     return rating + k_factor * (actual_score - expected_score)
 
-
 def add_elo_ratings(df):
-    logger.info("Calculando ELO ratings secuenciales...")
-    # Asegurar que esté ordenado cronológicamente
+    logger.info("Calculando Ratings de Ataque/Defensa y ELO Clásico...")
     df = df.sort_values('match_date').reset_index(drop=True)
     
-    elo_dict = {}  # {team_name: elo}
+    att_dict = {}  # {team_name: attack_rating}
+    def_dict = {}  # {team_name: defense_rating}
+    elo_dict = {}  # {team_name: classic_elo}
     
-    # Necesitamos iterar por partido (2 filas por partido en el df)
     match_ids = df['match_id'].unique()
     
     for match_id in match_ids:
         match_rows = df[df['match_id'] == match_id]
         if len(match_rows) != 2:
-            continue # Salto si hay un error en los datos
+            continue
             
-        row1 = match_rows.iloc[0]
-        row2 = match_rows.iloc[1]
-        
-        team1 = row1['team']
-        team2 = row2['team']
-        
-        # Inicializar en 1500 si no existe
-        if team1 not in elo_dict:
-            elo_dict[team1] = 1500.0
-        if team2 not in elo_dict:
-            elo_dict[team2] = 1500.0
-            
-        elo1_pre = elo_dict[team1]
-        elo2_pre = elo_dict[team2]
-        
-        # Determinar puntuación real (1 victoria, 0.5 empate, 0 derrota)
-        outcome1 = row1['outcome'] # 1, 0, -1
-        if outcome1 == 1:
-            score1, score2 = 1.0, 0.0
-        elif outcome1 == -1:
-            score1, score2 = 0.0, 1.0
+        # Detectar quién es local y visitante
+        if match_rows.iloc[0]['is_home'] == 1:
+            row_home, row_away = match_rows.iloc[0], match_rows.iloc[1]
         else:
-            score1, score2 = 0.5, 0.5
+            row_home, row_away = match_rows.iloc[1], match_rows.iloc[0]
             
-        exp1 = calculate_expected_score(elo1_pre, elo2_pre)
-        exp2 = calculate_expected_score(elo2_pre, elo1_pre)
+        home_team = row_home['team']
+        away_team = row_away['team']
         
-        elo_dict[team1] = update_elo(elo1_pre, exp1, score1)
-        elo_dict[team2] = update_elo(elo2_pre, exp2, score2)
+        # Inicializar en 1000/1500
+        for t in [home_team, away_team]:
+            if t not in att_dict: att_dict[t] = 1000.0
+            if t not in def_dict: def_dict[t] = 1000.0
+            if t not in elo_dict: elo_dict[t] = 1500.0
+            
+        home_att_pre = att_dict[home_team]
+        home_def_pre = def_dict[home_team]
+        away_att_pre = att_dict[away_team]
+        away_def_pre = def_dict[away_team]
         
-        # Guardamos para asignar al df original
-        df.loc[df['match_id'] == match_id, 'team_elo'] = [elo1_pre, elo2_pre]
-        df.loc[df['match_id'] == match_id, 'opp_elo'] = [elo2_pre, elo1_pre]
-        df.loc[df['match_id'] == match_id, 'elo_diff'] = [elo1_pre - elo2_pre, elo2_pre - elo1_pre]
+        home_elo_pre = elo_dict[home_team]
+        away_elo_pre = elo_dict[away_team]
+        
+        goals_home = row_home['goals_scored']
+        goals_away = row_away['goals_scored']
+        
+        # 1. Update Attack/Defense
+        exp_goals_home = calculate_expected_goals(home_att_pre, away_def_pre, is_home=True)
+        exp_goals_away = calculate_expected_goals(away_att_pre, home_def_pre, is_home=False)
+        
+        att_dict[home_team] = update_rating(home_att_pre, exp_goals_home, goals_home)
+        att_dict[away_team] = update_rating(away_att_pre, exp_goals_away, goals_away)
+        def_dict[home_team] = update_rating(home_def_pre, goals_away, exp_goals_away)
+        def_dict[away_team] = update_rating(away_def_pre, goals_home, exp_goals_home)
+        
+        # 2. Update Classic ELO
+        outcome_home = row_home['outcome'] # 1, 0, -1
+        if outcome_home == 1:
+            score_home, score_away = 1.0, 0.0
+        elif outcome_home == -1:
+            score_home, score_away = 0.0, 1.0
+        else:
+            score_home, score_away = 0.5, 0.5
+            
+        exp_elo_home = calculate_expected_score(home_elo_pre, away_elo_pre)
+        exp_elo_away = calculate_expected_score(away_elo_pre, home_elo_pre)
+        
+        elo_dict[home_team] = update_elo(home_elo_pre, exp_elo_home, score_home)
+        elo_dict[away_team] = update_elo(away_elo_pre, exp_elo_away, score_away)
+        
+        # Guardar en DF
+        # Para row_home
+        df.loc[df.index == row_home.name, 'team_att_rating'] = home_att_pre
+        df.loc[df.index == row_home.name, 'team_def_rating'] = home_def_pre
+        df.loc[df.index == row_home.name, 'opp_att_rating'] = away_att_pre
+        df.loc[df.index == row_home.name, 'opp_def_rating'] = away_def_pre
+        df.loc[df.index == row_home.name, 'team_elo'] = home_elo_pre
+        df.loc[df.index == row_home.name, 'opp_elo'] = away_elo_pre
+        df.loc[df.index == row_home.name, 'elo_diff'] = home_elo_pre - away_elo_pre
+        
+        # Para row_away
+        df.loc[df.index == row_away.name, 'team_att_rating'] = away_att_pre
+        df.loc[df.index == row_away.name, 'team_def_rating'] = away_def_pre
+        df.loc[df.index == row_away.name, 'opp_att_rating'] = home_att_pre
+        df.loc[df.index == row_away.name, 'opp_def_rating'] = home_def_pre
+        df.loc[df.index == row_away.name, 'team_elo'] = away_elo_pre
+        df.loc[df.index == row_away.name, 'opp_elo'] = home_elo_pre
+        df.loc[df.index == row_away.name, 'elo_diff'] = away_elo_pre - home_elo_pre
 
     return df
 
@@ -156,6 +197,47 @@ def add_contextual_features(df):
     return df
 
 
+def add_h2h_features(df):
+    logger.info("Calculando variables H2H (enfrentamientos directos)...")
+    df = df.sort_values('match_date').reset_index(drop=True)
+    
+    df['h2h_points'] = df['outcome'].map({1: 3, 0: 1, -1: 0})
+    
+    df['h2h_games_played'] = df.groupby(['team', 'opponent']).cumcount()
+    
+    df['h2h_points_last_5'] = df.groupby(['team', 'opponent'])['h2h_points'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).sum()
+    ).fillna(0)
+    
+    df['h2h_win_rate_hist'] = df.groupby(['team', 'opponent'])['outcome'].transform(
+        lambda x: (x.shift(1) == 1).expanding().mean()
+    ).fillna(0)
+    
+    df['h2h_draw_rate_hist'] = df.groupby(['team', 'opponent'])['outcome'].transform(
+        lambda x: (x.shift(1) == 0).expanding().mean()
+    ).fillna(0)
+    
+    df = df.drop(columns=['h2h_points'])
+    return df
+
+
+def add_advanced_fatigue(df):
+    logger.info("Calculando Fatiga Avanzada (cambio de competiciones)...")
+    df = df.sort_values(['team', 'match_date']).reset_index(drop=True)
+    
+    df['prev_competition'] = df.groupby('team')['competition'].shift(1)
+    
+    df['is_european_hangover'] = (
+        (df['competition'] != df['prev_competition']) & 
+        (df['prev_competition'].notna()) & 
+        (df['rest_days'] <= 4)
+    ).astype(int)
+    
+    df = df.drop(columns=['prev_competition'])
+    df = df.sort_values('match_date').reset_index(drop=True)
+    return df
+
+
 def build_processed_dataset():
     if not os.path.exists(INTERIM_DATASET_PATH):
         logger.error(
@@ -182,6 +264,10 @@ def build_processed_dataset():
     # Añadir contexto competitivo (Descanso y fuerza del rival)
     final_df = add_contextual_features(final_df)
 
+    # Añadir H2H y Fatiga Avanzada
+    final_df = add_h2h_features(final_df)
+    final_df = add_advanced_fatigue(final_df)
+
     # Crear directorio si no existe
     processed_dir = os.path.dirname(OUTPUT_PATH)
     os.makedirs(processed_dir, exist_ok=True)
@@ -199,7 +285,8 @@ def build_processed_dataset():
         'is_home',
         'xg_created',
         'xg_created_ema3',
-        'team_elo',
+        'team_att_rating',
+        'team_def_rating',
         'outcome']
     
     # Check if cols exist before showing
