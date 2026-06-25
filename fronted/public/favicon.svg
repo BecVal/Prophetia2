@@ -1,0 +1,35 @@
+<svg viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="proGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stopColor="#00D4FF" />
+      <stop offset="100%" stopColor="#4F7CFF" />
+    </linearGradient>
+  </defs>
+  
+  <rect width="120" height="120" rx="28" fill="#0B1020" />
+  
+  <path 
+    d="M60 16 L24 30 L24 66 C24 90 56 104 60 106 C64 104 96 90 96 66 L96 30 L60 16 Z" 
+    stroke="url(#proGrad)" 
+    stroke-width="4" 
+    stroke-linejoin="round" 
+    fill="rgba(0, 212, 255, 0.05)" 
+  />
+  
+  <path 
+    d="M 52 40 L 74 40 C 86 40 86 60 74 60 L 52 60 L 52 82" 
+    stroke="url(#proGrad)" 
+    stroke-width="10" 
+    stroke-linecap="round" 
+    stroke-linejoin="round" 
+  />
+  
+  <path d="M 32 50 L 42 50 L 42 72 L 52 72" stroke="url(#proGrad)" stroke-width="3" stroke-linejoin="round" />
+  <circle cx="32" cy="50" r="3.5" fill="#00D4FF" />
+  
+  <path d="M 36 36 L 46 36 L 46 54 L 52 54" stroke="url(#proGrad)" stroke-width="3" stroke-linejoin="round" />
+  <circle cx="36" cy="36" r="3.5" fill="#4F7CFF" />
+  
+  <path d="M 38 64 L 48 64 L 48 76" stroke="url(#proGrad)" stroke-width="3" stroke-linejoin="round" />
+  <circle cx="38" cy="64" r="3.5" fill="#00D4FF" />
+</svg>
