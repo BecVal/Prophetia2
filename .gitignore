@@ -4,7 +4,7 @@ data/interim/
 data/processed/
 *.parquet
 *.csv
-*.json
+
 
 # Modelos Entrenados (No subir pesos ni modelos masivos)
 core/save_models/
