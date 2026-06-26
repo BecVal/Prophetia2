@@ -327,6 +327,7 @@ def train_model():
         
         liquid_bankroll = 1000.0  # Bankroll líquido disponible
         bankroll_history = [liquid_bankroll]
+        daily_multipliers = []  # Para Bootstrapping Monte Carlo
         total_staked = 0.0
         bets_placed = 0
         bets_won = 0
@@ -342,6 +343,7 @@ def train_model():
         # TODO: Para el futuro, calcular 'clv = open_odds - close_odds' y usarlo como feature.
         
         for current_date in sorted(unique_dates):
+            start_of_day_bankroll = liquid_bankroll
             day_indices = np.where(dates == current_date)[0]
             daily_bets = []
             
@@ -493,6 +495,10 @@ def train_model():
             # Reintegrar ganancias al capital disponible
             liquid_bankroll += day_profit
             bankroll_history.append(liquid_bankroll)
+            
+            if day_staked > 0:
+                daily_multiplier = liquid_bankroll / start_of_day_bankroll
+                daily_multipliers.append(daily_multiplier)
 
         yield_pct = ((liquid_bankroll - 1000.0) / total_staked) * 100 if total_staked > 0 else 0
         roi_pct = ((liquid_bankroll - 1000.0) / 1000.0) * 100
@@ -511,10 +517,69 @@ def train_model():
                 l_yield = (stats['profit'] / stats['staked']) * 100
                 logger.info(f"Liga {comp}: {stats['bets']} apuestas | WinRate: {l_winrate:.1f}% | Yield: {l_yield:.2f}% | Profit: ${stats['profit']:.2f}")
         
+        
         if yield_pct > 0:
             logger.info("EL MODELO ES RENTABLE. (Tiene Edge real contra el mercado).")
         else:
             logger.warning("EL MODELO PIERDE DINERO. (Las cuotas del mercado son más eficientes que el modelo).")
+            
+        # --- MONTE CARLO BOOTSTRAPPING ---
+        if len(daily_multipliers) > 10:
+            logger.info("=== PRUEBA DE RESISTENCIA (MONTE CARLO) ===")
+            logger.info(f"Ejecutando 10,000 simulaciones de bootstrapping sobre {len(daily_multipliers)} bloques diarios...")
+            import random
+            
+            n_sims = 10000
+            ruin_count = 0
+            max_drawdowns = []
+            final_capitals = []
+            
+            for _ in range(n_sims):
+                sim_bankroll = 1000.0
+                peak = 1000.0
+                max_dd = 0.0
+                is_ruined = False
+                
+                # Remuestreo con reemplazo (Block Bootstrapping)
+                sampled_multipliers = random.choices(daily_multipliers, k=len(daily_multipliers))
+                
+                for mult in sampled_multipliers:
+                    sim_bankroll *= mult
+                    
+                    if sim_bankroll > peak:
+                        peak = sim_bankroll
+                    
+                    dd = (peak - sim_bankroll) / peak
+                    if dd > max_dd:
+                        max_dd = dd
+                        
+                    if sim_bankroll <= 10.0:  # Umbral de ruina técnica
+                        is_ruined = True
+                        break
+                        
+                if is_ruined:
+                    ruin_count += 1
+                    max_drawdowns.append(1.0)
+                    final_capitals.append(0.0)
+                else:
+                    max_drawdowns.append(max_dd)
+                    final_capitals.append(sim_bankroll)
+            
+            por = (ruin_count / n_sims) * 100
+            avg_mdd = np.mean(max_drawdowns) * 100
+            p95_mdd = np.percentile(max_drawdowns, 95) * 100
+            median_cap = np.median(final_capitals)
+            
+            logger.info(f"Probabilidad de Ruina (PoR): {por:.2f}%")
+            logger.info(f"Maximum Drawdown Promedio (MDD): {avg_mdd:.2f}%")
+            logger.info(f"MDD Tail Risk (Percentil 95): {p95_mdd:.2f}%")
+            logger.info(f"Capital Final Mediano Esperado: ${median_cap:.2f}")
+            
+            if por > 1.0:
+                logger.warning("ALERTA QUANT: La Probabilidad de Ruina supera el 1%. Considera reducir el `kelly_fraction` o el `max_stake_pct`.")
+            else:
+                logger.info("VALIDACIÓN QUANT: Estrategia de bankroll robusta frente a la varianza extrema.")
+
     else:
         logger.warning("=== EVALUACIÓN FINANCIERA ===")
         logger.warning("No se encontraron cuotas en el dataset. No se puede calcular ROI/Yield.")
