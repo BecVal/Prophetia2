@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # Reducir verbosidad de Optuna para no ensuciar la consola
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+# Configuración Quant
+WHITELIST_LEAGUES = ['I1', 'E1', 'D2', 'SP2']
+FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
+
 # Intenta cargar el dataset con cuotas, si no, usa el base.
 DATASET_PATH = '../data/processed/matches_with_odds.parquet'
 FALLBACK_DATASET = '../data/processed/matches_dataset.parquet'
@@ -309,76 +313,191 @@ def train_model():
     logger.info(f"Precisión en Empates: {correct_draws} correctos de {predicted_as_draw} predichos ({draw_precision:.1f}%)")
     
     # -------------------------------------
-    # EVALUACIÓN FINANCIERA (Kelly Criterion)
+    # EVALUACIÓN FINANCIERA (Bankroll Simulation)
     # -------------------------------------
     has_odds = 'odds_win' in df.columns
     if has_odds:
         logger.info("=== EVALUACIÓN FINANCIERA (Bankroll Simulation) ===")
-        # Extraemos cuotas del Test Set
+        # Extraemos cuotas y variables del Test Set
         odds_win = df['odds_win'].iloc[split_idx:].values
         odds_draw = df['odds_draw'].iloc[split_idx:].values
         odds_loss = df['odds_loss'].iloc[split_idx:].values
+        dates = df['match_date'].iloc[split_idx:].values
+        competitions = df['competition'].iloc[split_idx:].values if 'competition' in df.columns else np.array([None]*len(y_test))
         
-        bankroll = 1000.0  # Bankroll inicial
-        bankroll_history = [bankroll]
+        liquid_bankroll = 1000.0  # Bankroll líquido disponible
+        bankroll_history = [liquid_bankroll]
         total_staked = 0.0
         bets_placed = 0
         bets_won = 0
         
-        # Kelly Fraction (0.25 is standard conservative fractional Kelly)
         kelly_fraction = 0.25 
-        max_stake_pct = 0.05  # Cap de apuesta por partido (5% del bankroll)
+        max_stake_pct = 0.05  # Cap de apuesta por partido (5% del bankroll líquido)
         
-        for i in range(len(y_test)):
-            p_loss, p_draw, p_win = y_prob[i]
-            real_outcome = y_test.iloc[i] # 0: loss, 1: draw, 2: win
+        # Agrupar índices por fecha (timestamp) para evitar Sequential Loop Bug
+        unique_dates = np.unique(dates)
+        league_stats = {}
+
+        # Preparación de CLV (Closing Line Value)
+        # TODO: Para el futuro, calcular 'clv = open_odds - close_odds' y usarlo como feature.
+        
+        for current_date in sorted(unique_dates):
+            day_indices = np.where(dates == current_date)[0]
+            daily_bets = []
             
-            # Cuotas para las 3 opciones (0: loss, 1: draw, 2: win)
-            odds = [odds_loss[i], odds_draw[i], odds_win[i]]
-            probs = [p_loss, p_draw, p_win]
-            
-            # Si alguna cuota es NaN, saltamos este partido
-            if np.isnan(odds).any():
-                continue
-                
-            # Calculamos Expected Value (EV) para cada opción
-            # EV = (Probabilidad * Cuota) - 1
-            evs = [ (probs[j] * odds[j]) - 1 for j in range(3) ]
-            
-            # Seleccionamos la opción con mayor EV
-            best_choice = np.argmax(evs)
-            best_ev = evs[best_choice]
-            
-            # Solo apostamos si EV > 5% (Value Bet Real)
-            if best_ev > 0.05:
-                # Formula de Kelly: f* = (p*odds - 1) / (odds - 1) = EV / (odds - 1)
-                b = odds[best_choice] - 1
-                kelly_pct = best_ev / b
-                
-                # Aplicamos Kelly fraccional y el cap máximo
-                stake_pct = min(kelly_pct * kelly_fraction, max_stake_pct)
-                
-                # Mínimo del 0.5%
-                if stake_pct < 0.005:
+            for i in day_indices:
+                comp = competitions[i]
+                if FILTER_BY_WHITELIST and comp not in WHITELIST_LEAGUES:
                     continue
                     
-                stake = bankroll * stake_pct
-                total_staked += stake
-                bets_placed += 1
+                p_loss, p_draw, p_win = y_prob[i]
+                real_outcome = y_test.iloc[i] 
+                odds = [odds_loss[i], odds_draw[i], odds_win[i]]
+                probs = [p_loss, p_draw, p_win]
                 
-                if real_outcome == best_choice:
-                    profit = stake * (odds[best_choice] - 1)
-                    bankroll += profit
-                    bets_won += 1
-                else:
-                    bankroll -= stake
+                if np.isnan(odds).any():
+                    continue
                     
-                bankroll_history.append(bankroll)
+                evs = [ (probs[j] * odds[j]) - 1 for j in range(3) ]
                 
-        yield_pct = ((bankroll - 1000.0) / total_staked) * 100 if total_staked > 0 else 0
-        roi_pct = ((bankroll - 1000.0) / 1000.0) * 100
+                # Check for Dutching / Doble Oportunidad (Local y Empate)
+                ev_local = evs[2]
+                ev_draw = evs[1]
+                
+                bet_type = 'single'
+                best_choice = np.argmax(evs)
+                best_ev = evs[best_choice]
+                secondary_choice = None
+                
+                # Dutching logic if both Local and Draw have EV > 0.05
+                if ev_local > 0.05 and ev_draw > 0.05:
+                    bet_type = 'dutching'
+                    implied_prob_1 = 1 / odds[2]
+                    implied_prob_X = 1 / odds[1]
+                    total_implied = implied_prob_1 + implied_prob_X
+                    combined_odds = 1 / total_implied
+                    best_ev = ((probs[2] + probs[1]) * combined_odds) - 1
+                    best_choice = 2
+                    secondary_choice = 1
+                
+                if best_ev > 0.05:
+                    daily_bets.append({
+                        'index': i,
+                        'best_choice': best_choice,
+                        'secondary_choice': secondary_choice,
+                        'best_ev': best_ev,
+                        'odds': odds,
+                        'probs': probs,
+                        'bet_type': bet_type,
+                        'real_outcome': real_outcome,
+                        'comp': comp
+                    })
+                    
+            # Ordenar las apuestas del día por EV descendente para priorizar la asignación de capital
+            daily_bets.sort(key=lambda x: x['best_ev'], reverse=True)
+            
+            day_profit = 0.0
+            day_staked = 0.0
+            
+            for bet in daily_bets:
+                best_choice = bet['best_choice']
+                secondary_choice = bet['secondary_choice']
+                odds = bet['odds']
+                bet_type = bet['bet_type']
+                comp = bet['comp']
+                real_outcome = bet['real_outcome']
+                best_ev = bet['best_ev']
+                
+                if bet_type == 'single':
+                    b = odds[best_choice] - 1
+                    kelly_pct = best_ev / b
+                    
+                    # Conservador en cuotas bajas para mitigar trampa isotónica
+                    if odds[best_choice] < 1.30:
+                        kelly_pct = min(kelly_pct, 0.01) # Cap 1% Kelly
+                        
+                    stake_pct = min(kelly_pct * kelly_fraction, max_stake_pct)
+                    if stake_pct < 0.005: continue
+                        
+                    stake = liquid_bankroll * stake_pct
+                    if liquid_bankroll - stake < 0:
+                        stake = liquid_bankroll
+                        if stake <= 0: break
+                            
+                    liquid_bankroll -= stake
+                    day_staked += stake
+                    total_staked += stake
+                    bets_placed += 1
+                    
+                    if comp not in league_stats:
+                        league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
+                    league_stats[comp]['bets'] += 1
+                    league_stats[comp]['staked'] += stake
+                    
+                    if real_outcome == best_choice:
+                        profit = stake * odds[best_choice]
+                        day_profit += profit
+                        bets_won += 1
+                        league_stats[comp]['profit'] += (profit - stake)
+                        league_stats[comp]['won'] += 1
+                    else:
+                        league_stats[comp]['profit'] -= stake
+                        
+                elif bet_type == 'dutching':
+                    implied_prob_1 = 1 / odds[best_choice]
+                    implied_prob_X = 1 / odds[secondary_choice]
+                    total_implied = implied_prob_1 + implied_prob_X
+                    combined_odds = 1 / total_implied
+                    
+                    b = combined_odds - 1
+                    kelly_pct = best_ev / b if b > 0 else 0
+                    if combined_odds < 1.30:
+                        kelly_pct = min(kelly_pct, 0.01)
+                        
+                    stake_pct = min(kelly_pct * kelly_fraction, max_stake_pct)
+                    if stake_pct < 0.005: continue
+                        
+                    total_dutch_stake = liquid_bankroll * stake_pct
+                    if liquid_bankroll - total_dutch_stake < 0:
+                        total_dutch_stake = liquid_bankroll
+                        if total_dutch_stake <= 0: break
+                            
+                    stake_1 = total_dutch_stake * (implied_prob_1 / total_implied)
+                    stake_X = total_dutch_stake * (implied_prob_X / total_implied)
+                    
+                    liquid_bankroll -= total_dutch_stake
+                    day_staked += total_dutch_stake
+                    total_staked += total_dutch_stake
+                    bets_placed += 1
+                    
+                    if comp not in league_stats:
+                        league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
+                    league_stats[comp]['bets'] += 1
+                    league_stats[comp]['staked'] += total_dutch_stake
+                    
+                    if real_outcome == best_choice:
+                        profit = stake_1 * odds[best_choice]
+                        day_profit += profit
+                        bets_won += 1
+                        league_stats[comp]['profit'] += (profit - total_dutch_stake)
+                        league_stats[comp]['won'] += 1
+                    elif real_outcome == secondary_choice:
+                        profit = stake_X * odds[secondary_choice]
+                        day_profit += profit
+                        bets_won += 1
+                        league_stats[comp]['profit'] += (profit - total_dutch_stake)
+                        league_stats[comp]['won'] += 1
+                    else:
+                        league_stats[comp]['profit'] -= total_dutch_stake
+            
+            # Reintegrar ganancias al capital disponible
+            liquid_bankroll += day_profit
+            bankroll_history.append(liquid_bankroll)
+
+        yield_pct = ((liquid_bankroll - 1000.0) / total_staked) * 100 if total_staked > 0 else 0
+        roi_pct = ((liquid_bankroll - 1000.0) / 1000.0) * 100
         
-        logger.info(f"Capital Inicial: $1000.00 | Capital Final: ${bankroll:.2f}")
+        logger.info(f"Capital Inicial: $1000.00 | Capital Final Líquido: ${liquid_bankroll:.2f}")
         logger.info(f"Apuestas Realizadas: {bets_placed} | Apuestas Ganadas: {bets_won} ({(bets_won/bets_placed)*100:.1f}% WinRate)")
         logger.info(f"Volumen Apostado (Turnover): ${total_staked:.2f}")
         logger.info(f"Yield (Beneficio Neto / Turnover): {yield_pct:.2f}%")
@@ -386,53 +505,11 @@ def train_model():
         
         # --- DESGLOSE POR LIGAS ---
         logger.info("=== RENDIMIENTO POR LIGA ===")
-        
-        # Extraemos la liga de los registros del test_set (si existe)
-        if 'competition' in df.columns:
-            comp_test = df['competition'].iloc[split_idx:].values
-            
-            league_stats = {}
-            for i in range(len(y_test)):
-                p_loss, p_draw, p_win = y_prob[i]
-                real_outcome = y_test.iloc[i] 
-                odds = [odds_loss[i], odds_draw[i], odds_win[i]]
-                probs = [p_loss, p_draw, p_win]
-                
-                if np.isnan(odds).any(): continue
-                
-                evs = [ (probs[j] * odds[j]) - 1 for j in range(3) ]
-                best_choice = np.argmax(evs)
-                best_ev = evs[best_choice]
-                
-                if best_ev > 0.05:
-                    comp = comp_test[i]
-                    if comp not in league_stats:
-                        league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
-                    
-                    b = odds[best_choice] - 1
-                    kelly_pct = best_ev / b
-                    stake_pct = min(kelly_pct * kelly_fraction, max_stake_pct)
-                    if stake_pct < 0.005: continue
-                    
-                    # Para el desglose asumimos apuesta plana de $100 por simplicidad matemática y comparación justa
-                    flat_stake = 100.0
-                    league_stats[comp]['bets'] += 1
-                    league_stats[comp]['staked'] += flat_stake
-                    
-                    if real_outcome == best_choice:
-                        profit = flat_stake * (odds[best_choice] - 1)
-                        league_stats[comp]['profit'] += profit
-                        league_stats[comp]['won'] += 1
-                    else:
-                        league_stats[comp]['profit'] -= flat_stake
-            
-            for comp, stats in sorted(league_stats.items(), key=lambda x: x[1]['profit'], reverse=True):
-                if stats['bets'] > 0:
-                    l_winrate = (stats['won'] / stats['bets']) * 100
-                    l_yield = (stats['profit'] / stats['staked']) * 100
-                    logger.info(f"Liga {comp}: {stats['bets']} apuestas | WinRate: {l_winrate:.1f}% | Yield: {l_yield:.2f}% | Profit Flat: ${stats['profit']:.2f}")
-        else:
-            logger.info("La columna 'competition' no existe, no se puede hacer el desglose.")
+        for comp, stats in sorted(league_stats.items(), key=lambda x: x[1]['profit'], reverse=True):
+            if stats['bets'] > 0:
+                l_winrate = (stats['won'] / stats['bets']) * 100
+                l_yield = (stats['profit'] / stats['staked']) * 100
+                logger.info(f"Liga {comp}: {stats['bets']} apuestas | WinRate: {l_winrate:.1f}% | Yield: {l_yield:.2f}% | Profit: ${stats['profit']:.2f}")
         
         if yield_pct > 0:
             logger.info("EL MODELO ES RENTABLE. (Tiene Edge real contra el mercado).")
