@@ -8,7 +8,7 @@ Prophetia2 es una arquitectura avanzada de Machine Learning Cuantitativo (Quant)
 
 El núcleo predictivo del proyecto ha evolucionado hacia un **Metamodelo (Corrector de Residuos)**. En lugar de predecir el resultado desde cero, el sistema ingiere las Cuotas de Apertura (Opening Odds) de casas asiáticas eficientes (Pinnacle/Bet365), las convierte a probabilidades puras, y utiliza un modelo **XGBoost Classifier** para buscar errores en la estimación de la casa. 
 
-Para lograr esto, el motor cruza las cuotas con métricas tácticas avanzadas (xG), un sistema dinámico de Ratings Ofensivos/Defensivos (estilo Glicko), y un modelo bivariado Poisson Dixon-Coles para corregir la subestimación estadística de los empates. Finalmente, emite distribuciones probabilísticas calibradas mediante Regresión Isotónica, optimizando la rentabilidad financiera (Yield/ROI).
+Para lograr esto, el motor procesa más de 12 años de histórico en 15 ligas europeas y cruza las cuotas con métricas tácticas avanzadas (xG), un sistema dinámico de Ratings Ofensivos/Defensivos (estilo Glicko), el Valor de Mercado de las plantillas (Transfermarkt) y un modelo bivariado Poisson Dixon-Coles para corregir la subestimación estadística de los empates. Finalmente, emite distribuciones probabilísticas calibradas mediante Regresión Isotónica libre de fuga de datos (Anti-Leakage), optimizando la rentabilidad financiera (Yield/ROI).
 
 ## Instalacion
 
@@ -21,7 +21,9 @@ Se recomienda utilizar un entorno virtual de Python. Para instalar las dependenc
 
 ## Arquitectura Matemática y Financiera
 
-1. **Ratings Dinámicos (Ataque/Defensa) y ELO:** El sistema calcula ratings separados de ataque y defensa para cada equipo basándose en la métrica de Goles Esperados (xG), actualizándolos partido a partido sin contaminar el futuro (evitando Data Leakage).
+1. **Arquitectura Anti-Leakage y Single-Row:** El modelo filtra duplicados (Double-Row Betting) y calibra las probabilidades puramente fuera de muestra (OOS) garantizando métricas financieras honestas y robustas.
+2. **Valoración de Plantillas (Proxy de Jugadores):** Mediante web scraping automatizado, Prophetia2 inyecta el valor de mercado contemporáneo (en millones de euros) de cada equipo desde Transfermarkt para sintetizar la calidad técnica de los jugadores sin sufrir la maldición de la dimensionalidad.
+3. **Ratings Dinámicos (Ataque/Defensa) y ELO:** El sistema calcula ratings separados de ataque y defensa para cada equipo basándose en la métrica de Goles Esperados (xG), actualizándolos partido a partido sin contaminar el futuro.
 2. **Modelo de Poisson Bivariado (Dixon-Coles):** Dado que el fútbol es un deporte de baja puntuación, los empates ocurren con mayor frecuencia de lo que sugiere la independencia estadística. Prophetia2 usa el ajuste de Dixon-Coles ($\rho \approx -0.15$) para inflar matemáticamente la probabilidad conjunta de resultados 0-0 y 1-1.
 3. **Calibración Isotónica:** Las probabilidades crudas del XGBoost se ajustan de manera no-paramétrica para asegurar que una predicción del "60%" realmente se cumpla el 60% de las veces en la realidad.
 4. **Simulación Financiera y Kelly Criterion:** Prophetia2 no solo clasifica; es un simulador de inversiones. El entrenamiento concluye con un backtest financiero riguroso. El algoritmo compara sus predicciones contra las **Cuotas de Cierre (Closing Odds)** (la línea más eficiente del mercado). Si encuentra Expectativa Matemática positiva (EV > 5%), el modelo aplica el **Criterio de Kelly** fraccionado para calcular exactamente qué porcentaje del Bankroll apostar (max 5%). Al final, reporta el ROI, Turnover y el Yield neto.
@@ -30,43 +32,49 @@ Se recomienda utilizar un entorno virtual de Python. Para instalar las dependenc
 
 Para obtener predicciones y ejecutar las simulaciones financieras, sigue el pipeline estándar:
 
-### 0. Descarga de Datos (Ingestion)
-Para alimentar el modelo, primero debes descargar la base de datos abierta de StatsBomb (partidos y eventos tacticos). Ejecuta el script de ingestion:
+### 0. Descarga de Datos de Partidos (Ingestion)
+Para alimentar el modelo, primero debes descargar los históricos de partidos y eventos tácticos (15 ligas principales y secundarias a lo largo de 12 años). Ejecuta el script:
 ```bash
-python ingestion/statsbomb_ingestion.py
+python core/download_football_data.py
 ```
-*Nota sobre el almacenamiento:* Los datos se guardan en formato `.parquet`, que es altamente comprimido. Descargar una buena cantidad de partidos (cientos o miles) ocupara aproximadamente entre **500 MB y 1.5 GB** de espacio en tu disco duro, dependiendo de las competiciones habilitadas en el script.
 
-### 1. Adaptacion de Datos (Data Adapter)
-Para permitir que Prophetia2 consuma diferentes fuentes de datos (StatsBomb, Understat, football-data, etc.), primero debes estandarizar los eventos crudos en un DataFrame Intermedio Universal. Ejecuta el adaptador:
+### 1. Descarga del Proxy de Jugadores (Transfermarkt)
+Extrae el valor de mercado histórico de cada equipo para medir el nivel técnico de sus jugadores. Cuenta con guardado progresivo antibloqueos.
+```bash
+python ingestion/transfermarkt_scraper.py
+```
+
+### 2. Adaptacion de Datos (Data Adapter)
+Para permitir que Prophetia2 consuma las diferentes fuentes de datos, primero debes estandarizar los eventos crudos en un DataFrame Intermedio Universal. Ejecuta el adaptador:
 ```bash
 python core/data_adapter.py
 ```
-Este script leera los archivos especificos de tu proveedor de datos (por defecto StatsBomb) y generara un dataset intermedio tabular unificado en `data/interim/intermediate_dataset.parquet`.
+Este script generara un dataset intermedio tabular unificado en `data/interim/intermediate_dataset.parquet`.
 
-### 2. Extracción de Cuotas (Bookmaker Odds)
+### 3. Extracción de Cuotas (Bookmaker Odds)
 Descarga el historial de cuotas de casas de apuestas globales para entrenar el metamodelo y simular rentabilidad:
 ```bash
 python ingestion/fetch_odds.py
 ```
-Este script descarga cuotas de apertura (PSH) y cierre (PSCH), convirtiéndolas a probabilidades implícitas (Vig-free) en un archivo temporal.
+Este script descarga cuotas de apertura (PSH) y cierre (PSCH) para las 15 ligas, convirtiéndolas a probabilidades implícitas (Vig-free).
 
-### 3. Procesamiento Matemático (Feature Engineering)
-El motor de Prophetia2 debe calcular las estadísticas tácticas avanzadas (Rolling Averages), el ELO Clásico, los ratings Glicko de Ataque/Defensa y preparar el dataset del metamodelo:
+### 4. Procesamiento Matemático (Feature Engineering)
+El motor de Prophetia2 cruza las estadísticas tácticas avanzadas (Rolling Averages), el ELO Clásico, los ratings Glicko y fusiona los millones de euros de Transfermarkt con cada evento:
 ```bash
 python core/feature_engineering.py
 ```
 Se generará el dataset final de entrenamiento listo para la IA en `data/processed/matches_dataset.parquet`.
 
-### 4. Entrenamiento del Metamodelo de IA
-Una vez procesados los datos tácticos y las cuotas, entrena el modelo optimizado:
+### 5. Entrenamiento del Metamodelo de IA
+Una vez procesados los más de 65,000 partidos históricos, entrena el modelo optimizado:
 ```bash
 python core/train.py
 ```
-Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna` (minimizando el Log-Loss), aplicará la Calibración Isotónica y ejecutará una simulación financiera completa de Bankroll ($1,000 iniciales) mostrando el Yield y las Apuestas de Valor realizadas en el Test Set.
+Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna`, aplicará la Calibración Isotónica y ejecutará una simulación financiera completa de Bankroll ($1,000 iniciales).
 
 **¿Qué datos entran al modelo? (Inputs)**
 - **Consenso del Mercado (Metamodelado):** Probabilidades de apertura del mercado (`open_prob_win`, `open_prob_draw`, `open_prob_loss`).
+- **Calidad de Jugadores (Proxy):** Valor de mercado de la plantilla contemporánea extraído de Transfermarkt (`team_squad_value`, `squad_value_diff`).
 - **Ratings Cuantitativos:** Fuerza Relativa de Ataque, ELO Clásico (`team_elo`, `elo_diff`), y Ratings Puros de Ataque/Defensa (`team_att_rating`, `team_def_rating`).
 - **Tácticas Base (EMA-3/EMA-5):** Goles esperados creados y concedidos (`xg_created`, `xg_conceded`), xG-Chain, posesión, y acciones defensivas (presiones, intercepciones).
 - **Contexto Avanzado:** Días de descanso, desgaste por competiciones europeas previas (`is_european_hangover`), e historial directo (H2H).

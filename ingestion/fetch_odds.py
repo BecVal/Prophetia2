@@ -12,8 +12,8 @@ from core.team_mapping import normalize_team_name
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-SEASONS = ['1516', '1617', '1718', '1819', '1920', '2021', '2122', '2223', '2324']
-LEAGUES = ['E0', 'SP1', 'I1', 'D1', 'F1']
+SEASONS = ['1415', '1516', '1617', '1718', '1819', '1920', '2021', '2122', '2223', '2324', '2425', '2526']
+LEAGUES = ['E0', 'E1', 'SP1', 'SP2', 'I1', 'I2', 'D1', 'D2', 'F1', 'F2', 'N1', 'B1', 'P1', 'T1', 'G1']
 BASE_URL = "https://www.football-data.co.uk/mmz4281/{season}/{league}.csv"
 
 DATASET_PATH = os.path.join(script_dir, '..', 'data', 'processed', 'matches_dataset.parquet')

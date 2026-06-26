@@ -8,9 +8,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuración de ligas y temporadas a descargar
-# E0: Premier League, SP1: La Liga, I1: Serie A, D1: Bundesliga, F1: Ligue 1
-LEAGUES = ['E0', 'SP1', 'I1', 'D1', 'F1']
-SEASONS = ['1819', '1920', '2021', '2122', '2223', '2324']
+LEAGUES = ['E0', 'E1', 'SP1', 'SP2', 'I1', 'I2', 'D1', 'D2', 'F1', 'F2', 'N1', 'B1', 'P1', 'T1', 'G1']
+SEASONS = ['1415', '1516', '1617', '1718', '1819', '1920', '2021', '2122', '2223', '2324', '2425', '2526']
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281/{season}/{league}.csv"
 OUTPUT_DIR = '../data/raw/football_data'

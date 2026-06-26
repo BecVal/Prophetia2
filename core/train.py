@@ -143,6 +143,7 @@ def train_model():
     feature_cols = ['is_home', 'rest_days', 'relative_attack_strength', 
                     'team_att_rating', 'team_def_rating', 'opp_att_rating', 'opp_def_rating',
                     'team_elo', 'opp_elo', 'elo_diff',
+                    'team_squad_value', 'opp_squad_value', 'squad_value_diff',
                     'h2h_games_played', 'h2h_points_last_5', 'h2h_win_rate_hist', 'h2h_draw_rate_hist', 'is_european_hangover',
                     'open_prob_win', 'open_prob_draw', 'open_prob_loss']
     for stat in base_stats:
@@ -382,6 +383,56 @@ def train_model():
         logger.info(f"Volumen Apostado (Turnover): ${total_staked:.2f}")
         logger.info(f"Yield (Beneficio Neto / Turnover): {yield_pct:.2f}%")
         logger.info(f"ROI del Capital Inicial: {roi_pct:.2f}%")
+        
+        # --- DESGLOSE POR LIGAS ---
+        logger.info("=== RENDIMIENTO POR LIGA ===")
+        
+        # Extraemos la liga de los registros del test_set (si existe)
+        if 'competition' in df.columns:
+            comp_test = df['competition'].iloc[split_idx:].values
+            
+            league_stats = {}
+            for i in range(len(y_test)):
+                p_loss, p_draw, p_win = y_prob[i]
+                real_outcome = y_test.iloc[i] 
+                odds = [odds_loss[i], odds_draw[i], odds_win[i]]
+                probs = [p_loss, p_draw, p_win]
+                
+                if np.isnan(odds).any(): continue
+                
+                evs = [ (probs[j] * odds[j]) - 1 for j in range(3) ]
+                best_choice = np.argmax(evs)
+                best_ev = evs[best_choice]
+                
+                if best_ev > 0.05:
+                    comp = comp_test[i]
+                    if comp not in league_stats:
+                        league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
+                    
+                    b = odds[best_choice] - 1
+                    kelly_pct = best_ev / b
+                    stake_pct = min(kelly_pct * kelly_fraction, max_stake_pct)
+                    if stake_pct < 0.005: continue
+                    
+                    # Para el desglose asumimos apuesta plana de $100 por simplicidad matemática y comparación justa
+                    flat_stake = 100.0
+                    league_stats[comp]['bets'] += 1
+                    league_stats[comp]['staked'] += flat_stake
+                    
+                    if real_outcome == best_choice:
+                        profit = flat_stake * (odds[best_choice] - 1)
+                        league_stats[comp]['profit'] += profit
+                        league_stats[comp]['won'] += 1
+                    else:
+                        league_stats[comp]['profit'] -= flat_stake
+            
+            for comp, stats in sorted(league_stats.items(), key=lambda x: x[1]['profit'], reverse=True):
+                if stats['bets'] > 0:
+                    l_winrate = (stats['won'] / stats['bets']) * 100
+                    l_yield = (stats['profit'] / stats['staked']) * 100
+                    logger.info(f"Liga {comp}: {stats['bets']} apuestas | WinRate: {l_winrate:.1f}% | Yield: {l_yield:.2f}% | Profit Flat: ${stats['profit']:.2f}")
+        else:
+            logger.info("La columna 'competition' no existe, no se puede hacer el desglose.")
         
         if yield_pct > 0:
             logger.info("EL MODELO ES RENTABLE. (Tiene Edge real contra el mercado).")

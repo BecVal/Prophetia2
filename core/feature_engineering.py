@@ -238,6 +238,54 @@ def add_advanced_fatigue(df):
     return df
 
 
+def add_squad_value_features(df):
+    logger.info("Integrando Valores de Mercado de Transfermarkt...")
+    
+    tm_path = '../data/raw/transfermarkt_squad_values.parquet'
+    if not os.path.exists(tm_path):
+        logger.warning(f"No se encontró el archivo de Transfermarkt en {tm_path}. Saltando variable.")
+        return df
+        
+    tm_df = pd.read_parquet(tm_path, engine='fastparquet')
+    
+    # Derivar la temporada en el df principal
+    # Si el mes es >= 7 (Julio), la temporada es el año actual, si no, el año anterior.
+    df['season_year'] = df['match_date'].dt.year
+    df.loc[df['match_date'].dt.month < 7, 'season_year'] -= 1
+    
+    # Merge local
+    df = pd.merge(
+        df, 
+        tm_df[['season_year', 'team', 'squad_value_millions']], 
+        on=['season_year', 'team'], 
+        how='left'
+    )
+    df = df.rename(columns={'squad_value_millions': 'team_squad_value'})
+    
+    # Merge visitante (oponente)
+    tm_df_opp = tm_df[['season_year', 'team', 'squad_value_millions']].rename(
+        columns={'team': 'opponent', 'squad_value_millions': 'opp_squad_value'}
+    )
+    df = pd.merge(
+        df, 
+        tm_df_opp, 
+        on=['season_year', 'opponent'], 
+        how='left'
+    )
+    
+    # Fill NaN para equipos sin datos de Transfermarkt (ej. recién ascendidos) con el mínimo de la liga
+    df['team_squad_value'] = df.groupby(['season_year'])['team_squad_value'].transform(lambda x: x.fillna(x.min() if not pd.isna(x.min()) else 10.0))
+    df['opp_squad_value'] = df.groupby(['season_year'])['opp_squad_value'].transform(lambda x: x.fillna(x.min() if not pd.isna(x.min()) else 10.0))
+    
+    # Calcular diferencia de valor
+    df['squad_value_diff'] = df['team_squad_value'] - df['opp_squad_value']
+    
+    df = df.drop(columns=['season_year'])
+    df = df.sort_values('match_date').reset_index(drop=True)
+    return df
+
+
+
 def build_processed_dataset():
     if not os.path.exists(INTERIM_DATASET_PATH):
         logger.error(
@@ -267,6 +315,9 @@ def build_processed_dataset():
     # Añadir H2H y Fatiga Avanzada
     final_df = add_h2h_features(final_df)
     final_df = add_advanced_fatigue(final_df)
+    
+    # Añadir Valor de Plantilla (Transfermarkt)
+    final_df = add_squad_value_features(final_df)
 
     # Crear directorio si no existe
     processed_dir = os.path.dirname(OUTPUT_PATH)
