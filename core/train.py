@@ -128,6 +128,9 @@ def train_model():
     else:
         logger.warning("No se encontró columna 'match_date'. Posible Data Leakage.")
 
+    logger.info("Filtrando eventos solo desde la perspectiva local para evitar Double-Row Betting...")
+    df = df[df['is_home'] == 1].reset_index(drop=True)
+
     base_stats = [
         'xg_created', 'xg_conceded', 'shots_total', 'shots_on_target',
         'passes_total', 'passes_completed', 'pass_accuracy', 'possession_pct',
@@ -274,11 +277,11 @@ def train_model():
 
     final_model = calibrated_clf
     
-    # Encontrar umbral óptimo en Train para predecir empates (Threshold Moving)
-    y_prob_train = final_model.predict_proba(X_train)
-    y_prob_train = y_prob_train / y_prob_train.sum(axis=1, keepdims=True)
+    # Encontrar umbral óptimo en el set de Calibración para evitar Leakage (Threshold Moving)
+    y_prob_calib = final_model.predict_proba(X_calib)
+    y_prob_calib = y_prob_calib / y_prob_calib.sum(axis=1, keepdims=True)
     # Asumimos una frecuencia natural de empate del ~26%
-    draw_threshold = np.percentile(y_prob_train[:, 1], 74)
+    draw_threshold = np.percentile(y_prob_calib[:, 1], 74)
 
     # Evaluar
     y_prob = final_model.predict_proba(X_test)
