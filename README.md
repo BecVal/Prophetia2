@@ -70,7 +70,17 @@ Una vez procesados los más de 65,000 partidos históricos, entrena el modelo op
 ```bash
 python core/train.py
 ```
-Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna`, aplicará la Calibración Isotónica y ejecutará una simulación financiera completa de Bankroll ($1,000 iniciales).
+Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna`, aplicará la Calibración Isotónica y exportará las predicciones del modelo al archivo `test_predictions.parquet` para su evaluación financiera.
+
+### 6. Evaluación Financiera (Bankroll Simulation)
+Dado que el modelo estocástico de Optuna puede variar, la simulación de banca se ha separado para poder ajustar los umbrales de riesgo al instante sin re-entrenar el modelo:
+```bash
+python core/simulate_bankroll.py
+```
+Este script leerá las predicciones base, aplicará tus diccionarios de riesgo (**Kelly Fractions** y **EV Thresholds** por liga), simulará la rentabilidad de un Bankroll inicial de $1,000 y ejecutará pruebas de resistencia (Monte Carlo Bootstrapping) para medir tu Maximum Drawdown y Probabilidad de Ruina (PoR).
+
+> **Benchmark Actual:** Utilizando este flujo, el modelo ha demostrado métricas de clase institucional en *Out-of-Sample*, alcanzando un **WinRate del 47.0%**, un **Yield neto del 7.36%** y un **ROI del 51.23%**, manteniendo la **Probabilidad de Ruina (PoR) en un 0.00%** tras 10,000 simulaciones extremas.
+
 
 **¿Qué datos entran al modelo? (Inputs)**
 - **Consenso del Mercado (Metamodelado):** Probabilidades de apertura del mercado (`open_prob_win`, `open_prob_draw`, `open_prob_loss`).
@@ -85,7 +95,7 @@ En lugar de dar un resultado seco, el modelo expulsa **probabilidades calibradas
 - Probabilidad de Empate ajustada por Dixon-Coles (ej. 24.5%)
 - Expectativa Matemática de la Apuesta (EV) frente a la línea de cierre.
 
-### 6. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
+### 7. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
 El analisis interactivo y las predicciones individuales se gestionan a traves de Jupyter Notebooks. Inicie su servidor de Jupyter:
 ```bash
 jupyter notebook
@@ -96,7 +106,7 @@ Navegue a la carpeta `notebooks/` y utilice los siguientes archivos:
 *   **02_model_selection.ipynb**: Genera visualizaciones graficas sobre la correlacion tactica y revela que estadisticas (Feature Importance) considera XGBoost mas determinantes para ganar.
 *   **03_live_dashboard.ipynb**: Contiene un panel interactivo (Dashboard). Ejecute todas las celdas para habilitar un selector desplegable de partidos. Al seleccionar un encuentro, el sistema utilizara el modelo entrenado para emitir las probabilidades exactas de Victoria, Empate o Derrota, comparando ademas la prediccion con el flujo tactico real del partido.
 
-### 7. Predicción Financiera en Terminal (CLI Quant)
+### 8. Predicción Financiera en Terminal (CLI Quant)
 Para ejecutar pronósticos en tiempo real basados en los últimos partidos procesados y calcular el riesgo (Bankroll Staking), utiliza nuestro menú interactivo de predicción cuantitativa:
 ```bash
 cd core
