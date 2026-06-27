@@ -180,36 +180,51 @@ def train_model():
     # ==========================
     # FASE 1: MODELOS POISSON
     # ==========================
-    logger.info("Fase 1: Entrenando Modelos Poisson para Goles Esperados...")
+    logger.info("Fase 1: Entrenando Modelos Poisson para Goles Esperados con Time Decay...")
     xgb_poisson = XGBRegressor(objective='count:poisson', n_estimators=100, learning_rate=0.05, random_state=42, device='cuda')
     
+    # Pre-calculamos fechas para el Time Decay (Asumiendo que match_date existe)
+    train_dates = None
+    if 'match_date' in df.columns:
+        train_dates = pd.to_datetime(df['match_date'].iloc[:split_idx])
+    
+    def get_time_weights(dates, half_life_days=365):
+        if dates is None:
+            return None
+        max_date = dates.max()
+        days_diff = (max_date - dates).dt.days.clip(lower=0)
+        return np.exp(-np.log(2) * days_diff / half_life_days)
+
     # Función personalizada para predecir OOS (Out-Of-Sample) con TimeSeriesSplit
-    def get_expanding_predictions(estimator, X, y, n_splits=5):
+    def get_expanding_predictions(estimator, X, y, dates, n_splits=5):
         tscv = TimeSeriesSplit(n_splits=n_splits)
         preds = np.zeros(len(X))
         preds[:] = np.nan
         # Generar predicciones estrictamente para el futuro
         for train_idx, val_idx in tscv.split(X):
-            estimator.fit(X.iloc[train_idx], y.iloc[train_idx])
+            w_tr = get_time_weights(dates.iloc[train_idx]) if dates is not None else None
+            estimator.fit(X.iloc[train_idx], y.iloc[train_idx], sample_weight=w_tr)
             preds[val_idx] = estimator.predict(X.iloc[val_idx])
         
         # Para la primera partición base (que no tiene predicción OOS),
         # rellenamos entrenando y prediciendo sobre ella misma (subóptimo, pero evita perder los datos)
         first_train_idx = next(tscv.split(X))[0]
-        estimator.fit(X.iloc[first_train_idx], y.iloc[first_train_idx])
+        w_first = get_time_weights(dates.iloc[first_train_idx]) if dates is not None else None
+        estimator.fit(X.iloc[first_train_idx], y.iloc[first_train_idx], sample_weight=w_first)
         preds[first_train_idx] = estimator.predict(X.iloc[first_train_idx])
         return preds
 
     # Predecir Out-Of-Sample en Train usando Expanding Window para eliminar Leakage temporal
-    logger.info("Calculando predicciones Poisson Out-Of-Sample (Expanding Window)...")
-    pred_scored_train = get_expanding_predictions(xgb_poisson, X_train, y_scored_train)
-    pred_conceded_train = get_expanding_predictions(xgb_poisson, X_train, y_conceded_train)
+    logger.info("Calculando predicciones Poisson Out-Of-Sample (Expanding Window con Time Decay)...")
+    pred_scored_train = get_expanding_predictions(xgb_poisson, X_train, y_scored_train, train_dates)
+    pred_conceded_train = get_expanding_predictions(xgb_poisson, X_train, y_conceded_train, train_dates)
     
     # Entrenar en todo Train y predecir en Test
-    xgb_poisson.fit(X_train, y_scored_train)
+    final_train_weights = get_time_weights(train_dates)
+    xgb_poisson.fit(X_train, y_scored_train, sample_weight=final_train_weights)
     pred_scored_test = xgb_poisson.predict(X_test)
     
-    xgb_poisson.fit(X_train, y_conceded_train)
+    xgb_poisson.fit(X_train, y_conceded_train, sample_weight=final_train_weights)
     pred_conceded_test = xgb_poisson.predict(X_test)
 
     # Calcular Probabilidad Bivariada de Empate (Dixon-Coles)
@@ -332,7 +347,10 @@ def train_model():
         bets_placed = 0
         bets_won = 0
         
-        kelly_fraction = 0.25 
+        # Diccionarios de riesgo por liga (ajustados a liquidez y eficiencia)
+        KELLY_FRACTIONS = {'E1': 0.30, 'I1': 0.25, 'D2': 0.15, 'SP2': 0.15, 'DEFAULT': 0.20}
+        EV_THRESHOLDS = {'E1': 0.03, 'I1': 0.05, 'D2': 0.08, 'SP2': 0.08, 'DEFAULT': 0.05}
+        
         max_stake_pct = 0.05  # Cap de apuesta por partido (5% del bankroll líquido)
         
         # Agrupar índices por fecha (timestamp) para evitar Sequential Loop Bug
@@ -362,6 +380,10 @@ def train_model():
                     
                 evs = [ (probs[j] * odds[j]) - 1 for j in range(3) ]
                 
+                # Obtener umbrales dinámicos para esta liga
+                league_ev_thresh = EV_THRESHOLDS.get(comp, EV_THRESHOLDS['DEFAULT'])
+                league_kelly = KELLY_FRACTIONS.get(comp, KELLY_FRACTIONS['DEFAULT'])
+                
                 # Check for Dutching / Doble Oportunidad (Local y Empate)
                 ev_local = evs[2]
                 ev_draw = evs[1]
@@ -371,8 +393,8 @@ def train_model():
                 best_ev = evs[best_choice]
                 secondary_choice = None
                 
-                # Dutching logic if both Local and Draw have EV > 0.05
-                if ev_local > 0.05 and ev_draw > 0.05:
+                # Dutching logic if both Local and Draw have EV > league_ev_thresh
+                if ev_local > league_ev_thresh and ev_draw > league_ev_thresh:
                     bet_type = 'dutching'
                     implied_prob_1 = 1 / odds[2]
                     implied_prob_X = 1 / odds[1]
@@ -382,8 +404,9 @@ def train_model():
                     best_choice = 2
                     secondary_choice = 1
                 
-                if best_ev > 0.05:
+                if best_ev > league_ev_thresh:
                     daily_bets.append({
+                        'kelly_fraction': league_kelly,
                         'index': i,
                         'best_choice': best_choice,
                         'secondary_choice': secondary_choice,
@@ -409,10 +432,11 @@ def train_model():
                 comp = bet['comp']
                 real_outcome = bet['real_outcome']
                 best_ev = bet['best_ev']
+                kelly_fraction = bet['kelly_fraction']
                 
                 if bet_type == 'single':
                     b = odds[best_choice] - 1
-                    kelly_pct = best_ev / b
+                    kelly_pct = best_ev / b if b > 0 else 0
                     
                     # Conservador en cuotas bajas para mitigar trampa isotónica
                     if odds[best_choice] < 1.30:

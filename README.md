@@ -85,7 +85,7 @@ En lugar de dar un resultado seco, el modelo expulsa **probabilidades calibradas
 - Probabilidad de Empate ajustada por Dixon-Coles (ej. 24.5%)
 - Expectativa Matemática de la Apuesta (EV) frente a la línea de cierre.
 
-### 5. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
+### 6. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
 El analisis interactivo y las predicciones individuales se gestionan a traves de Jupyter Notebooks. Inicie su servidor de Jupyter:
 ```bash
 jupyter notebook
@@ -95,3 +95,39 @@ Navegue a la carpeta `notebooks/` y utilice los siguientes archivos:
 *   **01_data_exploration.ipynb**: Permite explorar la estructura cruda de los datos de StatsBomb.
 *   **02_model_selection.ipynb**: Genera visualizaciones graficas sobre la correlacion tactica y revela que estadisticas (Feature Importance) considera XGBoost mas determinantes para ganar.
 *   **03_live_dashboard.ipynb**: Contiene un panel interactivo (Dashboard). Ejecute todas las celdas para habilitar un selector desplegable de partidos. Al seleccionar un encuentro, el sistema utilizara el modelo entrenado para emitir las probabilidades exactas de Victoria, Empate o Derrota, comparando ademas la prediccion con el flujo tactico real del partido.
+
+### 7. Predicción Financiera en Terminal (CLI Quant)
+Para ejecutar pronósticos en tiempo real basados en los últimos partidos procesados y calcular el riesgo (Bankroll Staking), utiliza nuestro menú interactivo de predicción cuantitativa:
+```bash
+cd core
+python cli_predictor.py
+```
+El script te permitirá seleccionar primero la competición (Liga) y luego autocompletará los equipos participantes. Podrás introducir las cuotas del mercado actual y aplicar penalizaciones de fuerza estocástica si hay jugadores clave lesionados.
+
+**Ejemplo de Salida:**
+```text
++------------------------------------------------------+
+| Prophetia2 - Quant Value Betting CLI                 |
+| Initializing stochastic models and feature stores... |
++------------------------------------------------------+
+
+=== ANÁLISIS CUANTITATIVO DEL PARTIDO ===
++-----------------------------------------------------------------------------+
+|             |            |             |            |          EV |         |
+|             | Odds       |       Prob. |      Prob. |   (Expected |         |
+| Mercado     | (Bookie)   |      Bookie |     Modelo |      Value) | Kelly % |
+|-------------+------------+-------------+------------+-------------+---------|
+| 1 (Local -  | 2.10       |       47.6% |      34.7% |      -27.2% |   0.00% |
+| Arsenal)    |            |             |            |             |         |
+| X (Empate)  | 3.40       |       29.4% |      40.2% |      +36.7% |  15.30% |
+| 2 (Visita - | 3.50       |       28.6% |      25.1% |      -12.1% |   0.00% |
+| Chelsea)    |            |             |            |             |         |
++-----------------------------------------------------------------------------+
+
+=== RECOMENDACIÓN DE STAKING ===
++---------------------------- SISTEMA DE STAKING -----------------------------+
+| VALUE DETECTADO                                                             |
+| Selección: Empate (X) @ 3.40                                                |
+| Stake Recomendado: $30.61 (3.06% del bankroll)                              |
++-----------------------------------------------------------------------------+
+```
