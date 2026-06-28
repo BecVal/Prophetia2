@@ -50,3 +50,8 @@ share/python-wheels/
 # Archivos de SO
 .DS_Store
 Thumbs.db
+
+#MCP
+.codebase-memory/
+data/
+notebooks/

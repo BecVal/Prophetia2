@@ -350,9 +350,15 @@ def train_model():
             'prob_draw': y_prob[:, 1],
             'prob_win': y_prob[:, 2],
             'outcome': y_test.values,
-            'odds_win': df['odds_win'].iloc[split_idx:].values,
-            'odds_draw': df['odds_draw'].iloc[split_idx:].values,
-            'odds_loss': df['odds_loss'].iloc[split_idx:].values
+            # Cuotas a las que se realiza la apuesta (Apertura)
+            'odds_win': df['open_odds_win'].iloc[split_idx:].values if 'open_odds_win' in df.columns else df['odds_win'].iloc[split_idx:].values,
+            'odds_draw': df['open_odds_draw'].iloc[split_idx:].values if 'open_odds_draw' in df.columns else df['odds_draw'].iloc[split_idx:].values,
+            'odds_loss': df['open_odds_loss'].iloc[split_idx:].values if 'open_odds_loss' in df.columns else df['odds_loss'].iloc[split_idx:].values,
+            
+            # Cuotas de cierre para el cálculo del CLV en la simulación
+            'closing_odds_win': df['odds_win'].iloc[split_idx:].values,
+            'closing_odds_draw': df['odds_draw'].iloc[split_idx:].values,
+            'closing_odds_loss': df['odds_loss'].iloc[split_idx:].values
         })
         
         # Crear directorio si no existe

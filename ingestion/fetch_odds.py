@@ -52,12 +52,12 @@ def fetch_and_merge_odds():
                     
                 # Check for Pinnacle Opening
                 pin_cols = ['PSH', 'PSD', 'PSA']
-                if all(c in pin_cols for c in df_odds.columns):
+                if all(c in df_odds.columns for c in pin_cols):
                     cols_to_keep.extend(pin_cols)
                     
                 # Check for Pinnacle Closing
                 pin_ch_cols = ['PSCH', 'PSCD', 'PSCA']
-                if all(c in pin_ch_cols for c in df_odds.columns):
+                if all(c in df_odds.columns for c in pin_ch_cols):
                     cols_to_keep.extend(pin_ch_cols)
                     
                 df_odds = df_odds[cols_to_keep].copy()

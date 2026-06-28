@@ -15,10 +15,21 @@ FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la sim
 WHITELIST_LEAGUES = ['I1', 'D2', 'SP1', 'F2', 'G1', 'D1', 'T1', 'F1']
 
 # Diccionarios de riesgo por liga (ajustados a liquidez y eficiencia)
-KELLY_FRACTIONS = {'D2': 0.10, 'I1': 0.20, 'SP1': 0.05, 'F2': 0.05, 'G1': 0.05, 'D1': 0.05, 'T1': 0.04, 'F1': 0.02, 'DEFAULT': 0.02}
-EV_THRESHOLDS = {'D2': 0.10, 'I1': 0.06, 'SP1': 0.10, 'F2': 0.10, 'G1': 0.08, 'D1': 0.07, 'T1': 0.08, 'F1': 0.10, 'DEFAULT': 0.12}
+KELLY_FRACTIONS = {'D2': 0.12, 'I1': 0.01, 'SP1': 0.10, 'F2': 0.05, 'G1': 0.02, 'D1': 0.02, 'T1': 0.10, 'F1': 0.03, 'DEFAULT': 0.02}
+EV_THRESHOLDS = {'D2': 0.025, 'I1': 0.06, 'SP1': 0.02, 'F2': 0.035, 'G1': 0.06, 'D1': 0.05, 'T1': 0.015, 'F1': 0.025, 'DEFAULT': 0.04}
 
 MAX_STAKE_PCT = 0.05  # Cap de apuesta por partido (5% del bankroll líquido)
+
+# Parámetros Institucionales/Fricción Añadidos
+TAX_RETENTION_RATE = 0.07  # Retención del 7% sobre ganancias netas (Común en MX: 1% federal + 6% estatal, p.ej. Caliente/Draftea)
+MARKET_BLEND_ALPHA = 0.85  # Peso del modelo vs mercado (85% modelo, 15% mercado)
+EXPECTED_CLV_DROP = 0.015  # Penalización por slippage esperado del CLV (-1.5%)
+MAX_BET_LIQUIDITY = {      # Límites de liquidez absolutos en USD o Unidad Base
+    'D1': 2000.0, 'SP1': 2000.0, 'I1': 2000.0, 'G1': 2000.0, 'F1': 2000.0,
+    'D2': 1000.0, 'F2': 1000.0,
+    'T1': 500.0,
+    'DEFAULT': 200.0
+}
 
 def run_simulation():
     PREDICTIONS_PATH = '../data/processed/test_predictions.parquet'
@@ -42,6 +53,16 @@ def run_simulation():
     odds_win = df['odds_win'].values
     odds_draw = df['odds_draw'].values
     odds_loss = df['odds_loss'].values
+    
+    # Comprobar si tenemos las cuotas de cierre para el CLV
+    has_closing_odds = all(c in df.columns for c in ['closing_odds_win', 'closing_odds_draw', 'closing_odds_loss'])
+    if has_closing_odds:
+        c_odds_win = df['closing_odds_win'].values
+        c_odds_draw = df['closing_odds_draw'].values
+        c_odds_loss = df['closing_odds_loss'].values
+    else:
+        logger.warning("No se detectaron columnas de 'closing_odds_*' en el dataset. Se omitirá el cálculo de CLV.")
+        
     dates = df['match_date'].values
     competitions = df['competition'].values if 'competition' in df.columns else np.array([None]*len(df))
     
@@ -54,6 +75,12 @@ def run_simulation():
     total_staked = 0.0
     bets_placed = 0
     bets_won = 0
+    
+    # Nuevas variables de rastreo financiero
+    total_expected_profit = 0.0 # Para calcular xYield
+    historical_peak = liquid_bankroll
+    historical_mdd = 0.0
+    clv_list = []
     
     # Agrupar índices por fecha (timestamp) para evitar Sequential Loop Bug
     unique_dates = np.unique(dates)
@@ -77,7 +104,19 @@ def run_simulation():
             if np.isnan(odds).any():
                 continue
                 
-            evs = [ (probs[j] * odds[j]) - 1 for j in range(3) ]
+            # Extraer probabilidad implícita del mercado (des-vigificada)
+            market_implied = [1 / odds[j] for j in range(3)]
+            margin = sum(market_implied)
+            market_probs = [p / margin for p in market_implied]
+            
+            # Blending de probabilidades (Anclaje a la realidad)
+            blended_probs = [(MARKET_BLEND_ALPHA * probs[j]) + ((1 - MARKET_BLEND_ALPHA) * market_probs[j]) for j in range(3)]
+            
+            # Calcular Net Odds (Ganancia menos impuestos)
+            net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
+            
+            # Net EV descontando el drop del CLV esperado
+            evs = [ (blended_probs[j] * net_odds[j]) - 1 - EXPECTED_CLV_DROP for j in range(3) ]
             
             # Obtener umbrales dinámicos para esta liga
             league_ev_thresh = EV_THRESHOLDS.get(comp, EV_THRESHOLDS['DEFAULT'])
@@ -99,7 +138,11 @@ def run_simulation():
                 implied_prob_X = 1 / odds[1]
                 total_implied = implied_prob_1 + implied_prob_X
                 combined_odds = 1 / total_implied
-                best_ev = ((probs[2] + probs[1]) * combined_odds) - 1
+                
+                blended_prob_1X = blended_probs[2] + blended_probs[1]
+                net_combined_odds = 1 + (combined_odds - 1) * (1 - TAX_RETENTION_RATE)
+                best_ev = (blended_prob_1X * net_combined_odds) - 1 - EXPECTED_CLV_DROP
+                
                 best_choice = 2
                 secondary_choice = 1
             
@@ -134,7 +177,10 @@ def run_simulation():
             kelly_fraction = bet['kelly_fraction']
             
             if bet_type == 'single':
-                b = odds[best_choice] - 1
+                # 'best_ev' ya es el Net EV
+                # 'b' debe ser la cuota neta de impuesto
+                net_odd = 1 + (odds[best_choice] - 1) * (1 - TAX_RETENTION_RATE)
+                b = net_odd - 1
                 kelly_pct = best_ev / b if b > 0 else 0
                 
                 # Conservador en cuotas bajas para mitigar trampa isotónica
@@ -145,6 +191,12 @@ def run_simulation():
                 if stake_pct < 0.005: continue
                     
                 stake = liquid_bankroll * stake_pct
+                
+                # Limitar apuesta por liquidez máxima de la liga
+                max_liquidity = MAX_BET_LIQUIDITY.get(comp, MAX_BET_LIQUIDITY['DEFAULT'])
+                if stake > max_liquidity:
+                    stake = max_liquidity
+
                 if liquid_bankroll - stake < 0:
                     stake = liquid_bankroll
                     if stake <= 0: break
@@ -153,6 +205,16 @@ def run_simulation():
                 day_staked += stake
                 total_staked += stake
                 bets_placed += 1
+                total_expected_profit += (stake * best_ev) # Acumular EV monetario para xYield
+                
+                # Calcular CLV (Closing Line Value)
+                if has_closing_odds:
+                    idx = bet['index']
+                    closing_odds = [c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]]
+                    c_odd = closing_odds[best_choice]
+                    if not np.isnan(c_odd) and c_odd > 0:
+                        clv = (odds[best_choice] / c_odd) - 1
+                        clv_list.append(clv)
                 
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
@@ -160,10 +222,14 @@ def run_simulation():
                 league_stats[comp]['staked'] += stake
                 
                 if real_outcome == best_choice:
-                    profit = stake * odds[best_choice]
-                    day_profit += profit
+                    gross_profit = stake * (odds[best_choice] - 1)
+                    # Aplicar fricción / impuestos sobre la ganancia neta
+                    net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE)
+                    total_return = stake + net_profit
+                    
+                    day_profit += total_return
                     bets_won += 1
-                    league_stats[comp]['profit'] += (profit - stake)
+                    league_stats[comp]['profit'] += net_profit
                     league_stats[comp]['won'] += 1
                 else:
                     league_stats[comp]['profit'] -= stake
@@ -174,7 +240,8 @@ def run_simulation():
                 total_implied = implied_prob_1 + implied_prob_X
                 combined_odds = 1 / total_implied
                 
-                b = combined_odds - 1
+                net_combined_odds = 1 + (combined_odds - 1) * (1 - TAX_RETENTION_RATE)
+                b = net_combined_odds - 1
                 kelly_pct = best_ev / b if b > 0 else 0
                 if combined_odds < 1.30:
                     kelly_pct = min(kelly_pct, 0.01)
@@ -183,6 +250,12 @@ def run_simulation():
                 if stake_pct < 0.005: continue
                     
                 total_dutch_stake = liquid_bankroll * stake_pct
+                
+                # Limitar apuesta por liquidez máxima de la liga
+                max_liquidity = MAX_BET_LIQUIDITY.get(comp, MAX_BET_LIQUIDITY['DEFAULT'])
+                if total_dutch_stake > max_liquidity:
+                    total_dutch_stake = max_liquidity
+
                 if liquid_bankroll - total_dutch_stake < 0:
                     total_dutch_stake = liquid_bankroll
                     if total_dutch_stake <= 0: break
@@ -194,6 +267,19 @@ def run_simulation():
                 day_staked += total_dutch_stake
                 total_staked += total_dutch_stake
                 bets_placed += 1
+                total_expected_profit += (total_dutch_stake * best_ev) # Acumular EV monetario para xYield
+                
+                # Calcular CLV combinado para Dutching
+                if has_closing_odds:
+                    idx = bet['index']
+                    c_odd_1 = c_odds_win[idx]
+                    c_odd_X = c_odds_draw[idx]
+                    if not np.isnan(c_odd_1) and not np.isnan(c_odd_X) and c_odd_1 > 0 and c_odd_X > 0:
+                        c_implied_1 = 1 / c_odd_1
+                        c_implied_X = 1 / c_odd_X
+                        c_combined_odds = 1 / (c_implied_1 + c_implied_X)
+                        clv = (combined_odds / c_combined_odds) - 1
+                        clv_list.append(clv)
                 
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
@@ -201,16 +287,20 @@ def run_simulation():
                 league_stats[comp]['staked'] += total_dutch_stake
                 
                 if real_outcome == best_choice:
-                    profit = stake_1 * odds[best_choice]
-                    day_profit += profit
+                    gross_profit = stake_1 * (odds[best_choice] - 1) - stake_X
+                    net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE) if gross_profit > 0 else gross_profit
+                    total_return = total_dutch_stake + net_profit
+                    day_profit += total_return
                     bets_won += 1
-                    league_stats[comp]['profit'] += (profit - total_dutch_stake)
+                    league_stats[comp]['profit'] += net_profit
                     league_stats[comp]['won'] += 1
                 elif real_outcome == secondary_choice:
-                    profit = stake_X * odds[secondary_choice]
-                    day_profit += profit
+                    gross_profit = stake_X * (odds[secondary_choice] - 1) - stake_1
+                    net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE) if gross_profit > 0 else gross_profit
+                    total_return = total_dutch_stake + net_profit
+                    day_profit += total_return
                     bets_won += 1
-                    league_stats[comp]['profit'] += (profit - total_dutch_stake)
+                    league_stats[comp]['profit'] += net_profit
                     league_stats[comp]['won'] += 1
                 else:
                     league_stats[comp]['profit'] -= total_dutch_stake
@@ -219,18 +309,31 @@ def run_simulation():
         liquid_bankroll += day_profit
         bankroll_history.append(liquid_bankroll)
         
+        # Actualizar Drawdown Histórico Real
+        if liquid_bankroll > historical_peak:
+            historical_peak = liquid_bankroll
+        current_dd = (historical_peak - liquid_bankroll) / historical_peak
+        if current_dd > historical_mdd:
+            historical_mdd = current_dd
+        
         if day_staked > 0:
             daily_multiplier = liquid_bankroll / start_of_day_bankroll
             daily_multipliers.append(daily_multiplier)
 
     yield_pct = ((liquid_bankroll - 1000.0) / total_staked) * 100 if total_staked > 0 else 0
     roi_pct = ((liquid_bankroll - 1000.0) / 1000.0) * 100
+    x_yield_pct = (total_expected_profit / total_staked) * 100 if total_staked > 0 else 0
+    avg_clv = np.mean(clv_list) * 100 if len(clv_list) > 0 else 0.0
     
     logger.info(f"Capital Inicial: $1000.00 | Capital Final Líquido: ${liquid_bankroll:.2f}")
     logger.info(f"Apuestas Realizadas: {bets_placed} | Apuestas Ganadas: {bets_won} ({(bets_won/bets_placed)*100:.1f}% WinRate)" if bets_placed > 0 else "Apuestas Realizadas: 0")
     logger.info(f"Volumen Apostado (Turnover): ${total_staked:.2f}")
-    logger.info(f"Yield (Beneficio Neto / Turnover): {yield_pct:.2f}%")
+    logger.info(f"Fricción de Mercado Simulada (Impuestos / Ganancias Neta): {TAX_RETENTION_RATE*100:.1f}%")
+    logger.info(f"Yield Real (Beneficio Neto / Turnover): {yield_pct:.2f}% | Expected Yield (xYield): {x_yield_pct:.2f}%")
+    if has_closing_odds:
+        logger.info(f"Promedio Closing Line Value (CLV): {avg_clv:.2f}%")
     logger.info(f"ROI del Capital Inicial: {roi_pct:.2f}%")
+    logger.info(f"Maximum Drawdown Histórico Real: {historical_mdd*100:.2f}%")
     
     # --- DESGLOSE POR LIGAS ---
     logger.info("=== RENDIMIENTO POR LIGA ===")
