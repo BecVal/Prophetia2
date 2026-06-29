@@ -178,27 +178,57 @@ def main():
     
     prob_loss, prob_draw, prob_win = y_prob
     
-    ev_win = calculate_ev(prob_win, odds_1)
-    ev_draw = calculate_ev(prob_draw, odds_X)
-    ev_loss = calculate_ev(prob_loss, odds_2)
+    # Quant Blending Parámetros
+    TAX_RETENTION_RATE = 0.07
+    MARKET_BLEND_ALPHA = 0.85
+    EXPECTED_CLV_DROP = 0.015
+    
+    # Probabilidades de Mercado
+    margin = impl_win + impl_draw + impl_loss
+    market_prob_win = impl_win / margin
+    market_prob_draw = impl_draw / margin
+    market_prob_loss = impl_loss / margin
+    
+    # Blended Probs
+    blend_win = (MARKET_BLEND_ALPHA * prob_win) + ((1 - MARKET_BLEND_ALPHA) * market_prob_win)
+    blend_draw = (MARKET_BLEND_ALPHA * prob_draw) + ((1 - MARKET_BLEND_ALPHA) * market_prob_draw)
+    blend_loss = (MARKET_BLEND_ALPHA * prob_loss) + ((1 - MARKET_BLEND_ALPHA) * market_prob_loss)
+    
+    # Net Odds
+    net_odds_1 = 1 + (odds_1 - 1) * (1 - TAX_RETENTION_RATE)
+    net_odds_X = 1 + (odds_X - 1) * (1 - TAX_RETENTION_RATE)
+    net_odds_2 = 1 + (odds_2 - 1) * (1 - TAX_RETENTION_RATE)
+    
+    # Net EV
+    ev_win = (blend_win * net_odds_1) - 1 - EXPECTED_CLV_DROP
+    ev_draw = (blend_draw * net_odds_X) - 1 - EXPECTED_CLV_DROP
+    ev_loss = (blend_loss * net_odds_2) - 1 - EXPECTED_CLV_DROP
+    
+    # Dutching 1X (Doble Oportunidad Local o Empate)
+    total_implied_1X = impl_win + impl_draw
+    combined_odds_1X = 1 / total_implied_1X
+    net_combined_odds_1X = 1 + (combined_odds_1X - 1) * (1 - TAX_RETENTION_RATE)
+    blend_1X = blend_win + blend_draw
+    ev_1X = (blend_1X * net_combined_odds_1X) - 1 - EXPECTED_CLV_DROP
     
     # Kelly Criterion
-    def calc_kelly_stake(ev, odds):
-        b = odds - 1
+    def calc_kelly_stake(ev, net_odd):
+        b = net_odd - 1
         return (ev / b) if b > 0 and ev > 0 else 0
         
-    k_win = calc_kelly_stake(ev_win, odds_1)
-    k_draw = calc_kelly_stake(ev_draw, odds_X)
-    k_loss = calc_kelly_stake(ev_loss, odds_2)
+    k_win = calc_kelly_stake(ev_win, net_odds_1)
+    k_draw = calc_kelly_stake(ev_draw, net_odds_X)
+    k_loss = calc_kelly_stake(ev_loss, net_odds_2)
+    k_1X = calc_kelly_stake(ev_1X, net_combined_odds_1X)
     
     # Mostrar resultados en tabla
     console.print("\n[bold]=== ANÁLISIS CUANTITATIVO DEL PARTIDO ===[/bold]")
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Mercado", style="cyan")
-    table.add_column("Odds (Bookie)")
+    table.add_column("Odds (Brutas)")
     table.add_column("Prob. Bookie", justify="right")
-    table.add_column("Prob. Modelo", justify="right")
-    table.add_column("EV (Expected Value)", justify="right")
+    table.add_column("Prob. Blended", justify="right")
+    table.add_column("Net EV", justify="right")
     table.add_column("Kelly %", justify="right")
     
     def color_ev(ev):
@@ -208,28 +238,16 @@ def main():
         return f"[green]{p_mod*100:.1f}%[/green]" if p_mod > p_book else f"[dim]{p_mod*100:.1f}%[/dim]"
 
     table.add_row(
-        f"1 (Local - {home_team})", 
-        f"{odds_1:.2f}", 
-        f"{(1/odds_1)*100:.1f}%", 
-        color_prob(prob_win, 1/odds_1), 
-        color_ev(ev_win), 
-        f"{k_win*100:.2f}%"
+        f"1 (Local - {home_team})", f"{odds_1:.2f}", f"{(market_prob_win)*100:.1f}%", color_prob(blend_win, market_prob_win), color_ev(ev_win), f"{k_win*100:.2f}%"
     )
     table.add_row(
-        "X (Empate)", 
-        f"{odds_X:.2f}", 
-        f"{(1/odds_X)*100:.1f}%", 
-        color_prob(prob_draw, 1/odds_X), 
-        color_ev(ev_draw), 
-        f"{k_draw*100:.2f}%"
+        "X (Empate)", f"{odds_X:.2f}", f"{(market_prob_draw)*100:.1f}%", color_prob(blend_draw, market_prob_draw), color_ev(ev_draw), f"{k_draw*100:.2f}%"
     )
     table.add_row(
-        f"2 (Visita - {away_team})", 
-        f"{odds_2:.2f}", 
-        f"{(1/odds_2)*100:.1f}%", 
-        color_prob(prob_loss, 1/odds_2), 
-        color_ev(ev_loss), 
-        f"{k_loss*100:.2f}%"
+        f"2 (Visita - {away_team})", f"{odds_2:.2f}", f"{(market_prob_loss)*100:.1f}%", color_prob(blend_loss, market_prob_loss), color_ev(ev_loss), f"{k_loss*100:.2f}%"
+    )
+    table.add_row(
+        "1X (Local o Empate)", f"{combined_odds_1X:.2f}", f"{(market_prob_win + market_prob_draw)*100:.1f}%", color_prob(blend_1X, market_prob_win + market_prob_draw), color_ev(ev_1X), f"{k_1X*100:.2f}%"
     )
     
     console.print(table)
@@ -237,7 +255,7 @@ def main():
     # Recomendación Final
     console.print("\n[bold]=== RECOMENDACIÓN DE STAKING ===[/bold]")
     
-    best_ev = max(ev_win, ev_draw, ev_loss)
+    best_ev = max(ev_win, ev_draw, ev_loss, ev_1X)
     if best_ev > 0:
         if best_ev == ev_win:
             selection = "Local (1)"
@@ -247,6 +265,10 @@ def main():
             selection = "Empate (X)"
             k_pct = k_draw * kelly_fraction
             odds = odds_X
+        elif best_ev == ev_1X:
+            selection = "Doble Oportunidad (1X) / Dutching"
+            k_pct = k_1X * kelly_fraction
+            odds = combined_odds_1X
         else:
             selection = "Visitante (2)"
             k_pct = k_loss * kelly_fraction
@@ -263,13 +285,13 @@ def main():
         else:
             rec = Panel(
                 f"[bold green]VALUE DETECTADO[/bold green]\n"
-                f"Selección: [bold]{selection}[/bold] @ {odds:.2f}\n"
+                f"Selección: [bold]{selection}[/bold] @ {odds:.2f} (Cuota Bruta Mínima)\n"
                 f"Stake Recomendado: [bold]${stake_amount:.2f}[/bold] ({k_pct*100:.2f}% del bankroll)",
                 title="SISTEMA DE STAKING", border_style="green"
             )
             console.print(rec)
     else:
-        console.print(Panel("[bold red]NO HAY VALUE EN ESTE PARTIDO.[/bold red]\nEl mercado es más eficiente que nuestra proyección.", title="SISTEMA DE STAKING", border_style="red"))
+        console.print(Panel("[bold red]NO HAY VALUE EN ESTE PARTIDO.[/bold red]\nEl mercado es más eficiente que nuestra proyección tras descontar impuestos y CLV slippage.", title="SISTEMA DE STAKING", border_style="red"))
 
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))

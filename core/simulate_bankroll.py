@@ -11,12 +11,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuración Quant
-FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
+FILTER_BY_WHITELIST = False  # True: ignora partidos fuera de Whitelist en la simulación financiera
 WHITELIST_LEAGUES = ['I1', 'D2', 'SP1', 'F2', 'G1', 'D1', 'T1', 'F1']
 
 # Diccionarios de riesgo por liga (ajustados a liquidez y eficiencia)
-KELLY_FRACTIONS = {'D2': 0.12, 'I1': 0.01, 'SP1': 0.10, 'F2': 0.05, 'G1': 0.02, 'D1': 0.02, 'T1': 0.10, 'F1': 0.03, 'DEFAULT': 0.02}
-EV_THRESHOLDS = {'D2': 0.025, 'I1': 0.06, 'SP1': 0.02, 'F2': 0.035, 'G1': 0.06, 'D1': 0.05, 'T1': 0.015, 'F1': 0.025, 'DEFAULT': 0.04}
+KELLY_FRACTIONS = {'D2': 0.12, 'I1': 0.01, 'SP1': 0.10, 'F2': 0.05, 'G1': 0.02, 'D1': 0.02, 'T1': 0.10, 'F1': 0.03, 'E1': 0.04, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.02}
+EV_THRESHOLDS = {'D2': 0.025, 'I1': 0.06, 'SP1': 0.02, 'F2': 0.035, 'G1': 0.06, 'D1': 0.05, 'T1': 0.015, 'F1': 0.025, 'E1': 0.03, 'N1': 0.06, 'SP2': 0.06, 'P1': 0.05, 'DEFAULT': 0.04}
 
 MAX_STAKE_PCT = 0.05  # Cap de apuesta por partido (5% del bankroll líquido)
 
@@ -75,6 +75,7 @@ def run_simulation():
     total_staked = 0.0
     bets_placed = 0
     bets_won = 0
+    total_analyzed_matches = 0
     
     # Nuevas variables de rastreo financiero
     total_expected_profit = 0.0 # Para calcular xYield
@@ -103,6 +104,8 @@ def run_simulation():
             
             if np.isnan(odds).any():
                 continue
+                
+            total_analyzed_matches += 1
                 
             # Extraer probabilidad implícita del mercado (des-vigificada)
             market_implied = [1 / odds[j] for j in range(3)]
@@ -325,8 +328,11 @@ def run_simulation():
     x_yield_pct = (total_expected_profit / total_staked) * 100 if total_staked > 0 else 0
     avg_clv = np.mean(clv_list) * 100 if len(clv_list) > 0 else 0.0
     
+    bet_percentage = (bets_placed / total_analyzed_matches) * 100 if total_analyzed_matches > 0 else 0
+    
     logger.info(f"Capital Inicial: $1000.00 | Capital Final Líquido: ${liquid_bankroll:.2f}")
-    logger.info(f"Apuestas Realizadas: {bets_placed} | Apuestas Ganadas: {bets_won} ({(bets_won/bets_placed)*100:.1f}% WinRate)" if bets_placed > 0 else "Apuestas Realizadas: 0")
+    logger.info(f"Partidos Analizados (Whitelist & Cuotas válidas): {total_analyzed_matches}")
+    logger.info(f"Apuestas Realizadas: {bets_placed} ({bet_percentage:.1f}% de selectividad) | Apuestas Ganadas: {bets_won} ({(bets_won/bets_placed)*100:.1f}% WinRate)" if bets_placed > 0 else "Apuestas Realizadas: 0")
     logger.info(f"Volumen Apostado (Turnover): ${total_staked:.2f}")
     logger.info(f"Fricción de Mercado Simulada (Impuestos / Ganancias Neta): {TAX_RETENTION_RATE*100:.1f}%")
     logger.info(f"Yield Real (Beneficio Neto / Turnover): {yield_pct:.2f}% | Expected Yield (xYield): {x_yield_pct:.2f}%")
