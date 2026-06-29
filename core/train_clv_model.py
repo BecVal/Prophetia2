@@ -2,7 +2,9 @@ import os
 import pandas as pd
 import numpy as np
 import logging
+import optuna
 from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, accuracy_score, precision_score, recall_score
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,14 +26,19 @@ def train_clv_model():
         df = df.sort_values('match_date').reset_index(drop=True)
     df = df[df['is_home'] == 1].reset_index(drop=True)
 
-    # Cargar X_train y X_test (con las features generadas como poisson y medias)
+    # Cargar X_train y X_test
     X_train = pd.read_parquet(X_TRAIN_PATH, engine='fastparquet')
     X_test = pd.read_parquet(X_TEST_PATH, engine='fastparquet')
     
-    # Cargar probabilidades
+    # Cargar probabilidades base
     df_train_preds = pd.read_parquet(TRAIN_PREDS_PATH, engine='fastparquet')
     df_test_preds = pd.read_parquet(PREDICTIONS_PATH, engine='fastparquet')
     
+    # Calcular implied probs de apertura
+    df['open_implied_loss'] = 1 / df['open_odds_loss']
+    df['open_implied_draw'] = 1 / df['open_odds_draw']
+    df['open_implied_win'] = 1 / df['open_odds_win']
+
     # Calcular target drifts
     df['drift_loss'] = (df['odds_loss'] / df['open_odds_loss']) - 1
     df['drift_draw'] = (df['odds_draw'] / df['open_odds_draw']) - 1
@@ -47,28 +54,109 @@ def train_clv_model():
     y_drift_draw_train = y_drift_draw.iloc[:split_idx]
     y_drift_win_train = y_drift_win.iloc[:split_idx]
     
-    # Inyectar probabilidades base a las features
+    y_drift_loss_test = y_drift_loss.iloc[split_idx:]
+    y_drift_draw_test = y_drift_draw.iloc[split_idx:]
+    y_drift_win_test = y_drift_win.iloc[split_idx:]
+    
+    logger.info("Inyectando Probabilidades y Características de Divergencia...")
+    # Inyectar para Train
     X_train['prob_loss'] = df_train_preds['prob_loss'].values
     X_train['prob_draw'] = df_train_preds['prob_draw'].values
     X_train['prob_win'] = df_train_preds['prob_win'].values
     
+    X_train['open_implied_loss'] = df['open_implied_loss'].iloc[:split_idx].values
+    X_train['open_implied_draw'] = df['open_implied_draw'].iloc[:split_idx].values
+    X_train['open_implied_win'] = df['open_implied_win'].iloc[:split_idx].values
+    
+    X_train['divergence_loss'] = X_train['prob_loss'] - X_train['open_implied_loss']
+    X_train['divergence_draw'] = X_train['prob_draw'] - X_train['open_implied_draw']
+    X_train['divergence_win'] = X_train['prob_win'] - X_train['open_implied_win']
+    
+    # Inyectar para Test
     X_test['prob_loss'] = df_test_preds['prob_loss'].values
     X_test['prob_draw'] = df_test_preds['prob_draw'].values
     X_test['prob_win'] = df_test_preds['prob_win'].values
     
-    logger.info("Entrenando Meta-Modelos XGBoost (Odds Drift)...")
-    xgb_drift = XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42, device='cuda')
+    X_test['open_implied_loss'] = df['open_implied_loss'].iloc[split_idx:].values
+    X_test['open_implied_draw'] = df['open_implied_draw'].iloc[split_idx:].values
+    X_test['open_implied_win'] = df['open_implied_win'].iloc[split_idx:].values
     
-    xgb_drift.fit(X_train, y_drift_win_train)
-    pred_drift_win = xgb_drift.predict(X_test)
+    X_test['divergence_loss'] = X_test['prob_loss'] - X_test['open_implied_loss']
+    X_test['divergence_draw'] = X_test['prob_draw'] - X_test['open_implied_draw']
+    X_test['divergence_win'] = X_test['prob_win'] - X_test['open_implied_win']
     
-    xgb_drift.fit(X_train, y_drift_draw_train)
-    pred_drift_draw = xgb_drift.predict(X_test)
+    def optimize_xgb(X, y):
+        def objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                'max_depth': trial.suggest_int('max_depth', 2, 8),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'random_state': 42,
+                'device': 'cuda'
+            }
+            model = XGBRegressor(**params)
+            
+            # Simple Time-based Train/Val split
+            val_split = int(len(X) * 0.8)
+            X_tr, y_tr = X.iloc[:val_split], y.iloc[:val_split]
+            X_va, y_va = X.iloc[val_split:], y.iloc[val_split:]
+            
+            model.fit(X_tr, y_tr)
+            preds = model.predict(X_va)
+            return mean_absolute_error(y_va, preds)
+        
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=20)
+        
+        best_params = study.best_params
+        best_params['random_state'] = 42
+        best_params['device'] = 'cuda'
+        
+        final_model = XGBRegressor(**best_params)
+        final_model.fit(X, y)
+        return final_model
+
+    logger.info("Entrenando y Optimizando Meta-Modelos XGBoost (Odds Drift) con Optuna...")
     
-    xgb_drift.fit(X_train, y_drift_loss_train)
-    pred_drift_loss = xgb_drift.predict(X_test)
+    logger.info("Optimizando modelo para Drift Win...")
+    model_win = optimize_xgb(X_train, y_drift_win_train)
+    pred_drift_win = model_win.predict(X_test)
     
-    logger.info("Actualizando test_predictions.parquet con el meta-modelo...")
+    logger.info("Optimizando modelo para Drift Draw...")
+    model_draw = optimize_xgb(X_train, y_drift_draw_train)
+    pred_drift_draw = model_draw.predict(X_test)
+    
+    logger.info("Optimizando modelo para Drift Loss...")
+    model_loss = optimize_xgb(X_train, y_drift_loss_train)
+    pred_drift_loss = model_loss.predict(X_test)
+    
+    def print_metrics(y_true, y_pred, name):
+        mae = mean_absolute_error(y_true, y_pred)
+        
+        # Direccionalidad binaria (1 si Drift > 0 "Mueve en contra", 0 si Drift <= 0 "Mueve a favor o estable")
+        y_true_bin = (y_true > 0).astype(int)
+        y_pred_bin = (y_pred > 0).astype(int)
+        
+        acc = accuracy_score(y_true_bin, y_pred_bin)
+        prec = precision_score(y_true_bin, y_pred_bin, zero_division=0)
+        rec = recall_score(y_true_bin, y_pred_bin, zero_division=0)
+        
+        logger.info(f"--- Métricas para {name} ---")
+        logger.info(f"MAE: {mae:.5f}")
+        logger.info(f"Accuracy Direccional: {acc*100:.2f}%")
+        logger.info(f"Precision (Detectar Drift > 0): {prec*100:.2f}%")
+        logger.info(f"Recall (Detectar Drift > 0): {rec*100:.2f}%")
+        logger.info(f"-----------------------------")
+
+    logger.info("=== EVALUACIÓN DEL META-MODELO CLV ===")
+    print_metrics(y_drift_win_test, pred_drift_win, "Win (Local)")
+    print_metrics(y_drift_draw_test, pred_drift_draw, "Draw (Empate)")
+    print_metrics(y_drift_loss_test, pred_drift_loss, "Loss (Visitante)")
+    
+    logger.info("Actualizando test_predictions.parquet con el meta-modelo optimizado...")
     
     df_test_preds['pred_drift_loss'] = pred_drift_loss
     df_test_preds['pred_drift_draw'] = pred_drift_draw
