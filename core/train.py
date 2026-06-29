@@ -144,11 +144,13 @@ def train_model():
         'fouls_committed', 'fouls_won', 'yellow_cards', 'red_cards',
         'aerials_won']
         
-    feature_cols = ['is_home', 'rest_days', 'relative_attack_strength', 
+    feature_cols = ['is_home', 'rest_days', 'rest_diff', 'relative_attack_strength', 
                     'team_att_rating', 'team_def_rating', 'opp_att_rating', 'opp_def_rating',
                     'team_elo', 'opp_elo', 'elo_diff',
                     'team_squad_value', 'opp_squad_value', 'squad_value_diff',
                     'h2h_games_played', 'h2h_points_last_5', 'h2h_win_rate_hist', 'h2h_draw_rate_hist', 'is_european_hangover',
+                    'win_streak_3', 'loss_streak_3', 'xg_momentum_5', 
+                    'opp_win_streak_3', 'opp_loss_streak_3', 'opp_xg_momentum_5',
                     'open_prob_win', 'open_prob_draw', 'open_prob_loss']
     for stat in base_stats:
         feature_cols.append(f"{stat}_ema3")
@@ -349,6 +351,7 @@ def train_model():
             'prob_loss': y_prob[:, 0],
             'prob_draw': y_prob[:, 1],
             'prob_win': y_prob[:, 2],
+            # Drift prediction is handled in train_clv_model.py
             'outcome': y_test.values,
             # Cuotas a las que se realiza la apuesta (Apertura)
             'odds_win': df['open_odds_win'].iloc[split_idx:].values if 'open_odds_win' in df.columns else df['odds_win'].iloc[split_idx:].values,
@@ -369,7 +372,25 @@ def train_model():
         preds_path = os.path.join(processed_dir, 'test_predictions.parquet')
         df_test.to_parquet(preds_path, engine='fastparquet')
         logger.info(f"Predicciones guardadas en: {preds_path}")
-        logger.info("Ejecuta 'python core/simulate_bankroll.py' para la evaluación financiera independiente.")
+        
+        # Save train_predictions.parquet for CLV model
+        train_prob = final_model.predict_proba(X_train)
+        train_prob = train_prob / train_prob.sum(axis=1, keepdims=True)
+        
+        df_train = pd.DataFrame({
+            'match_date': df['match_date'].iloc[:split_idx].values if 'match_date' in df.columns else np.array([None]*len(y_train)),
+            'prob_loss': train_prob[:, 0],
+            'prob_draw': train_prob[:, 1],
+            'prob_win': train_prob[:, 2],
+        })
+        train_preds_path = os.path.join(processed_dir, 'train_predictions.parquet')
+        df_train.to_parquet(train_preds_path, engine='fastparquet')
+        
+        # Save X_train and X_test for decoupled CLV model
+        X_train.to_parquet(os.path.join(processed_dir, 'X_train.parquet'), engine='fastparquet')
+        X_test.to_parquet(os.path.join(processed_dir, 'X_test.parquet'), engine='fastparquet')
+        
+        logger.info("Ejecuta 'python core/train_clv_model.py' a continuación para entrenar el meta-modelo.")
 
     # Guardar modelo
     if not os.path.exists(MODEL_SAVE_DIR):

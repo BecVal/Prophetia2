@@ -50,7 +50,7 @@ def add_ema_features(df, spans=[3, 5]):
         for span in spans:
             # shift(1) asegura que NO usemos los datos del partido actual (Fix Data Leakage)
             df[f'{col}_ema{span}'] = df.groupby('team')[col].transform(
-                lambda x: x.shift(1).ewm(span=span, min_periods=1).mean()
+                lambda x: x.shift(1).ewm(span=span, min_periods=2).mean()
             )
 
     df = df.sort_values('match_date').reset_index(drop=True)
@@ -163,7 +163,7 @@ def add_elo_ratings(df):
 
 def add_contextual_features(df):
     logger.info(
-        "Calculando variables contextuales (Días de descanso y Fuerza del oponente)...")
+        "Calculando variables contextuales (Días de descanso, fuerza del oponente y rachas)...")
 
     # 1. Días de descanso
     df = df.sort_values(['team', 'match_date']).reset_index(drop=True)
@@ -171,12 +171,34 @@ def add_contextual_features(df):
     # Promedio semanal si es el primer partido
     df['rest_days'] = df['rest_days'].fillna(7.0)
 
-    # 2. Fuerza del Oponente (Traer el historial 'ema' del rival)
+    # 2. Inercia (Rachas y xG Momentum)
+    df['is_win'] = (df['outcome'] == 1).astype(int)
+    df['is_loss'] = (df['outcome'] == -1).astype(int)
+    
+    df['win_streak_3'] = df.groupby('team')['is_win'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).sum()).fillna(0)
+    df['loss_streak_3'] = df.groupby('team')['is_loss'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).sum()).fillna(0)
+    
+    df['xg_diff_raw'] = df['xg_created'] - df['xg_conceded']
+    
+    def calc_slope(y):
+        if len(y) < 2: return 0.0
+        x = np.arange(len(y))
+        # cov(x,y)/var(x)
+        return np.polyfit(x, y, 1)[0]
+        
+    df['xg_momentum_5'] = df.groupby('team')['xg_diff_raw'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=2).apply(calc_slope, raw=True)
+    ).fillna(0)
+    
+    df = df.drop(columns=['is_win', 'is_loss', 'xg_diff_raw'])
+
+    # 3. Fuerza del Oponente (Traer el historial 'ema' del rival y sus rachas)
     ema_cols = [c for c in df.columns if '_ema' in c]
-    opp_df = df[['team', 'match_date'] + ema_cols].copy()
+    opp_cols = ema_cols + ['rest_days', 'win_streak_3', 'loss_streak_3', 'xg_momentum_5']
+    opp_df = df[['team', 'match_date'] + opp_cols].copy()
 
     # Renombrar columnas para el oponente
-    opp_rename = {c: f"opp_{c}" for c in ema_cols}
+    opp_rename = {c: f"opp_{c}" for c in opp_cols}
     opp_rename['team'] = 'opponent'
     opp_df = opp_df.rename(columns=opp_rename)
 
@@ -188,6 +210,9 @@ def add_contextual_features(df):
         if c != 'opponent':
             df[c] = df[c].fillna(0)
 
+    # 4. Métricas Relativas
+    df['rest_diff'] = df['rest_days'] - df['opp_rest_days']
+    
     # Opcional: Crear métricas de fuerza relativa (Ej: Mi ataque vs Su defensa usando EMA3)
     if 'xg_created_ema3' in df.columns and 'opp_xg_conceded_ema3' in df.columns:
         df['relative_attack_strength'] = df['xg_created_ema3'] - \

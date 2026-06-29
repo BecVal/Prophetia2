@@ -112,8 +112,17 @@ def run_simulation():
             margin = sum(market_implied)
             market_probs = [p / margin for p in market_implied]
             
-            # Blending de probabilidades (Anclaje a la realidad)
-            blended_probs = [(MARKET_BLEND_ALPHA * probs[j]) + ((1 - MARKET_BLEND_ALPHA) * market_probs[j]) for j in range(3)]
+            # Blending de probabilidades (Anclaje a la realidad) dinámico
+            # Si la divergencia es absurda (>20%), desconfiamos del modelo
+            blended_probs = []
+            for j in range(3):
+                divergence = abs(probs[j] - market_probs[j])
+                dynamic_alpha = MARKET_BLEND_ALPHA
+                if divergence > 0.20:
+                    dynamic_alpha = 0.50  # Penalización fuerte
+                elif divergence > 0.10:
+                    dynamic_alpha = 0.70  # Penalización media
+                blended_probs.append((dynamic_alpha * probs[j]) + ((1 - dynamic_alpha) * market_probs[j]))
             
             # Calcular Net Odds (Ganancia menos impuestos)
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
@@ -125,6 +134,16 @@ def run_simulation():
             league_ev_thresh = EV_THRESHOLDS.get(comp, EV_THRESHOLDS['DEFAULT'])
             league_kelly = KELLY_FRACTIONS.get(comp, KELLY_FRACTIONS['DEFAULT'])
             
+            # Meta-Modelo de Drift (CLV Optimization)
+            # Solo consideramos apuestas si el meta-modelo predice que las cuotas NO van a subir en nuestra contra.
+            # pred_drift > 0 significa que la cuota de cierre será mayor a la apertura (el mercado nos da la contra).
+            has_drift = all(c in df.columns for c in ['pred_drift_loss', 'pred_drift_draw', 'pred_drift_win'])
+            pred_drifts = [
+                df['pred_drift_loss'].iloc[i] if has_drift else 0.0,
+                df['pred_drift_draw'].iloc[i] if has_drift else 0.0,
+                df['pred_drift_win'].iloc[i] if has_drift else 0.0
+            ]
+            
             # Check for Dutching / Doble Oportunidad (Local y Empate)
             ev_local = evs[2]
             ev_draw = evs[1]
@@ -134,20 +153,25 @@ def run_simulation():
             best_ev = evs[best_choice]
             secondary_choice = None
             
+            # Si el mercado va a moverse en nuestra contra fuertemente (> 1%), cancelamos el valor aparente.
+            if pred_drifts[best_choice] > 0.01:
+                best_ev = -1.0 # Cancel bet
+            
             # Dutching logic if both Local and Draw have EV > league_ev_thresh
             if ev_local > league_ev_thresh and ev_draw > league_ev_thresh:
-                bet_type = 'dutching'
-                implied_prob_1 = 1 / odds[2]
-                implied_prob_X = 1 / odds[1]
-                total_implied = implied_prob_1 + implied_prob_X
-                combined_odds = 1 / total_implied
-                
-                blended_prob_1X = blended_probs[2] + blended_probs[1]
-                net_combined_odds = 1 + (combined_odds - 1) * (1 - TAX_RETENTION_RATE)
-                best_ev = (blended_prob_1X * net_combined_odds) - 1 - EXPECTED_CLV_DROP
-                
-                best_choice = 2
-                secondary_choice = 1
+                if pred_drifts[2] <= 0.01 and pred_drifts[1] <= 0.01:
+                    bet_type = 'dutching'
+                    implied_prob_1 = 1 / odds[2]
+                    implied_prob_X = 1 / odds[1]
+                    total_implied = implied_prob_1 + implied_prob_X
+                    combined_odds = 1 / total_implied
+                    
+                    blended_prob_1X = blended_probs[2] + blended_probs[1]
+                    net_combined_odds = 1 + (combined_odds - 1) * (1 - TAX_RETENTION_RATE)
+                    best_ev = (blended_prob_1X * net_combined_odds) - 1 - EXPECTED_CLV_DROP
+                    
+                    best_choice = 2
+                    secondary_choice = 1
             
             if best_ev > league_ev_thresh:
                 daily_bets.append({

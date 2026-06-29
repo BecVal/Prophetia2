@@ -65,15 +65,22 @@ python core/feature_engineering.py
 ```
 Se generará el dataset final de entrenamiento listo para la IA en `data/processed/matches_dataset.parquet`.
 
-### 5. Entrenamiento del Metamodelo de IA
+### 5. Entrenamiento del Modelo Predictivo
 Una vez procesados los más de 65,000 partidos históricos, entrena el modelo optimizado:
 ```bash
 python core/train.py
 ```
-Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna`, aplicará la Calibración Isotónica y exportará las predicciones del modelo al archivo `test_predictions.parquet` para su evaluación financiera.
+Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna`, aplicará la Calibración Isotónica y exportará las predicciones base a los archivos parquet.
 
-### 6. Evaluación Financiera (Bankroll Simulation)
-Dado que el modelo estocástico de Optuna puede variar, la simulación de banca se ha separado para poder ajustar los umbrales de riesgo al instante sin re-entrenar el modelo:
+### 6. Entrenamiento del Meta-Modelo CLV (Odds Drift)
+Para proteger el bankroll contra el *smart money*, entrenamos un segundo modelo que predice los movimientos de cuotas (Drift):
+```bash
+python core/train_clv_model.py
+```
+Este modelo detectará trampas de valor y actualizará `test_predictions.parquet` con predicciones de hacia dónde se moverá el mercado.
+
+### 7. Evaluación Financiera (Simulador de Bankroll)
+Por último, evalúa el desempeño de la estrategia aplicando Kelly Criterion y Bayesian Blending:
 ```bash
 python core/simulate_bankroll.py
 ```
