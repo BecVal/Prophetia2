@@ -4,8 +4,11 @@ import pandas as pd
 import numpy as np
 import logging
 import joblib
-import optuna
-from xgboost import XGBClassifier
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss
 from sklearn.model_selection import KFold
 
@@ -15,10 +18,9 @@ from data_splitter import get_base_dataset, get_train_test_split, get_cv_strateg
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 MODEL_SAVE_DIR = '../core/save_models/'
-MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'context_model.pkl')
+MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'nn_model.pkl')
 PROCESSED_DIR = '../data/processed'
 
 def get_time_weights(dates, half_life_days=365):
@@ -28,41 +30,91 @@ def get_time_weights(dates, half_life_days=365):
     days_diff = (max_date - dates).dt.days.clip(lower=0)
     return np.exp(-np.log(2) * days_diff / half_life_days)
 
-def objective(trial, X_train, y_train, dates_train, cv_strategy):
-    param = {
-        'objective': 'multi:softprob',
-        'num_class': 3,
-        'random_state': 42,
-        'device': 'cuda',
-        'max_depth': trial.suggest_int('max_depth', 2, 7),
-        'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
-        'n_estimators': trial.suggest_int('n_estimators', 100, 400),
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 7)
-    }
-    
-    cv_scores = []
-    for train_idx, val_idx in cv_strategy.split(X_train, y_train):
-        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-        y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+class PyTorchMLP(nn.Module):
+    def __init__(self, input_dim, num_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
         
-        dates_tr = dates_train.iloc[train_idx] if dates_train is not None else None
-        w_tr = get_time_weights(dates_tr)
-        
-        xgb_eval = XGBClassifier(**param)
-        xgb_eval.fit(X_tr, y_tr, sample_weight=w_tr)
-        
-        y_prob = xgb_eval.predict_proba(X_val)
-        cv_scores.append(log_loss(y_val, y_prob))
-        
-    return np.mean(cv_scores)
+    def forward(self, x):
+        return self.net(x)
 
-def train_context():
+class SklearnPyTorchWrapper:
+    def __init__(self, input_dim, num_classes=3, epochs=20, batch_size=64, lr=1e-3, device='cuda'):
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.model = None
+        self.scaler = StandardScaler()
+        
+    def _init_model(self):
+        self.model = PyTorchMLP(self.input_dim, self.num_classes).to(self.device)
+        
+    def fit(self, X, y, sample_weight=None):
+        self._init_model() # Reinicializar para asegurar pesos limpios por cada fold
+        
+        X_scaled = self.scaler.fit_transform(X)
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        y_tensor = torch.LongTensor(y.values if hasattr(y, 'values') else y).to(self.device)
+        
+        if sample_weight is not None:
+            w_vals = sample_weight.values if hasattr(sample_weight, 'values') else sample_weight
+            w_tensor = torch.FloatTensor(w_vals).to(self.device)
+        else:
+            w_tensor = torch.ones(len(X)).to(self.device)
+            
+        dataset = TensorDataset(X_tensor, y_tensor, w_tensor)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        
+        criterion = nn.CrossEntropyLoss(reduction='none')
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        
+        self.model.train()
+        for epoch in range(self.epochs):
+            for bx, by, bw in loader:
+                optimizer.zero_grad()
+                logits = self.model(bx)
+                loss = criterion(logits, by)
+                loss = (loss * bw).mean()
+                loss.backward()
+                optimizer.step()
+        return self
+
+    def predict_proba(self, X):
+        self.model.eval()
+        X_scaled = self.scaler.transform(X)
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        with torch.no_grad():
+            logits = self.model(X_tensor)
+            probs = torch.softmax(logits, dim=1)
+        return probs.cpu().numpy()
+        
+    def get_params(self):
+        return {
+            'input_dim': self.input_dim,
+            'num_classes': self.num_classes,
+            'epochs': self.epochs,
+            'batch_size': self.batch_size,
+            'lr': self.lr,
+            'device': self.device
+        }
+
+def train_nn():
     df = get_base_dataset()
     split_idx = get_train_test_split(df)
     
-    # Modelo B: Contexto y Táctica
     base_stats = [
         'shots_total', 'shots_on_target',
         'passes_total', 'passes_completed', 'pass_accuracy', 'possession_pct',
@@ -88,7 +140,7 @@ def train_context():
         
     missing_cols = [c for c in feature_cols if c not in df.columns]
     if missing_cols:
-        logger.error(f"Faltan las siguientes columnas en Contexto: {missing_cols}")
+        logger.error(f"Faltan las siguientes columnas en NN: {missing_cols}")
         feature_cols = [c for c in feature_cols if c in df.columns]
 
     X = df[feature_cols].fillna(0).copy()
@@ -103,21 +155,13 @@ def train_context():
     
     cv_strategy = get_cv_strategy(n_splits=5)
     
-    logger.info("Optimizando Modelo B (Contexto) con Optuna (50 Trials)...")
-    study = optuna.create_study(direction='minimize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=50)
+    logger.info("Configurando Red Neuronal (PyTorch)...")
     
-    logger.info(f"Mejores parámetros XGBoost Contexto: {study.best_params}")
+    input_dim = X_train.shape[1]
+    # Parámetros fijos, o podrías usar Optuna aquí también, pero para NN un buen default suele bastar
+    nn_best = SklearnPyTorchWrapper(input_dim=input_dim, epochs=25, batch_size=128, lr=0.001)
     
-    xgb_best = XGBClassifier(
-        **study.best_params,
-        objective='multi:softprob',
-        num_class=3,
-        random_state=42,
-        device='cuda'
-    )
-    
-    logger.info("Calculando predicciones OOF para Train (Contexto)...")
+    logger.info("Calculando predicciones OOF para Train (NN)...")
     pred_probs_train = np.zeros((len(X_train), 3))
     pred_probs_train[:] = np.nan
     
@@ -138,7 +182,7 @@ def train_context():
         dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
         w_tr = get_time_weights(dates_kf_train)
         
-        kf_estimator = XGBClassifier(**xgb_best.get_params())
+        kf_estimator = SklearnPyTorchWrapper(**nn_best.get_params())
         kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr)
         
         val_indices_in_original = first_train_idx[kf_val]
@@ -153,17 +197,17 @@ def train_context():
         dates_tr = train_dates.iloc[train_idx] if train_dates is not None else None
         w_tr = get_time_weights(dates_tr)
         
-        fold_estimator = XGBClassifier(**xgb_best.get_params())
+        fold_estimator = SklearnPyTorchWrapper(**nn_best.get_params())
         fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
         pred_probs_train[val_idx] = fold_estimator.predict_proba(X_val)
         
-    logger.info("Entrenando Modelo B final y prediciendo Test...")
+    logger.info("Entrenando Modelo NN final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
-    xgb_best.fit(X_train, y_train, sample_weight=final_w_tr)
-    pred_probs_test = xgb_best.predict_proba(X_test)
+    nn_best.fit(X_train, y_train, sample_weight=final_w_tr)
+    pred_probs_test = nn_best.predict_proba(X_test)
     
     # LOGS: Verificacion de calibracion
-    logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO B ===")
+    logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO NN ===")
     real_loss = (y_train == 0).mean()
     real_draw = (y_train == 1).mean()
     real_win = (y_train == 2).mean()
@@ -180,17 +224,17 @@ def train_context():
     if not os.path.exists(PROCESSED_DIR):
         os.makedirs(PROCESSED_DIR)
         
-    oof_train = pd.DataFrame(pred_probs_train, columns=['prob_loss_ctx', 'prob_draw_ctx', 'prob_win_ctx'], index=X_train.index)
-    oof_test = pd.DataFrame(pred_probs_test, columns=['prob_loss_ctx', 'prob_draw_ctx', 'prob_win_ctx'], index=X_test.index)
+    oof_train = pd.DataFrame(pred_probs_train, columns=['prob_loss_nn', 'prob_draw_nn', 'prob_win_nn'], index=X_train.index)
+    oof_test = pd.DataFrame(pred_probs_test, columns=['prob_loss_nn', 'prob_draw_nn', 'prob_win_nn'], index=X_test.index)
     
-    oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_context_train.parquet'), engine='fastparquet')
-    oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_context_test.parquet'), engine='fastparquet')
+    oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_nn_train.parquet'), engine='fastparquet')
+    oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_nn_test.parquet'), engine='fastparquet')
     
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         
-    joblib.dump({'model': xgb_best, 'features': feature_cols}, MODEL_SAVE_PATH)
-    logger.info(f"=== MODELO CONTEXTO FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
+    joblib.dump({'model': nn_best, 'features': feature_cols}, MODEL_SAVE_PATH)
+    logger.info(f"=== MODELO NN FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
-    train_context()
+    train_nn()

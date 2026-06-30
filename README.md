@@ -6,10 +6,13 @@
 
 Prophetia2 es una arquitectura avanzada de Machine Learning Cuantitativo (Quant) diseñada para predecir los resultados de partidos de fútbol y encontrar valor financiero (Value Bets) en el mercado de apuestas.
 
-El núcleo predictivo del proyecto ha evolucionado hacia una **Arquitectura de Stacking (Ensemble de Meta-Modelos)**. En lugar de predecir el resultado con un solo algoritmo monolítico, el sistema divide el trabajo en modelos especialistas (Nivel 0) y los ensambla en un Meta-Modelo (Nivel 1):
-1. **Modelo A (Poisson Bivariado):** Analiza exclusivamente la fuerza de los equipos (ELO) y los Goles Esperados (xG) para proyectar el flujo de goles.
-2. **Modelo B (Contexto y Táctica):** Analiza variables de fatiga, rachas (Momentum), valor de plantilla (Transfermarkt) y métricas tácticas usando *XGBoost*.
-3. **Modelo Jefe (Stacking Meta-Learner):** Ingiere las Cuotas de Apertura (Opening Odds) de casas asiáticas eficientes junto con las predicciones Out-Of-Fold (OOF) de los Modelos A y B, y emite distribuciones probabilísticas calibradas mediante Regresión Isotónica libre de fuga de datos (Anti-Leakage), optimizando la rentabilidad financiera (Yield/ROI).
+El núcleo predictivo del proyecto ha evolucionado hacia una avanzada **Arquitectura de Doble Stacking (Ensemble de Meta-Modelos)**. En lugar de predecir el resultado con un solo algoritmo monolítico, el sistema divide el trabajo en múltiples modelos especialistas y los ensambla en capas:
+1. **Modelo Poisson (Fuerza Relativa):** Analiza exclusivamente ELO y xG para proyectar el flujo de goles (XGBoost).
+2. **Modelo Contexto (Táctica y Fatiga):** Analiza rachas (Momentum), valor de plantilla (Transfermarkt) y métricas tácticas (XGBoost).
+3. **Modelo Deep Learning (No-Linealidades):** Un perceptrón multicapa (*Multi-Layer Perceptron* en PyTorch) que captura relaciones matemáticas complejas ignoradas por los árboles de decisión.
+4. **Modelo Caza-Empates (Draw-Catcher):** Un modelo binario enfocado exclusivamente en cazar la rentabilidad oculta de los empates.
+5. **Modelo de Dinámica de Mercado:** Extrae información puramente financiera ("Steam" y "Vig") de las casas de apuestas más eficientes (Pinnacle/Asia).
+6. **Meta-Modelo de Doble Stacking:** Consiste en dos niveles. Primero consolida un *Stacker Fundamental* con las probabilidades puramente deportivas y luego las cruza en un *Stacker Final* con las variables de mercado aplicando una fuerte penalidad L2 (Ridge) para evitar que el algoritmo se vuelva "perezoso" y asegurar un valor esperado (EV) genuino.
 
 ## Instalacion
 
@@ -72,10 +75,13 @@ Una vez procesados los más de 65,000 partidos históricos, ejecuta el orquestad
 python core/run_pipeline.py
 ```
 Este script orquesta los siguientes pasos automáticamente:
-1. **train_poisson.py**: Entrena el Modelo A basado en xG y ELO, y genera características Out-Of-Fold (OOF).
-2. **train_context.py**: Entrena el Modelo B (XGBoost) en métricas tácticas y de fatiga, con optimización `Optuna`, y genera características OOF.
-3. **train_stacker.py**: Entrena el Meta-Modelo (Stacker) que aprende a ponderar las predicciones base y las cuotas de mercado, aplicando Calibración Isotónica, y emite el `test_predictions.parquet` final.
-4. **train_clv_model.py (Meta-Modelo Odds Drift):** Para proteger el bankroll contra el *smart money*, entrena un modelo final que inyecta métricas de **Divergencia** (nuestra probabilidad vs la probabilidad implícita del mercado) para predecir hacia dónde se moverá la cuota de cierre y detectar trampas de valor.
+1. **train_poisson.py**: Entrena el Modelo Poisson basado en xG y ELO, generando características Out-Of-Fold (OOF).
+2. **train_context.py**: Entrena el Modelo de Contexto (XGBoost) con métricas tácticas y optimización `Optuna`.
+3. **train_nn.py**: Entrena la Red Neuronal Profunda (`PyTorch`) para encontrar relaciones no-lineales.
+4. **train_draws.py**: Entrena el modelo binario "Caza-Empates" especializado.
+5. **train_market.py**: Entrena el modelo financiero que analiza el movimiento del "Smart Money".
+6. **train_stacker.py**: Ejecuta el **Doble Stacking**, combinando predicciones fundamentales y financieras, aplicando Calibración Isotónica y emitiendo el `test_predictions.parquet` final.
+7. **train_clv_model.py (Meta-Modelo Odds Drift):** Para proteger el bankroll, inyecta métricas de **Divergencia** para predecir hacia dónde se moverá la cuota de cierre y detectar trampas de valor.
 
 ### 7. Evaluación Financiera (Simulador de Bankroll)
 Por último, evalúa el desempeño de la estrategia aplicando Kelly Criterion y Bayesian Blending:

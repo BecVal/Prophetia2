@@ -6,6 +6,7 @@ import logging
 import joblib
 from xgboost import XGBRegressor
 from scipy.stats import poisson
+from sklearn.model_selection import KFold
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,22 +19,114 @@ MODEL_SAVE_DIR = '../core/save_models/'
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'poisson_model.pkl')
 PROCESSED_DIR = '../data/processed'
 
-def calc_dixon_coles_draw(lam_scored, lam_conceded, rho=-0.15):
-    prob = 0
-    for i in range(6):
-        p_scored = poisson.pmf(i, lam_scored)
-        p_conceded = poisson.pmf(i, lam_conceded)
-        base_prob = p_scored * p_conceded
+def calc_match_probabilities(lam_scored, lam_conceded, rho=-0.15, max_goals=10):
+    """
+    Calculates Win, Draw, and Loss probabilities using a bivariate Poisson distribution 
+    with Dixon-Coles adjustment for low-scoring matches.
+    """
+    # Matrices of goals
+    x = np.arange(max_goals + 1)
+    y = np.arange(max_goals + 1)
+    
+    # PMF for scored and conceded
+    pmf_scored = poisson.pmf(x, lam_scored)
+    pmf_conceded = poisson.pmf(y, lam_conceded)
+    
+    # Outer product to get the independent bivariate Poisson matrix
+    prob_matrix = np.outer(pmf_scored, pmf_conceded)
+    
+    # Apply Dixon-Coles adjustment
+    # tau(x, y) = 
+    # 0,0 -> 1 - lambda*mu*rho
+    # 0,1 -> 1 + lambda*rho
+    # 1,0 -> 1 + mu*rho
+    # 1,1 -> 1 - rho
+    
+    # Calculate terms for adjustment
+    tau_00 = max(0, 1 - (lam_scored * lam_conceded * rho))
+    tau_01 = max(0, 1 + (lam_scored * rho))
+    tau_10 = max(0, 1 + (lam_conceded * rho))
+    tau_11 = max(0, 1 - rho)
+    
+    # Apply to matrix (x is scored (rows), y is conceded (cols))
+    prob_matrix[0, 0] *= tau_00
+    prob_matrix[0, 1] *= tau_01
+    prob_matrix[1, 0] *= tau_10
+    prob_matrix[1, 1] *= tau_11
+    
+    # Win = Lower triangle (scored > conceded)
+    # Draw = Diagonal (scored == conceded)
+    # Loss = Upper triangle (scored < conceded)
+    win_prob = np.tril(prob_matrix, -1).sum()
+    draw_prob = np.trace(prob_matrix)
+    loss_prob = np.triu(prob_matrix, 1).sum()
+    
+    # Normalize in case adjustments pushed sum slightly away from 1.0
+    total = win_prob + draw_prob + loss_prob
+    if total > 0:
+        return win_prob / total, draw_prob / total, loss_prob / total
+    else:
+        return 0.0, 0.0, 0.0
+
+def get_time_weights(dates, half_life_days=365):
+    if dates is None:
+        return None
+    max_date = dates.max()
+    days_diff = (max_date - dates).dt.days.clip(lower=0)
+    return np.exp(-np.log(2) * days_diff / half_life_days)
+
+def get_expanding_predictions(estimator_factory, X, y, dates):
+    """
+    Generates Out-Of-Fold predictions using Time Series Split.
+    For the very first fold, uses a standard KFold internally to prevent data leakage.
+    """
+    tscv = get_cv_strategy(n_splits=5)
+    preds = np.zeros(len(X))
+    preds[:] = np.nan
+    
+    splits = list(tscv.split(X))
+    
+    # First chunk (Fold 0 training data)
+    first_train_idx = splits[0][0]
+    X_first = X.iloc[first_train_idx]
+    y_first = y.iloc[first_train_idx]
+    dates_first = dates.iloc[first_train_idx] if dates is not None else None
+    
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para evitar Leakage...")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    for kf_train, kf_val in kf.split(X_first):
+        X_kf_train, y_kf_train = X_first.iloc[kf_train], y_first.iloc[kf_train]
+        X_kf_val = X_first.iloc[kf_val]
         
-        tau = 1.0
-        if i == 0: # 0-0
-            tau = 1 - (lam_scored * lam_conceded * rho)
-        elif i == 1: # 1-1
-            tau = 1 - rho
-            
-        tau = max(0, tau)
-        prob += base_prob * tau
-    return prob
+        dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
+        w_tr = get_time_weights(dates_kf_train) if dates_kf_train is not None else None
+        
+        # Instantiate a fresh model for this internal split
+        kf_estimator = estimator_factory()
+        kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr)
+        
+        val_indices_in_original = first_train_idx[kf_val]
+        preds[val_indices_in_original] = kf_estimator.predict(X_kf_val)
+
+    # Subsequent expanding window folds
+    for i, (train_idx, val_idx) in enumerate(splits):
+        logger.info(f"  -> Procesando Fold Temporal {i+1}/{len(splits)} (Train: {len(train_idx)}, Val: {len(val_idx)})...")
+        w_tr = get_time_weights(dates.iloc[train_idx]) if dates is not None else None
+        
+        fold_estimator = estimator_factory()
+        fold_estimator.fit(X.iloc[train_idx], y.iloc[train_idx], sample_weight=w_tr)
+        preds[val_idx] = fold_estimator.predict(X.iloc[val_idx])
+        
+    return preds
+
+def get_xgb_model():
+    return XGBRegressor(
+        objective='count:poisson',
+        n_estimators=100,
+        learning_rate=0.05,
+        random_state=42,
+        device='cuda'
+    )
 
 def train_poisson():
     df = get_base_dataset()
@@ -64,45 +157,42 @@ def train_poisson():
     if 'match_date' in df.columns:
         train_dates = pd.to_datetime(df['match_date'].iloc[:split_idx])
         
-    def get_time_weights(dates, half_life_days=365):
-        if dates is None:
-            return None
-        max_date = dates.max()
-        days_diff = (max_date - dates).dt.days.clip(lower=0)
-        return np.exp(-np.log(2) * days_diff / half_life_days)
-
-    xgb_poisson = XGBRegressor(objective='count:poisson', n_estimators=100, learning_rate=0.05, random_state=42, device='cuda')
+    logger.info("=== ENTRENANDO MODELO A (POISSON) OOF ===")
     
-    def get_expanding_predictions(estimator, X, y, dates):
-        tscv = get_cv_strategy(n_splits=5)
-        preds = np.zeros(len(X))
-        preds[:] = np.nan
-        for train_idx, val_idx in tscv.split(X):
-            w_tr = get_time_weights(dates.iloc[train_idx]) if dates is not None else None
-            estimator.fit(X.iloc[train_idx], y.iloc[train_idx], sample_weight=w_tr)
-            preds[val_idx] = estimator.predict(X.iloc[val_idx])
-        
-        first_train_idx = next(tscv.split(X))[0]
-        w_first = get_time_weights(dates.iloc[first_train_idx]) if dates is not None else None
-        estimator.fit(X.iloc[first_train_idx], y.iloc[first_train_idx], sample_weight=w_first)
-        preds[first_train_idx] = estimator.predict(X.iloc[first_train_idx])
-        return preds
-
-    logger.info("Entrenando Modelo A (Poisson) OOF...")
-    pred_scored_train = get_expanding_predictions(xgb_poisson, X_train, y_scored_train, train_dates)
-    pred_conceded_train = get_expanding_predictions(xgb_poisson, X_train, y_conceded_train, train_dates)
+    logger.info("Entrenando objetivo: Goles Anotados (Scored)...")
+    pred_scored_train = get_expanding_predictions(get_xgb_model, X_train, y_scored_train, train_dates)
     
+    logger.info("Entrenando objetivo: Goles Recibidos (Conceded)...")
+    pred_conceded_train = get_expanding_predictions(get_xgb_model, X_train, y_conceded_train, train_dates)
+    
+    logger.info("Entrenando modelos finales (Scored y Conceded) sobre todo el Train Set...")
     final_train_weights = get_time_weights(train_dates)
-    xgb_poisson.fit(X_train, y_scored_train, sample_weight=final_train_weights)
-    pred_scored_test = xgb_poisson.predict(X_test)
-    xgb_poisson_scored_model = XGBRegressor(**xgb_poisson.get_params()).fit(X_train, y_scored_train, sample_weight=final_train_weights)
     
-    xgb_poisson.fit(X_train, y_conceded_train, sample_weight=final_train_weights)
-    pred_conceded_test = xgb_poisson.predict(X_test)
-    xgb_poisson_conceded_model = XGBRegressor(**xgb_poisson.get_params()).fit(X_train, y_conceded_train, sample_weight=final_train_weights)
+    xgb_poisson_scored_model = get_xgb_model()
+    xgb_poisson_scored_model.fit(X_train, y_scored_train, sample_weight=final_train_weights)
+    pred_scored_test = xgb_poisson_scored_model.predict(X_test)
     
-    draw_prob_train = np.vectorize(calc_dixon_coles_draw)(pred_scored_train, pred_conceded_train)
-    draw_prob_test = np.vectorize(calc_dixon_coles_draw)(pred_scored_test, pred_conceded_test)
+    xgb_poisson_conceded_model = get_xgb_model()
+    xgb_poisson_conceded_model.fit(X_train, y_conceded_train, sample_weight=final_train_weights)
+    pred_conceded_test = xgb_poisson_conceded_model.predict(X_test)
+    
+    logger.info("=== CALCULANDO PROBABILIDADES MATEMÁTICAS (DIXON-COLES) ===")
+    
+    # Vectorizar la función para aplicarla rápido a los arreglos
+    v_calc_probs = np.vectorize(calc_match_probabilities)
+    
+    # Train Probs
+    win_prob_train, draw_prob_train, loss_prob_train = v_calc_probs(pred_scored_train, pred_conceded_train)
+    # Test Probs
+    win_prob_test, draw_prob_test, loss_prob_test = v_calc_probs(pred_scored_test, pred_conceded_test)
+    
+    # LOGS: Verificacion de los resultados de Poisson
+    logger.info("Estadísticas del Entrenamiento:")
+    logger.info(f" - Media xG Scored predicho: {pred_scored_train.mean():.3f} (Real: {y_scored_train.mean():.3f})")
+    logger.info(f" - Media xG Conceded predicho: {pred_conceded_train.mean():.3f} (Real: {y_conceded_train.mean():.3f})")
+    logger.info(f" - Promedio Prob Victoria: {win_prob_train.mean()*100:.1f}%")
+    logger.info(f" - Promedio Prob Empate: {draw_prob_train.mean()*100:.1f}%")
+    logger.info(f" - Promedio Prob Derrota: {loss_prob_train.mean()*100:.1f}%")
     
     # Guardar OOF
     if not os.path.exists(PROCESSED_DIR):
@@ -111,17 +201,23 @@ def train_poisson():
     oof_train = pd.DataFrame({
         'predicted_xg_scored': pred_scored_train,
         'predicted_xg_conceded': pred_conceded_train,
-        'poisson_draw_prob': draw_prob_train
+        'poisson_win_prob': win_prob_train,
+        'poisson_draw_prob': draw_prob_train,
+        'poisson_loss_prob': loss_prob_train
     }, index=X_train.index)
     
     oof_test = pd.DataFrame({
         'predicted_xg_scored': pred_scored_test,
         'predicted_xg_conceded': pred_conceded_test,
-        'poisson_draw_prob': draw_prob_test
+        'poisson_win_prob': win_prob_test,
+        'poisson_draw_prob': draw_prob_test,
+        'poisson_loss_prob': loss_prob_test
     }, index=X_test.index)
     
     oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_poisson_train.parquet'), engine='fastparquet')
     oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_poisson_test.parquet'), engine='fastparquet')
+    
+    logger.info(f"Archivos OOF guardados exitosamente. (Rows Train: {len(oof_train)}, Rows Test: {len(oof_test)})")
     
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
@@ -131,7 +227,7 @@ def train_poisson():
         'model_conceded': xgb_poisson_conceded_model, 
         'features': feature_cols
     }, MODEL_SAVE_PATH)
-    logger.info(f"Modelo Poisson guardado en {MODEL_SAVE_PATH}")
+    logger.info(f"=== MODELO POISSON FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
     train_poisson()

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 MODEL_SAVE_DIR = '../core/save_models/'
-MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'context_model.pkl')
+MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'draws_model.pkl')
 PROCESSED_DIR = '../data/processed'
 
 def get_time_weights(dates, half_life_days=365):
@@ -30,8 +30,8 @@ def get_time_weights(dates, half_life_days=365):
 
 def objective(trial, X_train, y_train, dates_train, cv_strategy):
     param = {
-        'objective': 'multi:softprob',
-        'num_class': 3,
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',
         'random_state': 42,
         'device': 'cuda',
         'max_depth': trial.suggest_int('max_depth', 2, 7),
@@ -39,7 +39,7 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         'n_estimators': trial.suggest_int('n_estimators', 100, 400),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 7)
+        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 3.0) # Empates son minoría
     }
     
     cv_scores = []
@@ -58,41 +58,32 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         
     return np.mean(cv_scores)
 
-def train_context():
+def train_draws():
     df = get_base_dataset()
     split_idx = get_train_test_split(df)
     
-    # Modelo B: Contexto y Táctica
-    base_stats = [
-        'shots_total', 'shots_on_target',
-        'passes_total', 'passes_completed', 'pass_accuracy', 'possession_pct',
-        'crosses', 'corners', 'through_balls', 'key_passes',
-        'dribbles_completed', 'pressures', 'interceptions', 'clearances',
-        'blocks', 'ball_recoveries', 'actions_under_pressure',
-        'fouls_committed', 'fouls_won', 'yellow_cards', 'red_cards',
-        'aerials_won'
-    ]
-    
+    # Features específicos para cazar empates: 
+    # Diferencias pequeñas de valor, rachas parecidas, volatilidad baja/alta.
     feature_cols = [
         'is_home', 'rest_days', 'rest_diff',
         'team_squad_value', 'opp_squad_value', 'squad_value_diff',
-        'h2h_games_played', 'h2h_points_last_5', 'h2h_win_rate_hist', 'h2h_draw_rate_hist', 'is_european_hangover',
+        'h2h_games_played', 'h2h_draw_rate_hist',
         'win_streak_3', 'loss_streak_3', 'xg_momentum_macd', 
         'opp_win_streak_3', 'opp_loss_streak_3', 'opp_xg_momentum_macd',
         'fatigue_index', 'fatigue_diff', 'xg_volatility_5', 'opp_xg_volatility_5', 'volatility_diff'
     ]
     
-    for stat in base_stats:
-        feature_cols.append(f"{stat}_ema3")
-        feature_cols.append(f"{stat}_ema5")
-        
     missing_cols = [c for c in feature_cols if c not in df.columns]
     if missing_cols:
-        logger.error(f"Faltan las siguientes columnas en Contexto: {missing_cols}")
+        logger.error(f"Faltan las siguientes columnas en Draws: {missing_cols}")
         feature_cols = [c for c in feature_cols if c in df.columns]
 
     X = df[feature_cols].fillna(0).copy()
-    y = df['outcome'].replace({-1: 0, 0: 1, 1: 2})
+    
+    # TARGET BINARIO: 1 si es Empate, 0 si no.
+    # Original target mapping: -1: 0 (Loss), 0: 1 (Draw), 1: 2 (Win)
+    y_multi = df['outcome'].replace({-1: 0, 0: 1, 1: 2})
+    y = (y_multi == 1).astype(int)
     
     X_train, X_test = X.iloc[:split_idx].copy(), X.iloc[split_idx:].copy()
     y_train = y.iloc[:split_idx]
@@ -103,22 +94,22 @@ def train_context():
     
     cv_strategy = get_cv_strategy(n_splits=5)
     
-    logger.info("Optimizando Modelo B (Contexto) con Optuna (50 Trials)...")
+    logger.info("Optimizando Modelo Binario Caza-Empates (Draws) con Optuna (30 Trials)...")
     study = optuna.create_study(direction='minimize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=50)
+    study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=30)
     
-    logger.info(f"Mejores parámetros XGBoost Contexto: {study.best_params}")
+    logger.info(f"Mejores parámetros XGBoost Draws: {study.best_params}")
     
     xgb_best = XGBClassifier(
         **study.best_params,
-        objective='multi:softprob',
-        num_class=3,
+        objective='binary:logistic',
         random_state=42,
         device='cuda'
     )
     
-    logger.info("Calculando predicciones OOF para Train (Contexto)...")
-    pred_probs_train = np.zeros((len(X_train), 3))
+    logger.info("Calculando predicciones OOF para Train (Draws)...")
+    # Es binario, predict_proba devuelve [prob_not_draw, prob_draw]
+    pred_probs_train = np.zeros((len(X_train), 2))
     pred_probs_train[:] = np.nan
     
     splits = list(cv_strategy.split(X_train, y_train))
@@ -157,40 +148,37 @@ def train_context():
         fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
         pred_probs_train[val_idx] = fold_estimator.predict_proba(X_val)
         
-    logger.info("Entrenando Modelo B final y prediciendo Test...")
+    logger.info("Entrenando Modelo Draws final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
     xgb_best.fit(X_train, y_train, sample_weight=final_w_tr)
     pred_probs_test = xgb_best.predict_proba(X_test)
     
-    # LOGS: Verificacion de calibracion
-    logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO B ===")
-    real_loss = (y_train == 0).mean()
-    real_draw = (y_train == 1).mean()
-    real_win = (y_train == 2).mean()
+    # Nos interesa solo la probabilidad de la clase positiva (Empate)
+    # Extraemos la columna 1 (prob_draw)
+    prob_draw_train = pred_probs_train[:, 1]
+    prob_draw_test = pred_probs_test[:, 1]
     
-    pred_loss = pred_probs_train[:, 0].mean()
-    pred_draw = pred_probs_train[:, 1].mean()
-    pred_win = pred_probs_train[:, 2].mean()
-    
-    logger.info(f" - Derrota (Loss) | Predicha: {pred_loss*100:.1f}% | Real en Dataset: {real_loss*100:.1f}%")
-    logger.info(f" - Empate (Draw)  | Predicha: {pred_draw*100:.1f}% | Real en Dataset: {real_draw*100:.1f}%")
-    logger.info(f" - Victoria (Win) | Predicha: {pred_win*100:.1f}% | Real en Dataset: {real_win*100:.1f}%")
+    # LOGS: Verificacion
+    real_draw = y_train.mean()
+    pred_draw = prob_draw_train.mean()
+    logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO DRAWS ===")
+    logger.info(f" - Empate (Draw) | Predicha: {pred_draw*100:.1f}% | Real en Dataset: {real_draw*100:.1f}%")
     
     # Guardar OOF
     if not os.path.exists(PROCESSED_DIR):
         os.makedirs(PROCESSED_DIR)
         
-    oof_train = pd.DataFrame(pred_probs_train, columns=['prob_loss_ctx', 'prob_draw_ctx', 'prob_win_ctx'], index=X_train.index)
-    oof_test = pd.DataFrame(pred_probs_test, columns=['prob_loss_ctx', 'prob_draw_ctx', 'prob_win_ctx'], index=X_test.index)
+    oof_train = pd.DataFrame({'prob_is_draw': prob_draw_train}, index=X_train.index)
+    oof_test = pd.DataFrame({'prob_is_draw': prob_draw_test}, index=X_test.index)
     
-    oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_context_train.parquet'), engine='fastparquet')
-    oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_context_test.parquet'), engine='fastparquet')
+    oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_draws_train.parquet'), engine='fastparquet')
+    oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_draws_test.parquet'), engine='fastparquet')
     
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         
     joblib.dump({'model': xgb_best, 'features': feature_cols}, MODEL_SAVE_PATH)
-    logger.info(f"=== MODELO CONTEXTO FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
+    logger.info(f"=== MODELO DRAWS FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
-    train_context()
+    train_draws()
