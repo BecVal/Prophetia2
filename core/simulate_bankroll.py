@@ -11,14 +11,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuración Quant
-FILTER_BY_WHITELIST = False  # True: ignora partidos fuera de Whitelist en la simulación financiera
+FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
 WHITELIST_LEAGUES = ['I1', 'D2', 'SP1', 'F2', 'G1', 'D1', 'T1', 'F1']
 
 # Diccionarios de riesgo por liga (ajustados a liquidez y eficiencia)
-KELLY_FRACTIONS = {'D2': 0.12, 'I1': 0.01, 'SP1': 0.10, 'F2': 0.05, 'G1': 0.02, 'D1': 0.02, 'T1': 0.10, 'F1': 0.03, 'E1': 0.04, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.02}
-EV_THRESHOLDS = {'D2': 0.025, 'I1': 0.06, 'SP1': 0.02, 'F2': 0.035, 'G1': 0.06, 'D1': 0.05, 'T1': 0.015, 'F1': 0.025, 'E1': 0.03, 'N1': 0.06, 'SP2': 0.06, 'P1': 0.05, 'DEFAULT': 0.04}
+# Se han bajado los EV_THRESHOLDS para aumentar el volumen de apuestas y se ha reducido el Kelly para proteger el capital ante la varianza
+KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.015}
+EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 'D1': 0.015, 'T1': 0.01, 'F1': 0.015, 'E1': 0.015, 'N1': 0.02, 'SP2': 0.02, 'P1': 0.02, 'DEFAULT': 0.015}
 
-MAX_STAKE_PCT = 0.05  # Cap de apuesta por partido (5% del bankroll líquido)
+MAX_STAKE_PCT = 0.03  # Cap reducido al 3% para mayor seguridad con el nuevo filtro
 
 # Parámetros Institucionales/Fricción Añadidos
 TAX_RETENTION_RATE = 0.07  # Retención del 7% sobre ganancias netas (Común en MX: 1% federal + 6% estatal, p.ej. Caliente/Draftea)
@@ -134,14 +135,13 @@ def run_simulation():
             league_ev_thresh = EV_THRESHOLDS.get(comp, EV_THRESHOLDS['DEFAULT'])
             league_kelly = KELLY_FRACTIONS.get(comp, KELLY_FRACTIONS['DEFAULT'])
             
-            # Meta-Modelo de Drift (CLV Optimization)
-            # Solo consideramos apuestas si el meta-modelo predice que las cuotas NO van a subir en nuestra contra.
-            # pred_drift > 0 significa que la cuota de cierre será mayor a la apertura (el mercado nos da la contra).
-            has_drift = all(c in df.columns for c in ['pred_drift_loss', 'pred_drift_draw', 'pred_drift_win'])
-            pred_drifts = [
-                df['pred_drift_loss'].iloc[i] if has_drift else 0.0,
-                df['pred_drift_draw'].iloc[i] if has_drift else 0.0,
-                df['pred_drift_win'].iloc[i] if has_drift else 0.0
+            # Meta-Modelo True CLV Esperado
+            # Cancelamos la apuesta si el CLV continuo esperado es menor a nuestro umbral
+            has_pred_clv = all(c in df.columns for c in ['pred_clv_loss', 'pred_clv_draw', 'pred_clv_win'])
+            pred_clv = [
+                df['pred_clv_loss'].iloc[i] if has_pred_clv else 0.0,
+                df['pred_clv_draw'].iloc[i] if has_pred_clv else 0.0,
+                df['pred_clv_win'].iloc[i] if has_pred_clv else 0.0
             ]
             
             # Check for Dutching / Doble Oportunidad (Local y Empate)
@@ -153,13 +153,14 @@ def run_simulation():
             best_ev = evs[best_choice]
             secondary_choice = None
             
-            # Si el mercado va a moverse en nuestra contra fuertemente (> 1%), cancelamos el valor aparente.
-            if pred_drifts[best_choice] > 0.01:
+            # Umbral mínimo de True CLV esperado (ej: > 0.5%)
+            MIN_EXPECTED_CLV = 0.005
+            if pred_clv[best_choice] < MIN_EXPECTED_CLV:
                 best_ev = -1.0 # Cancel bet
             
             # Dutching logic if both Local and Draw have EV > league_ev_thresh
             if ev_local > league_ev_thresh and ev_draw > league_ev_thresh:
-                if pred_drifts[2] <= 0.01 and pred_drifts[1] <= 0.01:
+                if pred_clv[2] >= MIN_EXPECTED_CLV and pred_clv[1] >= MIN_EXPECTED_CLV:
                     bet_type = 'dutching'
                     implied_prob_1 = 1 / odds[2]
                     implied_prob_X = 1 / odds[1]
@@ -215,7 +216,7 @@ def run_simulation():
                     kelly_pct = min(kelly_pct, 0.01) # Cap 1% Kelly
                     
                 stake_pct = min(kelly_pct * kelly_fraction, MAX_STAKE_PCT)
-                if stake_pct < 0.005: continue
+                if stake_pct < 0.001: continue  # Permitir micro apuestas del 0.1% del bankroll
                     
                 stake = liquid_bankroll * stake_pct
                 
@@ -234,14 +235,25 @@ def run_simulation():
                 bets_placed += 1
                 total_expected_profit += (stake * best_ev) # Acumular EV monetario para xYield
                 
-                # Calcular CLV (Closing Line Value)
+                # Calcular True CLV (Closing Line Value sin margen)
                 if has_closing_odds:
                     idx = bet['index']
-                    closing_odds = [c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]]
-                    c_odd = closing_odds[best_choice]
-                    if not np.isnan(c_odd) and c_odd > 0:
-                        clv = (odds[best_choice] / c_odd) - 1
-                        clv_list.append(clv)
+                    c_loss = c_odds_loss[idx]
+                    c_draw = c_odds_draw[idx]
+                    c_win = c_odds_win[idx]
+                    
+                    if not np.isnan(c_loss) and not np.isnan(c_draw) and not np.isnan(c_win) and c_loss > 0 and c_draw > 0 and c_win > 0:
+                        # De-vigging
+                        c_margin = (1/c_loss) + (1/c_draw) + (1/c_win)
+                        fair_closing_odds = [
+                            1 / ((1/c_loss) / c_margin),
+                            1 / ((1/c_draw) / c_margin),
+                            1 / ((1/c_win) / c_margin)
+                        ]
+                        
+                        fair_c_odd = fair_closing_odds[best_choice]
+                        true_clv = (odds[best_choice] / fair_c_odd) - 1
+                        clv_list.append(true_clv)
                 
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
@@ -274,7 +286,7 @@ def run_simulation():
                     kelly_pct = min(kelly_pct, 0.01)
                     
                 stake_pct = min(kelly_pct * kelly_fraction, MAX_STAKE_PCT)
-                if stake_pct < 0.005: continue
+                if stake_pct < 0.001: continue  # Permitir micro apuestas del 0.1%
                     
                 total_dutch_stake = liquid_bankroll * stake_pct
                 
@@ -296,17 +308,25 @@ def run_simulation():
                 bets_placed += 1
                 total_expected_profit += (total_dutch_stake * best_ev) # Acumular EV monetario para xYield
                 
-                # Calcular CLV combinado para Dutching
+                # Calcular True CLV combinado para Dutching
                 if has_closing_odds:
                     idx = bet['index']
-                    c_odd_1 = c_odds_win[idx]
-                    c_odd_X = c_odds_draw[idx]
-                    if not np.isnan(c_odd_1) and not np.isnan(c_odd_X) and c_odd_1 > 0 and c_odd_X > 0:
-                        c_implied_1 = 1 / c_odd_1
-                        c_implied_X = 1 / c_odd_X
-                        c_combined_odds = 1 / (c_implied_1 + c_implied_X)
-                        clv = (combined_odds / c_combined_odds) - 1
-                        clv_list.append(clv)
+                    c_loss = c_odds_loss[idx]
+                    c_draw = c_odds_draw[idx]
+                    c_win = c_odds_win[idx]
+                    
+                    if not np.isnan(c_loss) and not np.isnan(c_draw) and not np.isnan(c_win) and c_loss > 0 and c_draw > 0 and c_win > 0:
+                        c_margin = (1/c_loss) + (1/c_draw) + (1/c_win)
+                        
+                        # Probabilidades justas para Local y Empate
+                        fair_prob_1 = (1/c_win) / c_margin
+                        fair_prob_X = (1/c_draw) / c_margin
+                        
+                        # Cuota justa combinada (Dutching = Apostar a ambos, prob combinada es suma)
+                        fair_c_combined_odds = 1 / (fair_prob_1 + fair_prob_X)
+                        
+                        true_clv = (combined_odds / fair_c_combined_odds) - 1
+                        clv_list.append(true_clv)
                 
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}

@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 import logging
+import time
 
 # Configurar logging
 logging.basicConfig(
@@ -76,24 +77,39 @@ def update_elo(rating, expected_score, actual_score, k_factor=30):
 
 def add_elo_ratings(df):
     logger.info("Calculando Ratings de Ataque/Defensa y ELO Clásico...")
+    start_time = time.time()
     df = df.sort_values('match_date').reset_index(drop=True)
     
-    att_dict = {}  # {team_name: attack_rating}
-    def_dict = {}  # {team_name: defense_rating}
-    elo_dict = {}  # {team_name: classic_elo}
+    att_dict = {}
+    def_dict = {}
+    elo_dict = {}
     
-    match_ids = df['match_id'].unique()
+    # Diccionarios para almacenar los resultados mapeados por índice del DataFrame
+    results = {
+        'team_att_rating': np.zeros(len(df)),
+        'team_def_rating': np.zeros(len(df)),
+        'opp_att_rating': np.zeros(len(df)),
+        'opp_def_rating': np.zeros(len(df)),
+        'team_elo': np.zeros(len(df)),
+        'opp_elo': np.zeros(len(df)),
+        'elo_diff': np.zeros(len(df))
+    }
     
-    for match_id in match_ids:
-        match_rows = df[df['match_id'] == match_id]
-        if len(match_rows) != 2:
+    grouped = df.groupby('match_id')
+    
+    for match_id, match_indices in grouped.groups.items():
+        if len(match_indices) != 2:
             continue
             
-        # Detectar quién es local y visitante
-        if match_rows.iloc[0]['is_home'] == 1:
-            row_home, row_away = match_rows.iloc[0], match_rows.iloc[1]
+        idx1, idx2 = match_indices
+        row1, row2 = df.loc[idx1], df.loc[idx2]
+        
+        if row1['is_home'] == 1:
+            home_idx, away_idx = idx1, idx2
+            row_home, row_away = row1, row2
         else:
-            row_home, row_away = match_rows.iloc[1], match_rows.iloc[0]
+            home_idx, away_idx = idx2, idx1
+            row_home, row_away = row2, row1
             
         home_team = row_home['team']
         away_team = row_away['team']
@@ -139,37 +155,47 @@ def add_elo_ratings(df):
         elo_dict[home_team] = update_elo(home_elo_pre, exp_elo_home, score_home)
         elo_dict[away_team] = update_elo(away_elo_pre, exp_elo_away, score_away)
         
-        # Guardar en DF
-        # Para row_home
-        df.loc[df.index == row_home.name, 'team_att_rating'] = home_att_pre
-        df.loc[df.index == row_home.name, 'team_def_rating'] = home_def_pre
-        df.loc[df.index == row_home.name, 'opp_att_rating'] = away_att_pre
-        df.loc[df.index == row_home.name, 'opp_def_rating'] = away_def_pre
-        df.loc[df.index == row_home.name, 'team_elo'] = home_elo_pre
-        df.loc[df.index == row_home.name, 'opp_elo'] = away_elo_pre
-        df.loc[df.index == row_home.name, 'elo_diff'] = home_elo_pre - away_elo_pre
+        # Guardar en diccionario de resultados
+        results['team_att_rating'][home_idx] = home_att_pre
+        results['team_def_rating'][home_idx] = home_def_pre
+        results['opp_att_rating'][home_idx] = away_att_pre
+        results['opp_def_rating'][home_idx] = away_def_pre
+        results['team_elo'][home_idx] = home_elo_pre
+        results['opp_elo'][home_idx] = away_elo_pre
+        results['elo_diff'][home_idx] = home_elo_pre - away_elo_pre
         
-        # Para row_away
-        df.loc[df.index == row_away.name, 'team_att_rating'] = away_att_pre
-        df.loc[df.index == row_away.name, 'team_def_rating'] = away_def_pre
-        df.loc[df.index == row_away.name, 'opp_att_rating'] = home_att_pre
-        df.loc[df.index == row_away.name, 'opp_def_rating'] = home_def_pre
-        df.loc[df.index == row_away.name, 'team_elo'] = away_elo_pre
-        df.loc[df.index == row_away.name, 'opp_elo'] = home_elo_pre
-        df.loc[df.index == row_away.name, 'elo_diff'] = away_elo_pre - home_elo_pre
+        results['team_att_rating'][away_idx] = away_att_pre
+        results['team_def_rating'][away_idx] = away_def_pre
+        results['opp_att_rating'][away_idx] = home_att_pre
+        results['opp_def_rating'][away_idx] = home_def_pre
+        results['team_elo'][away_idx] = away_elo_pre
+        results['opp_elo'][away_idx] = home_elo_pre
+        results['elo_diff'][away_idx] = away_elo_pre - home_elo_pre
 
+    # Asignar al DataFrame vectorizado
+    for col, values in results.items():
+        df[col] = values
+        
+    elapsed = time.time() - start_time
+    logger.info(f"Cálculo de ELO finalizado en {elapsed:.2f} segundos.")
     return df
 
 
 def add_contextual_features(df):
     logger.info(
-        "Calculando variables contextuales (Días de descanso, fuerza del oponente y rachas)...")
+        "Calculando variables contextuales (Días de descanso, SOS y Momentum)...")
+    start_time = time.time()
 
     # 1. Días de descanso
     df = df.sort_values(['team', 'match_date']).reset_index(drop=True)
     df['rest_days'] = df.groupby('team')['match_date'].diff().dt.days
-    # Promedio semanal si es el primer partido
     df['rest_days'] = df['rest_days'].fillna(7.0)
+    
+    # Cap a 21 días (parones de verano no deben corromper el modelo)
+    df['rest_days'] = df['rest_days'].clip(upper=21.0)
+    
+    # Fatigue Index (No lineal)
+    df['fatigue_index'] = np.exp(-df['rest_days'] / 4.0)
 
     # 2. Inercia (Rachas y xG Momentum)
     df['is_win'] = (df['outcome'] == 1).astype(int)
@@ -180,21 +206,37 @@ def add_contextual_features(df):
     
     df['xg_diff_raw'] = df['xg_created'] - df['xg_conceded']
     
-    def calc_slope(y):
-        if len(y) < 2: return 0.0
-        x = np.arange(len(y))
-        # cov(x,y)/var(x)
-        return np.polyfit(x, y, 1)[0]
-        
-    df['xg_momentum_5'] = df.groupby('team')['xg_diff_raw'].transform(
-        lambda x: x.shift(1).rolling(5, min_periods=2).apply(calc_slope, raw=True)
+    # Momentum optimizado usando MACD (Diferencia de EMA Corto vs EMA Largo)
+    xg_ema3 = df.groupby('team')['xg_diff_raw'].transform(lambda x: x.shift(1).ewm(span=3, min_periods=1).mean())
+    xg_ema10 = df.groupby('team')['xg_diff_raw'].transform(lambda x: x.shift(1).ewm(span=10, min_periods=1).mean())
+    df['xg_momentum_macd'] = (xg_ema3 - xg_ema10).fillna(0)
+    
+    # Inestabilidad del Equipo (Volatilidad de xG)
+    df['xg_volatility_5'] = df.groupby('team')['xg_diff_raw'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=2).std()
     ).fillna(0)
+    
+    # Fatiga de Viaje (Rachas de partidos consecutivos como visitante)
+    df['is_away'] = (df['is_home'] == 0).astype(int)
+    df['away_streak'] = df.groupby('team')['is_away'].transform(
+        lambda x: x.shift(1).groupby((x.shift(1) != 1).cumsum()).cumsum()
+    ).fillna(0)
+    df = df.drop(columns=['is_away'])
+    
+    # Fuerza de Calendario (Strength of Schedule - SOS) basado en ELO
+    if 'opp_elo' in df.columns:
+        df['schedule_strength_5'] = df.groupby('team')['opp_elo'].transform(
+            lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+        ).fillna(1500.0)
     
     df = df.drop(columns=['is_win', 'is_loss', 'xg_diff_raw'])
 
     # 3. Fuerza del Oponente (Traer el historial 'ema' del rival y sus rachas)
     ema_cols = [c for c in df.columns if '_ema' in c]
-    opp_cols = ema_cols + ['rest_days', 'win_streak_3', 'loss_streak_3', 'xg_momentum_5']
+    opp_cols = ema_cols + ['rest_days', 'fatigue_index', 'win_streak_3', 'loss_streak_3', 'xg_momentum_macd', 'xg_volatility_5', 'away_streak']
+    if 'schedule_strength_5' in df.columns:
+        opp_cols.append('schedule_strength_5')
+        
     opp_df = df[['team', 'match_date'] + opp_cols].copy()
 
     # Renombrar columnas para el oponente
@@ -212,13 +254,20 @@ def add_contextual_features(df):
 
     # 4. Métricas Relativas
     df['rest_diff'] = df['rest_days'] - df['opp_rest_days']
+    df['fatigue_diff'] = df['fatigue_index'] - df['opp_fatigue_index']
     
-    # Opcional: Crear métricas de fuerza relativa (Ej: Mi ataque vs Su defensa usando EMA3)
+    if 'schedule_strength_5' in df.columns:
+        df['sos_diff'] = df['schedule_strength_5'] - df['opp_schedule_strength_5']
+    
     if 'xg_created_ema3' in df.columns and 'opp_xg_conceded_ema3' in df.columns:
         df['relative_attack_strength'] = df['xg_created_ema3'] - \
             df['opp_xg_conceded_ema3']
+            
+    df['volatility_diff'] = df['xg_volatility_5'] - df['opp_xg_volatility_5']
 
     df = df.sort_values('match_date').reset_index(drop=True)
+    elapsed = time.time() - start_time
+    logger.info(f"Variables contextuales procesadas en {elapsed:.2f} segundos.")
     return df
 
 
