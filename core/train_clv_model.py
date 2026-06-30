@@ -34,10 +34,25 @@ def train_clv_model():
     df_train_preds = pd.read_parquet(TRAIN_PREDS_PATH, engine='fastparquet')
     df_test_preds = pd.read_parquet(PREDICTIONS_PATH, engine='fastparquet')
     
-    # Calcular implied probs de apertura
+    # Calcular implied probs de apertura y cuotas justas (sin vig)
     df['open_implied_loss'] = 1 / df['open_odds_loss']
     df['open_implied_draw'] = 1 / df['open_odds_draw']
     df['open_implied_win'] = 1 / df['open_odds_win']
+    open_vig = df['open_implied_loss'] + df['open_implied_draw'] + df['open_implied_win']
+    
+    df['open_fair_loss'] = df['open_implied_loss'] / open_vig
+    df['open_fair_draw'] = df['open_implied_draw'] / open_vig
+    df['open_fair_win'] = df['open_implied_win'] / open_vig
+    
+    # Calcular implied probs de cierre y cuotas justas (sin vig)
+    df['implied_loss'] = 1 / df['odds_loss']
+    df['implied_draw'] = 1 / df['odds_draw']
+    df['implied_win'] = 1 / df['odds_win']
+    vig = df['implied_loss'] + df['implied_draw'] + df['implied_win']
+    
+    df['fair_loss'] = df['implied_loss'] / vig
+    df['fair_draw'] = df['implied_draw'] / vig
+    df['fair_win'] = df['implied_win'] / vig
 
     # Drift histórico vs apertura (como proxy continuo) logarítmico
     df['target_loss'] = np.log(df['odds_loss'] / df['open_odds_loss'])
@@ -59,31 +74,31 @@ def train_clv_model():
     y_drift_win_test = y_drift_win.iloc[split_idx:]
     
     logger.info("Inyectando Probabilidades y Características de Divergencia...")
-    # Inyectar para Train
+    # Inyectar para Train (usando las probs finales del Stacker)
     X_train['prob_loss'] = df_train_preds['prob_loss'].values
     X_train['prob_draw'] = df_train_preds['prob_draw'].values
     X_train['prob_win'] = df_train_preds['prob_win'].values
     
-    X_train['divergence_loss'] = np.log(np.clip(X_train['prob_loss'] / X_train['fair_loss'], 1e-6, 1e6))
-    X_train['divergence_draw'] = np.log(np.clip(X_train['prob_draw'] / X_train['fair_draw'], 1e-6, 1e6))
-    X_train['divergence_win'] = np.log(np.clip(X_train['prob_win'] / X_train['fair_win'], 1e-6, 1e6))
+    X_train['divergence_loss'] = np.log(np.clip(X_train['prob_loss'] / df['fair_loss'].iloc[:split_idx].values, 1e-6, 1e6))
+    X_train['divergence_draw'] = np.log(np.clip(X_train['prob_draw'] / df['fair_draw'].iloc[:split_idx].values, 1e-6, 1e6))
+    X_train['divergence_win'] = np.log(np.clip(X_train['prob_win'] / df['fair_win'].iloc[:split_idx].values, 1e-6, 1e6))
     
-    X_train['open_divergence_loss'] = np.log(np.clip(X_train['prob_loss'] / X_train['open_fair_loss'], 1e-6, 1e6))
-    X_train['open_divergence_draw'] = np.log(np.clip(X_train['prob_draw'] / X_train['open_fair_draw'], 1e-6, 1e6))
-    X_train['open_divergence_win'] = np.log(np.clip(X_train['prob_win'] / X_train['open_fair_win'], 1e-6, 1e6))
+    X_train['open_divergence_loss'] = np.log(np.clip(X_train['prob_loss'] / df['open_fair_loss'].iloc[:split_idx].values, 1e-6, 1e6))
+    X_train['open_divergence_draw'] = np.log(np.clip(X_train['prob_draw'] / df['open_fair_draw'].iloc[:split_idx].values, 1e-6, 1e6))
+    X_train['open_divergence_win'] = np.log(np.clip(X_train['prob_win'] / df['open_fair_win'].iloc[:split_idx].values, 1e-6, 1e6))
     
-    # Inyectar para Test
+    # Inyectar para Test (usando las probs finales del Stacker)
     X_test['prob_loss'] = df_test_preds['prob_loss'].values
     X_test['prob_draw'] = df_test_preds['prob_draw'].values
     X_test['prob_win'] = df_test_preds['prob_win'].values
     
-    X_test['divergence_loss'] = np.log(np.clip(X_test['prob_loss'] / X_test['fair_loss'], 1e-6, 1e6))
-    X_test['divergence_draw'] = np.log(np.clip(X_test['prob_draw'] / X_test['fair_draw'], 1e-6, 1e6))
-    X_test['divergence_win'] = np.log(np.clip(X_test['prob_win'] / X_test['fair_win'], 1e-6, 1e6))
+    X_test['divergence_loss'] = np.log(np.clip(X_test['prob_loss'] / df['fair_loss'].iloc[split_idx:].values, 1e-6, 1e6))
+    X_test['divergence_draw'] = np.log(np.clip(X_test['prob_draw'] / df['fair_draw'].iloc[split_idx:].values, 1e-6, 1e6))
+    X_test['divergence_win'] = np.log(np.clip(X_test['prob_win'] / df['fair_win'].iloc[split_idx:].values, 1e-6, 1e6))
     
-    X_test['open_divergence_loss'] = np.log(np.clip(X_test['prob_loss'] / X_test['open_fair_loss'], 1e-6, 1e6))
-    X_test['open_divergence_draw'] = np.log(np.clip(X_test['prob_draw'] / X_test['open_fair_draw'], 1e-6, 1e6))
-    X_test['open_divergence_win'] = np.log(np.clip(X_test['prob_win'] / X_test['open_fair_win'], 1e-6, 1e6))
+    X_test['open_divergence_loss'] = np.log(np.clip(X_test['prob_loss'] / df['open_fair_loss'].iloc[split_idx:].values, 1e-6, 1e6))
+    X_test['open_divergence_draw'] = np.log(np.clip(X_test['prob_draw'] / df['open_fair_draw'].iloc[split_idx:].values, 1e-6, 1e6))
+    X_test['open_divergence_win'] = np.log(np.clip(X_test['prob_win'] / df['open_fair_win'].iloc[split_idx:].values, 1e-6, 1e6))
     
     def optimize_xgb(X, y):
         def objective(trial):

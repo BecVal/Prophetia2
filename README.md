@@ -6,9 +6,10 @@
 
 Prophetia2 es una arquitectura avanzada de Machine Learning Cuantitativo (Quant) diseñada para predecir los resultados de partidos de fútbol y encontrar valor financiero (Value Bets) en el mercado de apuestas.
 
-El núcleo predictivo del proyecto ha evolucionado hacia un **Metamodelo (Corrector de Residuos)**. En lugar de predecir el resultado desde cero, el sistema ingiere las Cuotas de Apertura (Opening Odds) de casas asiáticas eficientes (Pinnacle/Bet365), las convierte a probabilidades puras, y utiliza un modelo **XGBoost Classifier** para buscar errores en la estimación de la casa. 
-
-Para lograr esto, el motor procesa más de 12 años de histórico en 15 ligas europeas y cruza las cuotas con métricas tácticas avanzadas (xG), un sistema dinámico de Ratings Ofensivos/Defensivos (estilo Glicko), el Valor de Mercado de las plantillas (Transfermarkt) y un modelo bivariado Poisson Dixon-Coles para corregir la subestimación estadística de los empates. Finalmente, emite distribuciones probabilísticas calibradas mediante Regresión Isotónica libre de fuga de datos (Anti-Leakage), optimizando la rentabilidad financiera (Yield/ROI).
+El núcleo predictivo del proyecto ha evolucionado hacia una **Arquitectura de Stacking (Ensemble de Meta-Modelos)**. En lugar de predecir el resultado con un solo algoritmo monolítico, el sistema divide el trabajo en modelos especialistas (Nivel 0) y los ensambla en un Meta-Modelo (Nivel 1):
+1. **Modelo A (Poisson Bivariado):** Analiza exclusivamente la fuerza de los equipos (ELO) y los Goles Esperados (xG) para proyectar el flujo de goles.
+2. **Modelo B (Contexto y Táctica):** Analiza variables de fatiga, rachas (Momentum), valor de plantilla (Transfermarkt) y métricas tácticas usando *XGBoost*.
+3. **Modelo Jefe (Stacking Meta-Learner):** Ingiere las Cuotas de Apertura (Opening Odds) de casas asiáticas eficientes junto con las predicciones Out-Of-Fold (OOF) de los Modelos A y B, y emite distribuciones probabilísticas calibradas mediante Regresión Isotónica libre de fuga de datos (Anti-Leakage), optimizando la rentabilidad financiera (Yield/ROI).
 
 ## Instalacion
 
@@ -65,19 +66,16 @@ python core/feature_engineering.py
 ```
 Se generará el dataset final de entrenamiento listo para la IA en `data/processed/matches_dataset.parquet`.
 
-### 5. Entrenamiento del Modelo Predictivo
-Una vez procesados los más de 65,000 partidos históricos, entrena el modelo optimizado:
+### 5. Entrenamiento de la Arquitectura de Stacking (Pipeline Principal)
+Una vez procesados los más de 65,000 partidos históricos, ejecuta el orquestador principal que entrenará de manera secuencial todos los modelos especializados sin fuga de datos (Data Leakage):
 ```bash
-python core/train.py
+python core/run_pipeline.py
 ```
-Este proceso dividirá los datos cronológicamente, buscará hiperparámetros óptimos para XGBoost con `Optuna`, aplicará la Calibración Isotónica y exportará las predicciones base a los archivos parquet.
-
-### 6. Entrenamiento del Meta-Modelo CLV (Odds Drift)
-Para proteger el bankroll contra el *smart money*, entrenamos un segundo modelo que predice los movimientos de cuotas (Drift):
-```bash
-python core/train_clv_model.py
-```
-Este modelo inyecta métricas de **Divergencia** (nuestra probabilidad vs la probabilidad implícita del mercado) y utiliza **Optuna** para optimizar hiperparámetros de los XGBoost. Su objetivo es detectar trampas de valor y actualizar `test_predictions.parquet` con predicciones de hacia dónde se moverá el mercado.
+Este script orquesta los siguientes pasos automáticamente:
+1. **train_poisson.py**: Entrena el Modelo A basado en xG y ELO, y genera características Out-Of-Fold (OOF).
+2. **train_context.py**: Entrena el Modelo B (XGBoost) en métricas tácticas y de fatiga, con optimización `Optuna`, y genera características OOF.
+3. **train_stacker.py**: Entrena el Meta-Modelo (Stacker) que aprende a ponderar las predicciones base y las cuotas de mercado, aplicando Calibración Isotónica, y emite el `test_predictions.parquet` final.
+4. **train_clv_model.py (Meta-Modelo Odds Drift):** Para proteger el bankroll contra el *smart money*, entrena un modelo final que inyecta métricas de **Divergencia** (nuestra probabilidad vs la probabilidad implícita del mercado) para predecir hacia dónde se moverá la cuota de cierre y detectar trampas de valor.
 
 ### 7. Evaluación Financiera (Simulador de Bankroll)
 Por último, evalúa el desempeño de la estrategia aplicando Kelly Criterion y Bayesian Blending:

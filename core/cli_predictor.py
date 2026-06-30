@@ -12,7 +12,9 @@ from scipy.stats import poisson
 
 console = Console()
 
-MODEL_PATH = 'save_models/prophetia_xgb_model.pkl'
+POISSON_MODEL_PATH = 'save_models/poisson_model.pkl'
+CONTEXT_MODEL_PATH = 'save_models/context_model.pkl'
+STACKER_MODEL_PATH = 'save_models/stacker_model.pkl'
 DATASET_PATH = '../data/processed/matches_with_odds.parquet'
 FALLBACK_DATASET = '../data/processed/matches_dataset.parquet'
 
@@ -58,14 +60,18 @@ def calculate_ev(prob, odds):
 def main():
     console.print(Panel.fit("[bold cyan]Prophetia2 - Quant Value Betting CLI[/bold cyan]\n[dim]Initializing stochastic models and feature stores...[/dim]"))
     
-    # Cargar Modelo
-    if not os.path.exists(MODEL_PATH):
-        console.print(f"[red]Error: Modelo no encontrado en {MODEL_PATH}[/red]")
+    # Cargar Modelos del Stacker
+    if not all(os.path.exists(p) for p in [POISSON_MODEL_PATH, CONTEXT_MODEL_PATH, STACKER_MODEL_PATH]):
+        console.print(f"[red]Error: Faltan modelos de stacking. Ejecuta run_pipeline.py primero.[/red]")
         return
     
-    model_data = joblib.load(MODEL_PATH)
-    model = model_data['model']
-    features = model_data['features']
+    poisson_data = joblib.load(POISSON_MODEL_PATH)
+    context_data = joblib.load(CONTEXT_MODEL_PATH)
+    stacker_data = joblib.load(STACKER_MODEL_PATH)
+    
+    poisson_features = poisson_data['features']
+    context_features = context_data['features']
+    stacker_features = stacker_data['features']
     
     # Cargar Data
     df = load_data()
@@ -113,11 +119,12 @@ def main():
     # Construir el Feature Vector
     input_data = {}
     
-    for f in features:
+    all_features = set(poisson_features + context_features)
+    for f in all_features:
         input_data[f] = 0.0 # Default fallback
         
     # Llenar datos base (del local)
-    for f in features:
+    for f in all_features:
         if f in home_stats.index:
             input_data[f] = home_stats[f]
             
@@ -136,29 +143,16 @@ def main():
     input_data['opp_squad_value'] = away_stats['team_squad_value'] if 'team_squad_value' in away_stats else 0
     input_data['squad_value_diff'] = input_data['team_squad_value'] - input_data['opp_squad_value']
     
-    # Calcular Poisson aproximado (ya que el XGBPoisson no se guardó)
-    # Aproximación: xG_created del local multiplicado por xG_conceded del visitante (escalado)
-    lam_scored = home_stats.get('xg_created_ema5', 1.0) * (away_stats.get('xg_conceded_ema5', 1.0) / 1.5)
-    lam_conceded = away_stats.get('xg_created_ema5', 1.0) * (home_stats.get('xg_conceded_ema5', 1.0) / 1.5)
-    
-    # Penalizaciones por lesiones (Ajuste Estocástico Manual)
-    # 2% menos de xG a favor y ELO por lesión, 2% más de xG en contra por lesión clave.
+    # Penalizaciones por lesiones (Ajuste Estocástico Manual sobre ELO)
     if injuries_home > 0:
         penalty = injuries_home * 0.02
-        lam_scored *= (1 - penalty)
-        lam_conceded *= (1 + penalty)
         input_data['team_elo'] *= (1 - penalty)
         
     if injuries_away > 0:
         penalty = injuries_away * 0.02
-        lam_conceded *= (1 - penalty)
-        lam_scored *= (1 + penalty)
         input_data['opp_elo'] *= (1 - penalty)
         
     input_data['elo_diff'] = input_data['team_elo'] - input_data['opp_elo']
-    input_data['predicted_xg_scored'] = lam_scored
-    input_data['predicted_xg_conceded'] = lam_conceded
-    input_data['poisson_draw_prob'] = calc_dixon_coles_draw(lam_scored, lam_conceded)
     
     # Mercado implícito
     impl_win = 1/odds_1
@@ -169,11 +163,43 @@ def main():
     input_data['open_prob_draw'] = impl_draw / (impl_win + impl_draw + impl_loss)
     input_data['open_prob_loss'] = impl_loss / (impl_win + impl_draw + impl_loss)
 
-    # Inferencia
-    df_input = pd.DataFrame([input_data])[features]
+    # Inferencia Secuencial (Stacking)
+    df_input_full = pd.DataFrame([input_data])
     
-    # Predecir Probabilidades
-    y_prob = model.predict_proba(df_input)[0]
+    # 1. Modelo Poisson
+    df_poisson = df_input_full[poisson_features]
+    lam_scored = poisson_data['model_scored'].predict(df_poisson)[0]
+    lam_conceded = poisson_data['model_conceded'].predict(df_poisson)[0]
+    
+    if injuries_home > 0:
+        lam_scored *= (1 - (injuries_home * 0.02))
+        lam_conceded *= (1 + (injuries_home * 0.02))
+    if injuries_away > 0:
+        lam_conceded *= (1 - (injuries_away * 0.02))
+        lam_scored *= (1 + (injuries_away * 0.02))
+        
+    poisson_draw = calc_dixon_coles_draw(lam_scored, lam_conceded)
+    
+    # 2. Modelo Contexto
+    df_context = df_input_full[context_features]
+    ctx_probs = context_data['model'].predict_proba(df_context)[0]
+    
+    # 3. Meta-Modelo (Stacker)
+    stacker_input = {
+        'predicted_xg_scored': lam_scored,
+        'predicted_xg_conceded': lam_conceded,
+        'poisson_draw_prob': poisson_draw,
+        'prob_loss_ctx': ctx_probs[0],
+        'prob_draw_ctx': ctx_probs[1],
+        'prob_win_ctx': ctx_probs[2],
+        'open_prob_loss': input_data['open_prob_loss'],
+        'open_prob_draw': input_data['open_prob_draw'],
+        'open_prob_win': input_data['open_prob_win']
+    }
+    
+    df_stacker = pd.DataFrame([stacker_input])[stacker_features]
+    
+    y_prob = stacker_data['model'].predict_proba(df_stacker)[0]
     y_prob = y_prob / np.sum(y_prob) # Normalizar
     
     prob_loss, prob_draw, prob_win = y_prob
