@@ -5,9 +5,10 @@ from sklearn.model_selection import TimeSeriesSplit
 
 logger = logging.getLogger(__name__)
 
-# Intenta cargar el dataset con cuotas, si no, usa el base.
-DATASET_PATH = '../data/processed/matches_with_odds.parquet'
-FALLBACK_DATASET = '../data/processed/matches_dataset.parquet'
+import os
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+DATASET_PATH = os.path.join(BASE_DIR, 'data/processed/matches_with_odds.parquet')
+FALLBACK_DATASET = os.path.join(BASE_DIR, 'data/processed/matches_dataset.parquet')
 
 def get_base_dataset():
     """

@@ -155,12 +155,12 @@ def run_simulation():
             
             # Umbral mínimo de True CLV esperado (ej: > 0.5%)
             MIN_EXPECTED_CLV = 0.005
-            if pred_clv[best_choice] < MIN_EXPECTED_CLV:
+            if has_pred_clv and pred_clv[best_choice] < MIN_EXPECTED_CLV:
                 best_ev = -1.0 # Cancel bet
             
             # Dutching logic if both Local and Draw have EV > league_ev_thresh
             if ev_local > league_ev_thresh and ev_draw > league_ev_thresh:
-                if pred_clv[2] >= MIN_EXPECTED_CLV and pred_clv[1] >= MIN_EXPECTED_CLV:
+                if (not has_pred_clv) or (pred_clv[2] >= MIN_EXPECTED_CLV and pred_clv[1] >= MIN_EXPECTED_CLV):
                     bet_type = 'dutching'
                     implied_prob_1 = 1 / odds[2]
                     implied_prob_X = 1 / odds[1]

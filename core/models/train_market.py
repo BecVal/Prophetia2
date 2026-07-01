@@ -6,8 +6,8 @@ import logging
 import joblib
 import optuna
 from xgboost import XGBClassifier
-from sklearn.metrics import log_loss
-from sklearn.model_selection import KFold
+from sklearn.metrics import log_loss, brier_score_loss
+from sklearn.model_selection import TimeSeriesSplit, KFold
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +53,8 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         xgb_eval.fit(X_tr, y_tr, sample_weight=w_tr)
         
         y_prob = xgb_eval.predict_proba(X_val)
-        cv_scores.append(log_loss(y_val, y_prob))
+        y_prob = y_prob / y_prob.sum(axis=1, keepdims=True)
+        cv_scores.append(log_loss(y_val, y_prob, labels=[0, 1, 2]))
         
     return np.mean(cv_scores)
 
@@ -64,29 +65,43 @@ def train_market():
     split_idx = get_train_test_split(df)
     
     # Feature Engineering de Mercado
-    if 'open_prob_win' in df.columns and 'prob_win_implied' not in df.columns:
-        # Aproximar probs de cierre si están las cuotas de cierre
-        if 'odds_win' in df.columns:
-            df['prob_win_implied'] = 1 / df['odds_win']
-            df['prob_draw_implied'] = 1 / df['odds_draw']
-            df['prob_loss_implied'] = 1 / df['odds_loss']
-        else:
-            df['prob_win_implied'] = df['open_prob_win']
-            df['prob_draw_implied'] = df['open_prob_draw']
-            df['prob_loss_implied'] = df['open_prob_loss']
-            
-    if 'prob_win_implied' in df.columns and 'open_prob_win' in df.columns:
-        # Steam (Movimiento de cuotas)
-        df['steam_win'] = df['prob_win_implied'] - df['open_prob_win']
-        df['steam_draw'] = df['prob_draw_implied'] - df['open_prob_draw']
-        df['steam_loss'] = df['prob_loss_implied'] - df['open_prob_loss']
+    # 1. Calcular True Odds para el Cierre (Margin Removal)
+    if 'odds_win' in df.columns and 'prob_win_implied' not in df.columns:
+        implied_win = 1 / df['odds_win']
+        implied_draw = 1 / df['odds_draw']
+        implied_loss = 1 / df['odds_loss']
         
-        # Vig (Margen de la casa de apuestas)
-        df['vig_open'] = df['open_prob_win'] + df['open_prob_draw'] + df['open_prob_loss'] - 1
-        df['vig_close'] = df['prob_win_implied'] + df['prob_draw_implied'] + df['prob_loss_implied'] - 1
+        vig_close = implied_win + implied_draw + implied_loss
+        df['vig_close'] = vig_close - 1
+        
+        # Margin Removal (Basic method)
+        df['prob_win_implied'] = implied_win / vig_close
+        df['prob_draw_implied'] = implied_draw / vig_close
+        df['prob_loss_implied'] = implied_loss / vig_close
+    elif 'open_prob_win' in df.columns and 'prob_win_implied' not in df.columns:
+        df['prob_win_implied'] = df['open_prob_win']
+        df['prob_draw_implied'] = df['open_prob_draw']
+        df['prob_loss_implied'] = df['open_prob_loss']
+        df['vig_close'] = 0
+
+    if 'prob_win_implied' in df.columns and 'open_prob_win' in df.columns:
+        # 2. Calcular True Odds para la Apertura
+        vig_open = df['open_prob_win'] + df['open_prob_draw'] + df['open_prob_loss']
+        df['vig_open'] = vig_open - 1
+        
+        # Normalizar open probs para asegurar la misma escala antes de restar
+        norm_open_win = df['open_prob_win'] / vig_open
+        norm_open_draw = df['open_prob_draw'] / vig_open
+        norm_open_loss = df['open_prob_loss'] / vig_open
+        
+        # 3. Steam usando True Odds
+        df['steam_win'] = df['prob_win_implied'] - norm_open_win
+        df['steam_draw'] = df['prob_draw_implied'] - norm_open_draw
+        df['steam_loss'] = df['prob_loss_implied'] - norm_open_loss
         
     feature_cols = [
         'open_prob_win', 'open_prob_draw', 'open_prob_loss',
+        'prob_win_implied', 'prob_draw_implied', 'prob_loss_implied',
         'steam_win', 'steam_draw', 'steam_loss',
         'vig_open', 'vig_close'
     ]
@@ -138,7 +153,7 @@ def train_market():
     y_first = y_train.iloc[first_train_idx]
     dates_first = train_dates.iloc[first_train_idx] if train_dates is not None else None
     
-    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para evitar Leakage...")
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para evitar NaNs OOF...")
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     for kf_train, kf_val in kf.split(X_first):
         X_kf_train, y_kf_train = X_first.iloc[kf_train], y_first.iloc[kf_train]
@@ -170,20 +185,44 @@ def train_market():
     final_w_tr = get_time_weights(train_dates)
     xgb_best.fit(X_train, y_train, sample_weight=final_w_tr)
     pred_probs_test = xgb_best.predict_proba(X_test)
+    pred_probs_test = pred_probs_test / pred_probs_test.sum(axis=1, keepdims=True)
     
-    # LOGS: Verificacion
-    real_loss = (y_train == 0).mean()
-    real_draw = (y_train == 1).mean()
-    real_win = (y_train == 2).mean()
+    # Normalizar OOF (silencia warnings de suma != 1)
+    valid_mask = ~np.isnan(pred_probs_train[:, 0])
+    pred_probs_train[valid_mask] = pred_probs_train[valid_mask] / pred_probs_train[valid_mask].sum(axis=1, keepdims=True)
     
-    pred_loss = pred_probs_train[:, 0].mean()
-    pred_draw = pred_probs_train[:, 1].mean()
-    pred_win = pred_probs_train[:, 2].mean()
+    # LOGS: Verificacion y Calibración
+    valid_idx = valid_mask
+    y_true_valid = y_train.iloc[valid_idx].values
+    preds_valid = pred_probs_train[valid_idx]
     
-    logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO MERCADO ===")
-    logger.info(f" - Derrota (Loss) | Predicha: {pred_loss*100:.1f}% | Real en Dataset: {real_loss*100:.1f}%")
-    logger.info(f" - Empate (Draw)  | Predicha: {pred_draw*100:.1f}% | Real en Dataset: {real_draw*100:.1f}%")
-    logger.info(f" - Victoria (Win) | Predicha: {pred_win*100:.1f}% | Real en Dataset: {real_win*100:.1f}%")
+    if len(preds_valid) > 0:
+        logloss_val = log_loss(y_true_valid, preds_valid, labels=[0, 1, 2])
+        
+        brier_loss = np.mean((preds_valid[:, 0] - (y_true_valid == 0))**2)
+        brier_draw = np.mean((preds_valid[:, 1] - (y_true_valid == 1))**2)
+        brier_win  = np.mean((preds_valid[:, 2] - (y_true_valid == 2))**2)
+        
+        real_loss = np.mean(y_true_valid == 0)
+        real_draw = np.mean(y_true_valid == 1)
+        real_win = np.mean(y_true_valid == 2)
+        
+        pred_loss = np.mean(preds_valid[:, 0])
+        pred_draw = np.mean(preds_valid[:, 1])
+        pred_win = np.mean(preds_valid[:, 2])
+        
+        logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO MERCADO ===")
+        logger.info(f" -> Log Loss Global (OOF): {logloss_val:.4f}")
+        logger.info(f" - Derrota (Loss) | Predicha: {pred_loss*100:.1f}% | Real: {real_loss*100:.1f}% | Brier Score: {brier_loss:.4f}")
+        logger.info(f" - Empate (Draw)  | Predicha: {pred_draw*100:.1f}% | Real: {real_draw*100:.1f}% | Brier Score: {brier_draw:.4f}")
+        logger.info(f" - Victoria (Win) | Predicha: {pred_win*100:.1f}% | Real: {real_win*100:.1f}% | Brier Score: {brier_win:.4f}")
+        
+        # Feature Importances
+        importances = xgb_best.feature_importances_
+        feat_imp = pd.DataFrame({'Feature': feature_cols, 'Importance': importances}).sort_values(by='Importance', ascending=False)
+        logger.info("=== IMPORTANCIA DE VARIABLES (TOP 5) ===")
+        for _, row in feat_imp.head(5).iterrows():
+            logger.info(f"  {row['Feature']}: {row['Importance']:.4f}")
     
     # Guardar OOF
     if not os.path.exists(PROCESSED_DIR):

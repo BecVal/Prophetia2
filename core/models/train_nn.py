@@ -8,9 +8,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import log_loss
-from sklearn.model_selection import KFold
+from sklearn.metrics import log_loss, accuracy_score
+from sklearn.model_selection import TimeSeriesSplit
+import optuna
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -19,9 +21,10 @@ from data_splitter import get_base_dataset, get_train_test_split, get_cv_strateg
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-MODEL_SAVE_DIR = '../core/save_models/'
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+MODEL_SAVE_DIR = os.path.join(BASE_DIR, 'core/save_models/')
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'nn_model.pkl')
-PROCESSED_DIR = '../data/processed'
+PROCESSED_DIR = os.path.join(BASE_DIR, 'data/processed/')
 
 def get_time_weights(dates, half_life_days=365):
     if dates is None:
@@ -31,70 +34,121 @@ def get_time_weights(dates, half_life_days=365):
     return np.exp(-np.log(2) * days_diff / half_life_days)
 
 class PyTorchMLP(nn.Module):
-    def __init__(self, input_dim, num_classes=3):
+    def __init__(self, input_dim, hidden_dims=[128, 64], dropout_rate=0.3, num_classes=3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes)
-        )
+        layers = []
+        in_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.net = nn.Sequential(*layers)
         
     def forward(self, x):
         return self.net(x)
 
 class SklearnPyTorchWrapper:
-    def __init__(self, input_dim, num_classes=3, epochs=20, batch_size=64, lr=1e-3, device='cuda'):
+    def __init__(self, input_dim, hidden_dims=[128, 64], dropout_rate=0.3, weight_decay=1e-2, num_classes=3, epochs=100, batch_size=128, lr=1e-3, device='cuda', patience=7):
         self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.dropout_rate = dropout_rate
+        self.weight_decay = weight_decay
         self.num_classes = num_classes
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
+        self.patience = patience
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.model = None
         self.scaler = StandardScaler()
+        self.imputer = SimpleImputer(strategy='median')
         
     def _init_model(self):
-        self.model = PyTorchMLP(self.input_dim, self.num_classes).to(self.device)
+        self.model = PyTorchMLP(self.input_dim, self.hidden_dims, self.dropout_rate, self.num_classes).to(self.device)
         
     def fit(self, X, y, sample_weight=None):
         self._init_model() # Reinicializar para asegurar pesos limpios por cada fold
         
-        X_scaled = self.scaler.fit_transform(X)
-        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
-        y_tensor = torch.LongTensor(y.values if hasattr(y, 'values') else y).to(self.device)
+        # Validacion Interna para Early Stopping (Split primero para evitar Data Leakage)
+        val_idx = int(len(X) * 0.85)
         
-        if sample_weight is not None:
-            w_vals = sample_weight.values if hasattr(sample_weight, 'values') else sample_weight
-            w_tensor = torch.FloatTensor(w_vals).to(self.device)
-        else:
-            w_tensor = torch.ones(len(X)).to(self.device)
+        X_tr_raw = X.iloc[:val_idx] if hasattr(X, 'iloc') else X[:val_idx]
+        X_val_raw = X.iloc[val_idx:] if hasattr(X, 'iloc') else X[val_idx:]
+        
+        X_tr_imputed = self.imputer.fit_transform(X_tr_raw)
+        X_val_imputed = self.imputer.transform(X_val_raw)
+        
+        X_tr = self.scaler.fit_transform(X_tr_imputed)
+        X_val = self.scaler.transform(X_val_imputed)
+        
+        y_tr = y.iloc[:val_idx] if hasattr(y, 'iloc') else y[:val_idx]
+        y_val = y.iloc[val_idx:] if hasattr(y, 'iloc') else y[val_idx:]
+        
+        w_tr = sample_weight.iloc[:val_idx] if (sample_weight is not None and hasattr(sample_weight, 'iloc')) else (sample_weight[:val_idx] if sample_weight is not None else None)
+        w_val = sample_weight.iloc[val_idx:] if (sample_weight is not None and hasattr(sample_weight, 'iloc')) else (sample_weight[val_idx:] if sample_weight is not None else None)
+        
+        X_tr_t = torch.FloatTensor(X_tr).to(self.device)
+        y_tr_t = torch.LongTensor(y_tr.values if hasattr(y_tr, 'values') else y_tr).to(self.device)
+        w_tr_t = torch.FloatTensor(w_tr.values if hasattr(w_tr, 'values') else w_tr).to(self.device) if w_tr is not None else torch.ones(len(X_tr)).to(self.device)
+        
+        X_val_t = torch.FloatTensor(X_val).to(self.device)
+        y_val_t = torch.LongTensor(y_val.values if hasattr(y_val, 'values') else y_val).to(self.device)
+        w_val_t = torch.FloatTensor(w_val.values if hasattr(w_val, 'values') else w_val).to(self.device) if w_val is not None else torch.ones(len(X_val)).to(self.device)
             
-        dataset = TensorDataset(X_tensor, y_tensor, w_tensor)
+        dataset = TensorDataset(X_tr_t, y_tr_t, w_tr_t)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
+        # Sin pesos de clase ni label smoothing para no distorsionar las probabilidades reales
         criterion = nn.CrossEntropyLoss(reduction='none')
-        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+        
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
         
         self.model.train()
         for epoch in range(self.epochs):
+            self.model.train()
             for bx, by, bw in loader:
                 optimizer.zero_grad()
                 logits = self.model(bx)
                 loss = criterion(logits, by)
-                loss = (loss * bw).mean()
+                loss = (loss * bw).sum() / bw.sum()
                 loss.backward()
                 optimizer.step()
+                
+            # Validacion
+            self.model.eval()
+            with torch.no_grad():
+                val_logits = self.model(X_val_t)
+                val_loss = criterion(val_logits, y_val_t)
+                val_loss = ((val_loss * w_val_t).sum() / w_val_t.sum()).item()
+                
+            scheduler.step(val_loss)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_model_state = self.model.state_dict()
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= self.patience:
+                break
+                
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            
         return self
 
     def predict_proba(self, X):
         self.model.eval()
-        X_scaled = self.scaler.transform(X)
+        X_imputed = self.imputer.transform(X)
+        X_scaled = self.scaler.transform(X_imputed)
         X_tensor = torch.FloatTensor(X_scaled).to(self.device)
         with torch.no_grad():
             logits = self.model(X_tensor)
@@ -104,11 +158,15 @@ class SklearnPyTorchWrapper:
     def get_params(self):
         return {
             'input_dim': self.input_dim,
+            'hidden_dims': self.hidden_dims,
+            'dropout_rate': self.dropout_rate,
+            'weight_decay': self.weight_decay,
             'num_classes': self.num_classes,
             'epochs': self.epochs,
             'batch_size': self.batch_size,
             'lr': self.lr,
-            'device': self.device
+            'device': self.device,
+            'patience': self.patience
         }
 
 def train_nn():
@@ -143,7 +201,7 @@ def train_nn():
         logger.error(f"Faltan las siguientes columnas en NN: {missing_cols}")
         feature_cols = [c for c in feature_cols if c in df.columns]
 
-    X = df[feature_cols].fillna(0).copy()
+    X = df[feature_cols].copy()
     y = df['outcome'].replace({-1: 0, 0: 1, 1: 2})
     
     X_train, X_test = X.iloc[:split_idx].copy(), X.iloc[split_idx:].copy()
@@ -155,13 +213,85 @@ def train_nn():
     
     cv_strategy = get_cv_strategy(n_splits=5)
     
-    logger.info("Configurando Red Neuronal (PyTorch)...")
+    logger.info("Configurando Red Neuronal y Optuna (PyTorch)...")
     
     input_dim = X_train.shape[1]
-    # Parámetros fijos, o podrías usar Optuna aquí también, pero para NN un buen default suele bastar
-    nn_best = SklearnPyTorchWrapper(input_dim=input_dim, epochs=25, batch_size=128, lr=0.001)
     
-    logger.info("Calculando predicciones OOF para Train (NN)...")
+    # === OPTUNA HYPERPARAMETER TUNING ===
+    def objective(trial):
+        # Hyperparameter search space
+        n_layers = trial.suggest_int('n_layers', 1, 3)
+        hidden_dims = []
+        for i in range(n_layers):
+            hidden_dims.append(trial.suggest_categorical(f'n_units_l{i}', [64, 128, 256, 512]))
+            
+        dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5, step=0.1)
+        lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-4, 1e-1, log=True)
+        batch_size = trial.suggest_categorical('batch_size', [64, 128, 256])
+        
+        # Validacion Cruzada para evaluar estos parametros
+        kf = TimeSeriesSplit(n_splits=3) # Usamos 3 splits en Optuna para velocidad
+        fold_losses = []
+        
+        for train_idx, val_idx in kf.split(X_train):
+            X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
+            X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
+            
+            dates_tr = train_dates.iloc[train_idx] if train_dates is not None else None
+            w_tr = get_time_weights(dates_tr)
+            
+            # Usar paciencia menor y menos epochs para Optuna para acelerar (max 50 epochs)
+            estimator = SklearnPyTorchWrapper(
+                input_dim=input_dim, 
+                hidden_dims=hidden_dims, 
+                dropout_rate=dropout_rate,
+                weight_decay=weight_decay,
+                epochs=50, 
+                batch_size=batch_size, 
+                lr=lr, 
+                patience=4
+            )
+            
+            estimator.fit(X_tr, y_tr, sample_weight=w_tr)
+            preds = estimator.predict_proba(X_val)
+            fold_loss = log_loss(y_val, preds)
+            fold_losses.append(fold_loss)
+            
+        return np.mean(fold_losses)
+        
+    # Puedes ajustar 'n_trials' aquí si tarda demasiado. 50 es exhaustivo.
+    n_trials = 50 
+    logger.info(f"Iniciando Optuna con {n_trials} trials...")
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    
+    best_params = study.best_params
+    logger.info(f"Mejores hiperparámetros encontrados por Optuna: {best_params}")
+    logger.info(f"Mejor Log-Loss en validación (3 folds): {study.best_value:.4f}")
+    
+    # Reconstruir parametros del mejor trial
+    best_n_layers = best_params['n_layers']
+    best_hidden_dims = [best_params[f'n_units_l{i}'] for i in range(best_n_layers)]
+    best_dropout = best_params['dropout_rate']
+    best_lr = best_params['lr']
+    best_wd = best_params['weight_decay']
+    best_bs = best_params['batch_size']
+    
+    # Configurar el mejor modelo final (con patience normal y epochs completas)
+    nn_best = SklearnPyTorchWrapper(
+        input_dim=input_dim, 
+        hidden_dims=best_hidden_dims,
+        dropout_rate=best_dropout,
+        weight_decay=best_wd,
+        epochs=100, 
+        batch_size=best_bs, 
+        lr=best_lr, 
+        patience=7
+    )
+    
+    logger.info("Calculando predicciones OOF para Train (NN) con el MEJOR modelo...")
     pred_probs_train = np.zeros((len(X_train), 3))
     pred_probs_train[:] = np.nan
     
@@ -173,8 +303,8 @@ def train_nn():
     y_first = y_train.iloc[first_train_idx]
     dates_first = train_dates.iloc[first_train_idx] if train_dates is not None else None
     
-    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para evitar Leakage...")
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con TimeSeriesSplit(5) para evitar Leakage...")
+    kf = TimeSeriesSplit(n_splits=5)
     for kf_train, kf_val in kf.split(X_first):
         X_kf_train, y_kf_train = X_first.iloc[kf_train], y_first.iloc[kf_train]
         X_kf_val = X_first.iloc[kf_val]
@@ -208,13 +338,26 @@ def train_nn():
     
     # LOGS: Verificacion de calibracion
     logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO NN ===")
+    
+    # Calcular y mostrar métricas OOF
+    valid_idx = ~np.isnan(pred_probs_train[:, 0]) # Excluir NaNs del primer split
+    oof_preds_clean = pred_probs_train[valid_idx]
+    y_train_clean = y_train.iloc[valid_idx]
+    
+    oof_acc = accuracy_score(y_train_clean, np.argmax(oof_preds_clean, axis=1))
+    oof_logloss = log_loss(y_train_clean, oof_preds_clean)
+    
+    logger.info(f"OOF Accuracy: {oof_acc*100:.2f}%")
+    logger.info(f"OOF Log-Loss: {oof_logloss:.4f}")
+    logger.info("-" * 40)
+    
     real_loss = (y_train == 0).mean()
     real_draw = (y_train == 1).mean()
     real_win = (y_train == 2).mean()
     
-    pred_loss = pred_probs_train[:, 0].mean()
-    pred_draw = pred_probs_train[:, 1].mean()
-    pred_win = pred_probs_train[:, 2].mean()
+    pred_loss = oof_preds_clean[:, 0].mean()
+    pred_draw = oof_preds_clean[:, 1].mean()
+    pred_win = oof_preds_clean[:, 2].mean()
     
     logger.info(f" - Derrota (Loss) | Predicha: {pred_loss*100:.1f}% | Real en Dataset: {real_loss*100:.1f}%")
     logger.info(f" - Empate (Draw)  | Predicha: {pred_draw*100:.1f}% | Real en Dataset: {real_draw*100:.1f}%")

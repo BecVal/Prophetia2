@@ -20,7 +20,7 @@ if __name__ == "__main__":
     scripts = [
         "models/train_poisson.py",
         "models/train_context.py",
-        "models/train_nn.py",
+        #"models/train_nn.py",
         "models/train_draws.py",
         "models/train_market.py",
         "models/train_stacker.py",
