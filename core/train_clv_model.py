@@ -54,10 +54,10 @@ def train_clv_model():
     df['fair_draw'] = df['implied_draw'] / vig
     df['fair_win'] = df['implied_win'] / vig
 
-    # Drift histórico vs apertura (como proxy continuo) logarítmico
-    df['target_loss'] = np.log(df['odds_loss'] / df['open_odds_loss'])
-    df['target_draw'] = np.log(df['odds_draw'] / df['open_odds_draw'])
-    df['target_win'] = np.log(df['odds_win'] / df['open_odds_win'])
+    # Drift histórico vs apertura (como proxy continuo) logarítmico (positivo = odds dropean = CLV a favor)
+    df['target_loss'] = np.log(df['open_odds_loss'] / df['odds_loss'])
+    df['target_draw'] = np.log(df['open_odds_draw'] / df['odds_draw'])
+    df['target_win'] = np.log(df['open_odds_win'] / df['odds_win'])
     
     y_drift_loss = df['target_loss'].fillna(0)
     y_drift_draw = df['target_draw'].fillna(0)
@@ -79,9 +79,7 @@ def train_clv_model():
     X_train['prob_draw'] = df_train_preds['prob_draw'].values
     X_train['prob_win'] = df_train_preds['prob_win'].values
     
-    X_train['divergence_loss'] = np.log(np.clip(X_train['prob_loss'] / df['fair_loss'].iloc[:split_idx].values, 1e-6, 1e6))
-    X_train['divergence_draw'] = np.log(np.clip(X_train['prob_draw'] / df['fair_draw'].iloc[:split_idx].values, 1e-6, 1e6))
-    X_train['divergence_win'] = np.log(np.clip(X_train['prob_win'] / df['fair_win'].iloc[:split_idx].values, 1e-6, 1e6))
+    # REMOVED: divergence_loss using fair_loss (closing odds) causes data leakage because closing odds are not available at inference time.
     
     X_train['open_divergence_loss'] = np.log(np.clip(X_train['prob_loss'] / df['open_fair_loss'].iloc[:split_idx].values, 1e-6, 1e6))
     X_train['open_divergence_draw'] = np.log(np.clip(X_train['prob_draw'] / df['open_fair_draw'].iloc[:split_idx].values, 1e-6, 1e6))
@@ -92,9 +90,7 @@ def train_clv_model():
     X_test['prob_draw'] = df_test_preds['prob_draw'].values
     X_test['prob_win'] = df_test_preds['prob_win'].values
     
-    X_test['divergence_loss'] = np.log(np.clip(X_test['prob_loss'] / df['fair_loss'].iloc[split_idx:].values, 1e-6, 1e6))
-    X_test['divergence_draw'] = np.log(np.clip(X_test['prob_draw'] / df['fair_draw'].iloc[split_idx:].values, 1e-6, 1e6))
-    X_test['divergence_win'] = np.log(np.clip(X_test['prob_win'] / df['fair_win'].iloc[split_idx:].values, 1e-6, 1e6))
+    # REMOVED: divergence_loss leakage
     
     X_test['open_divergence_loss'] = np.log(np.clip(X_test['prob_loss'] / df['open_fair_loss'].iloc[split_idx:].values, 1e-6, 1e6))
     X_test['open_divergence_draw'] = np.log(np.clip(X_test['prob_draw'] / df['open_fair_draw'].iloc[split_idx:].values, 1e-6, 1e6))
@@ -155,7 +151,7 @@ def train_clv_model():
     def print_metrics(y_true, y_pred, name):
         mae = mean_absolute_error(y_true, y_pred)
         
-        # Direccionalidad binaria (1 si Drift > 0 "Mueve en contra", 0 si Drift <= 0 "Mueve a favor o estable")
+        # Direccionalidad binaria (1 si Drift > 0 "Mueve a favor (odds bajan)", 0 si Drift <= 0 "Mueve en contra o estable")
         y_true_bin = (y_true > 0).astype(int)
         y_pred_bin = (y_pred > 0).astype(int)
         
