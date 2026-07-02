@@ -14,14 +14,28 @@ El núcleo predictivo del proyecto ha evolucionado hacia una avanzada **Arquitec
 5. **Modelo de Dinámica de Mercado:** Extrae información puramente financiera ("Steam" y "Vig") de las casas de apuestas más eficientes (Pinnacle/Asia).
 6. **Meta-Modelo de Doble Stacking:** Consiste en dos niveles. Primero consolida un *Stacker Fundamental* con las probabilidades puramente deportivas y luego las cruza en un *Stacker Final* con las variables de mercado aplicando una fuerte penalidad L2 (Ridge) para evitar que el algoritmo se vuelva "perezoso" y asegurar un valor esperado (EV) genuino.
 
-## Instalacion
+<!-- ## Instalacion
 
 Se recomienda utilizar un entorno virtual de Python. Para instalar las dependencias necesarias para la extraccion de datos, entrenamiento del modelo y visualizacion:
 
 1. Clonar el repositorio.
 2. Crear y activar el entorno virtual (opcional pero recomendado).
 3. Ejecutar el archivo dependencias.bat (Solo la primera vez).
-4. Ejecutar los archivos iniciar_backend.bat y iniciar_frontend.bat
+4. Ejecutar los archivos iniciar_backend.bat y iniciar_frontend.bat -->
+
+## Requisitos del Sistema (Hardware)
+
+Prophetia2 es una arquitectura intensiva y está **optimizada nativamente para aceleración por hardware (NVIDIA CUDA)**, requiriendo procesar árboles de decisión (XGBoost GPU) y redes neuronales multicapa (PyTorch) sobre decenas de miles de filas con cientos de métricas.
+
+*   **Mínimos (Para ejecutar inferencia y predecir sin re-entrenar):**
+    *   CPU: Procesador moderno de 4 núcleos (ej. Intel Core i5 / Ryzen 5). Nota: Durante el entrenamiento, un procesador de 4-6 núcleos llegará al 100% de uso.
+    *   RAM: 8 GB.
+    *   GPU: No obligatoria, la inferencia puede correr en CPU.
+*   **Recomendados (Para Entrenamiento Completo del Meta-Modelo):**
+    *   CPU: 8 núcleos físicos o superior (ej. Ryzen 7 5700X o Intel i7). Con 8 núcleos, el uso de CPU rondará el 50%-60% durante el entrenamiento, evitando cuellos de botella.
+    *   RAM: 16 GB - 32 GB (crucial para procesar el Dataset OOF en memoria).
+    *   GPU: **Tarjeta gráfica NVIDIA con soporte CUDA (imprescindible para acelerar XGBoost y PyTorch)**. Se recomiendan mínimo 8GB de VRAM (ej. RTX 3060, RTX 4060 o superior). 
+    *   *Nota de rendimiento:* Entrenar el pipeline completo con una RTX 4060 OC lleva a la GPU al 100% de uso constante y tarda aproximadamente **30 minutos** en converger, más 2-3 horas adicionales si se realiza la extracción web completa desde cero (Scraping de Transfermarkt).
 
 ## Arquitectura Matemática y Financiera
 
@@ -90,7 +104,9 @@ python core/simulate_bankroll.py
 ```
 Este script leerá las predicciones base, aplicará tus diccionarios de riesgo (**Kelly Fractions** y **EV Thresholds** por liga), simulará la rentabilidad de un Bankroll inicial de $1,000 y ejecutará pruebas de resistencia (Monte Carlo Bootstrapping) para medir tu Maximum Drawdown y Probabilidad de Ruina (PoR).
 
-> **Benchmark Actual (Última Evaluación Financiera con Meta-Modelo Optuna):** Utilizando este flujo, el modelo ha demostrado métricas de clase institucional en *Out-of-Sample* tras procesar miles de partidos, alcanzando un **WinRate del 60.4%**, un **Yield neto del 9.04%** y un **ROI del 8.39%**, con un asombroso **Maximum Drawdown de solo 4.79%** y un **CLV casi nulo (-0.02%)**. La **Probabilidad de Ruina (PoR) se mantiene matemáticamente en 0.00%** tras 10,000 simulaciones extremas de estrés.
+> **Benchmark Actual (Última Evaluación Financiera con Meta-Modelo Optuna):** Utilizando este flujo riguroso, el modelo ha demostrado métricas de clase institucional en *Out-of-Sample* (7,799 partidos validados), alcanzando un **WinRate del 55.7%**, un asombroso **Yield neto del 15.64%** y un **ROI sobre el bankroll del 160.78%**, con un **Maximum Drawdown muy controlado de 9.50%**. Aún más importante, el modelo logra un **CLV Positivo del +4.75%**, demostrando matemáticamente que vence el cierre del mercado. La **Probabilidad de Ruina (PoR) se mantiene en 0.00%** tras 10,000 simulaciones extremas de estrés (Bootstrap por bloques Monte Carlo).
+> 
+> *⚠️ **Nota Cuantitativa sobre la Varianza:** Debido a que el modelo opera bajo un régimen de riesgo extremadamente estricto, la selectividad fue de apenas un 11.4% (889 apuestas ejecutadas de 7,799 partidos analizados). Por el bajo volumen relativo de apuestas, se debe ser consciente de que la Ley de los Grandes Números aún no ha estabilizado estas métricas por completo frente a la varianza. Por ende, los porcentajes reportados de Yield, ROI y CLV deben tomarse con cautela como una excelente validación inicial del modelo, pero podrían sufrir regresión a la media al exponerse a tamaños de muestra más grandes.*
 
 **¿Qué datos entran al modelo? (Inputs)**
 - **Consenso del Mercado (Metamodelado):** Probabilidades de apertura del mercado (`open_prob_win`, `open_prob_draw`, `open_prob_loss`).
@@ -116,7 +132,7 @@ Navegue a la carpeta `notebooks/` y utilice los siguientes archivos:
 *   **02_model_selection.ipynb**: Genera visualizaciones graficas sobre la correlacion tactica y revela que estadisticas (Feature Importance) considera XGBoost mas determinantes para ganar.
 *   **03_live_dashboard.ipynb**: Contiene un panel interactivo (Dashboard). Ejecute todas las celdas para habilitar un selector desplegable de partidos. Al seleccionar un encuentro, el sistema utilizara el modelo entrenado para emitir las probabilidades exactas de Victoria, Empate o Derrota, comparando ademas la prediccion con el flujo tactico real del partido.
 
-### 8. Predicción Financiera en Terminal (CLI Quant)
+### 8. Predicción Financiera en Terminal (CLI)
 Para ejecutar pronósticos en tiempo real basados en los últimos partidos procesados y calcular el riesgo (Bankroll Staking), utiliza nuestro menú interactivo de predicción cuantitativa:
 ```bash
 cd core
