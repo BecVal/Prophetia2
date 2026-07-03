@@ -9,3 +9,6 @@ ipywidgets
 xgboost
 jupyter
 optuna
+pymc
+pytensor
+arviz

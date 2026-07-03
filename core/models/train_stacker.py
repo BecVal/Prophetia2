@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import logging
 import joblib
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
@@ -15,13 +14,19 @@ from sklearn.frozen import FrozenEstimator
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_splitter import get_base_dataset, get_train_test_split
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
 
-MODEL_SAVE_DIR = '../core/save_models/'
+logger = get_logger(__name__, 'train_stacker')
+
+
+MODEL_SAVE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../core/save_models'))
 MODEL_SAVE_PATH_FUND = os.path.join(MODEL_SAVE_DIR, 'stacker_fundamental_model.pkl')
 MODEL_SAVE_PATH_FINAL = os.path.join(MODEL_SAVE_DIR, 'stacker_final_model.pkl')
-PROCESSED_DIR = '../data/processed'
+PROCESSED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed'))
 
 def get_time_weights(dates, half_life_days=365):
     if dates is None or dates.isna().all():
@@ -53,7 +58,7 @@ def train_stacker():
     logger.info("Cargando predicciones OOF de los modelos base...")
     
     oof_data = {}
-    for mod in ['poisson', 'context', 'nn', 'draws', 'market']:
+    for mod in ['poisson', 'context', 'nn', 'draws', 'market', 'gbm']:
         tr, ts = load_oof(mod, split_idx)
         if tr is not None:
             oof_data[mod] = (tr, ts)
@@ -113,10 +118,17 @@ def train_stacker():
     
     # ====== ETAPA 2: FINAL (MARKET) STACKER ======
     # Combina Predicciones Fundamentales con el Modelo de Mercado
-    logger.info("Entrenando Stacker Final (Nivel 2) combinando Fundamentales + Mercado...")
+    logger.info("Entrenando Stacker Final (Nivel 2) combinando Fundamentales + Mercado + GBM...")
     
+    market_models = []
     if 'market' in oof_data:
-        mkt_train, mkt_test = oof_data['market']
+        market_models.append(oof_data['market'])
+    if 'gbm' in oof_data:
+        market_models.append(oof_data['gbm'])
+        
+    if market_models:
+        mkt_train = pd.concat([m[0] for m in market_models], axis=1)
+        mkt_test = pd.concat([m[1] for m in market_models], axis=1)
         X_train_meta = pd.concat([df_fund_train, mkt_train], axis=1).fillna(0)
         X_test_meta = pd.concat([df_fund_test, mkt_test], axis=1).fillna(0)
     else:

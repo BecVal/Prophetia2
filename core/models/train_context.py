@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import logging
 import joblib
 import optuna
 from xgboost import XGBClassifier
@@ -13,13 +12,19 @@ from sklearn.model_selection import TimeSeriesSplit
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_splitter import get_base_dataset, get_train_test_split, get_cv_strategy
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'train_context')
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-MODEL_SAVE_DIR = '../core/save_models/'
+MODEL_SAVE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../core/save_models'))
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'context_model.pkl')
-PROCESSED_DIR = '../data/processed'
+PROCESSED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed'))
 
 def get_time_weights(dates, half_life_days=365):
     if dates is None:

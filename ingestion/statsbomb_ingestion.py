@@ -2,12 +2,17 @@ import os
 import time
 import pandas as pd
 from statsbombpy import sb
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configurar logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'statsbomb_ingestion')
+
 
 RAW_DATA_DIR = '../data/raw/statsbomb/events/'
 COMPETITIONS = ['La Liga', 'Premier League', 'Ligue 1', '1. Bundesliga', 'Champions League', 'FIFA World Cup']

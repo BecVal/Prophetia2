@@ -1,9 +1,14 @@
 import os
 import subprocess
-import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'run_pipeline')
+
 
 def run_script(script_name):
     logger.info(f"=== INICIANDO {script_name} ===")
@@ -20,9 +25,10 @@ if __name__ == "__main__":
     scripts = [
         "models/train_poisson.py",
         "models/train_context.py",
-        #"models/train_nn.py",
+        "models/train_nn.py",
         "models/train_draws.py",
         "models/train_market.py",
+        "models/train_gbm_model.py",
         "models/train_stacker.py",
         "train_clv_model.py",
     ]

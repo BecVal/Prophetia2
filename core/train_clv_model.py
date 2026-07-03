@@ -1,13 +1,18 @@
 import os
 import pandas as pd
 import numpy as np
-import logging
 import optuna
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, accuracy_score, precision_score, recall_score
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'train_clv_model')
+
 
 DATASET_PATH = '../data/processed/matches_with_odds.parquet'
 PREDICTIONS_PATH = '../data/processed/test_predictions.parquet'

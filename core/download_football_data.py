@@ -1,18 +1,23 @@
 import os
 import requests
-import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'download_football_data')
+
 
 # Configuración de ligas y temporadas a descargar
 
-LEAGUES = ['E0', 'E1', 'SP1', 'SP2', 'I1', 'I2', 'D1', 'D2', 'F1', 'F2', 'N1', 'B1', 'P1', 'T1', 'G1']
+LEAGUES = ['E0', 'E1', 'SP1', 'SP2', 'I1', 'I2', 'D1', 'D2', 'F1', 'F2', 'N1', 'B1', 'P1', 'T1', 'G1', 'SC0', 'E2']
+EXTRA_LEAGUES = ['USA', 'JPN', 'SWE', 'NOR', 'DNK', 'SWZ', 'AUT']
 SEASONS = ['1415', '1516', '1617', '1718', '1819', '1920', '2021', '2122', '2223', '2324', '2425', '2526']
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281/{season}/{league}.csv"
+EXTRA_BASE_URL = "https://www.football-data.co.uk/new/{league}.csv"
 OUTPUT_DIR = '../data/raw/football_data'
 
 def download_football_data():
@@ -40,6 +45,25 @@ def download_football_data():
                 logger.info(f"Guardado: {output_file}")
             except Exception as e:
                 logger.error(f"Error descargando {url}: {e}")
+
+    # Descargar ligas extra
+    for league in EXTRA_LEAGUES:
+        url = EXTRA_BASE_URL.format(league=league)
+        output_file = os.path.join(OUTPUT_DIR, f"{league}.csv")
+        if os.path.exists(output_file):
+            logger.info(f"El archivo {output_file} ya existe. Omitiendo.")
+            continue
+            
+        logger.info(f"Descargando liga extra {url}...")
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            
+            with open(output_file, 'wb') as f:
+                f.write(response.content)
+            logger.info(f"Guardado: {output_file}")
+        except Exception as e:
+            logger.error(f"Error descargando {url}: {e}")
 
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))

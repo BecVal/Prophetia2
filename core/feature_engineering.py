@@ -1,14 +1,17 @@
 import os
 import pandas as pd
 import numpy as np
-import logging
 import time
 
 # Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'feature_engineering')
+
 
 INTERIM_DATASET_PATH = '../data/interim/intermediate_dataset.parquet'
 OUTPUT_PATH = '../data/processed/matches_dataset.parquet'

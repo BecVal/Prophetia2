@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import logging
 import joblib
 import optuna
 from xgboost import XGBClassifier
@@ -13,13 +12,19 @@ from sklearn.model_selection import TimeSeriesSplit, KFold
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_splitter import get_base_dataset, get_train_test_split, get_cv_strategy
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'train_market')
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-MODEL_SAVE_DIR = '../core/save_models/'
+MODEL_SAVE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../core/save_models'))
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, 'market_model.pkl')
-PROCESSED_DIR = '../data/processed'
+PROCESSED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed'))
 
 def get_time_weights(dates, half_life_days=365):
     if dates is None:
@@ -67,37 +72,36 @@ def train_market():
     # Feature Engineering de Mercado
     # 1. Calcular True Odds para el Cierre (Margin Removal)
     if 'odds_win' in df.columns and 'prob_win_implied' not in df.columns:
-        implied_win = 1 / df['odds_win']
-        implied_draw = 1 / df['odds_draw']
-        implied_loss = 1 / df['odds_loss']
+        implied_win_c = 1 / df['odds_win']
+        implied_draw_c = 1 / df['odds_draw']
+        implied_loss_c = 1 / df['odds_loss']
         
-        vig_close = implied_win + implied_draw + implied_loss
+        vig_close = implied_win_c + implied_draw_c + implied_loss_c
         df['vig_close'] = vig_close - 1
         
         # Margin Removal (Basic method)
-        df['prob_win_implied'] = implied_win / vig_close
-        df['prob_draw_implied'] = implied_draw / vig_close
-        df['prob_loss_implied'] = implied_loss / vig_close
-    elif 'open_prob_win' in df.columns and 'prob_win_implied' not in df.columns:
-        df['prob_win_implied'] = df['open_prob_win']
-        df['prob_draw_implied'] = df['open_prob_draw']
-        df['prob_loss_implied'] = df['open_prob_loss']
-        df['vig_close'] = 0
+        df['prob_win_implied'] = implied_win_c / vig_close
+        df['prob_draw_implied'] = implied_draw_c / vig_close
+        df['prob_loss_implied'] = implied_loss_c / vig_close
 
-    if 'prob_win_implied' in df.columns and 'open_prob_win' in df.columns:
-        # 2. Calcular True Odds para la Apertura
-        vig_open = df['open_prob_win'] + df['open_prob_draw'] + df['open_prob_loss']
+    # 2. Calcular True Odds para la Apertura
+    if 'open_odds_win' in df.columns and 'open_prob_win' not in df.columns:
+        implied_win_o = 1 / df['open_odds_win']
+        implied_draw_o = 1 / df['open_odds_draw']
+        implied_loss_o = 1 / df['open_odds_loss']
+        
+        vig_open = implied_win_o + implied_draw_o + implied_loss_o
         df['vig_open'] = vig_open - 1
         
-        # Normalizar open probs para asegurar la misma escala antes de restar
-        norm_open_win = df['open_prob_win'] / vig_open
-        norm_open_draw = df['open_prob_draw'] / vig_open
-        norm_open_loss = df['open_prob_loss'] / vig_open
-        
-        # 3. Steam usando True Odds
-        df['steam_win'] = df['prob_win_implied'] - norm_open_win
-        df['steam_draw'] = df['prob_draw_implied'] - norm_open_draw
-        df['steam_loss'] = df['prob_loss_implied'] - norm_open_loss
+        df['open_prob_win'] = implied_win_o / vig_open
+        df['open_prob_draw'] = implied_draw_o / vig_open
+        df['open_prob_loss'] = implied_loss_o / vig_open
+
+    # 3. Steam usando True Odds (Cierre - Apertura)
+    if 'prob_win_implied' in df.columns and 'open_prob_win' in df.columns:
+        df['steam_win'] = df['prob_win_implied'] - df['open_prob_win']
+        df['steam_draw'] = df['prob_draw_implied'] - df['open_prob_draw']
+        df['steam_loss'] = df['prob_loss_implied'] - df['open_prob_loss']
         
     feature_cols = [
         'open_prob_win', 'open_prob_draw', 'open_prob_loss',

@@ -1,13 +1,16 @@
 import os
 import pandas as pd
-import logging
 from team_mapping import normalize_team_name
 
 # Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'data_adapter')
+
 
 MATCHES_METADATA_PATH = '../data/raw/statsbomb/matches.parquet'
 EVENTS_DIR = '../data/raw/statsbomb/events/'
@@ -284,7 +287,16 @@ def build_intermediate_from_footballdata():
         file_path = os.path.join(FOOTBALL_DATA_DIR, f)
         try:
             # Algunas columnas pueden tener tipos mixtos, forzamos low_memory=False
-            df = pd.read_csv(file_path, low_memory=False)
+            try:
+                df = pd.read_csv(file_path, low_memory=False, encoding='utf-8')
+            except UnicodeDecodeError:
+                df = pd.read_csv(file_path, low_memory=False, encoding='latin-1')
+            
+            # Normalizar columnas para ligas extra (ej. USA.csv) que usan nombres distintos
+            if 'Home' in df.columns and 'HomeTeam' not in df.columns:
+                df.rename(columns={'Home': 'HomeTeam', 'Away': 'AwayTeam'}, inplace=True)
+            if 'HG' in df.columns and 'FTHG' not in df.columns:
+                df.rename(columns={'HG': 'FTHG', 'AG': 'FTAG'}, inplace=True)
             
             # Limpiamos filas vacías que a veces vienen en los CSV
             df = df.dropna(subset=['HomeTeam', 'AwayTeam', 'Date'])
@@ -304,7 +316,25 @@ def build_intermediate_from_footballdata():
                 away_team = normalize_team_name(row['AwayTeam'])
                 
                 universal_id = f"footballdata_{match_date_id}_{home_team}_{away_team}".replace(" ", "")
-                competition = row.get('Div', '')
+                
+                # Obtener el código del archivo (ej. E0, USA, JPN)
+                file_code = f.split('_')[0].replace('.csv', '')
+                
+                # Mapear códigos a nombres legibles para ligas extra, o usar Div/League
+                EXTRA_LEAGUES_MAP = {
+                    'USA': 'MLS',
+                    'JPN': 'J1',
+                    'SWE': 'Allsvenskan',
+                    'NOR': 'Eliteserien',
+                    'DNK': 'Superligaen',
+                    'SWZ': 'Swiss Super League',
+                    'AUT': 'Austrian Bundesliga'
+                }
+                
+                if file_code in EXTRA_LEAGUES_MAP:
+                    competition = EXTRA_LEAGUES_MAP[file_code]
+                else:
+                    competition = row.get('Div', row.get('League', file_code))
                 
                 # Extracción segura de datos
                 def get_stat(col):
@@ -446,6 +476,36 @@ def build_unified_intermediate_dataset():
 
     # Crear directorio interim si no existe
     interim_dir = os.path.dirname(INTERMEDIATE_OUTPUT_PATH)
+    
+    # --- LOGS PARA DATA SCIENTIST ---
+    logger.info("=== RESUMEN DEL DATASET INTERMEDIO ===")
+    if 'competition' in final_df.columns and 'match_date' in final_df.columns:
+        # Cada partido tiene 2 filas (local y visitante), usamos drop_duplicates para contar partidos únicos
+        if 'match_id' in final_df.columns:
+            matches_df = final_df.drop_duplicates(subset=['match_id'])
+        else:
+            matches_df = final_df
+            
+        summary = matches_df.groupby('competition').agg(
+            total_matches=('match_date', 'count'),
+            last_match_date=('match_date', 'max')
+        ).reset_index()
+        
+        summary = summary.sort_values(by='total_matches', ascending=False)
+        
+        for _, row in summary.iterrows():
+            comp = row['competition']
+            total = row['total_matches']
+            last_date = row['last_match_date']
+            
+            if hasattr(last_date, 'strftime'):
+                last_date_str = last_date.strftime('%Y-%m-%d')
+            else:
+                last_date_str = str(last_date)[:10]
+                
+            logger.info(f"Liga: {comp:<20} | Partidos Únicos: {total:<5} | Último Partido: {last_date_str}")
+    logger.info("======================================")
+    
     os.makedirs(interim_dir, exist_ok=True)
 
     # Guardar dataset procesado

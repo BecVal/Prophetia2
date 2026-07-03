@@ -12,7 +12,8 @@ El núcleo predictivo del proyecto ha evolucionado hacia una avanzada **Arquitec
 3. **Modelo Deep Learning (No-Linealidades):** Un perceptrón multicapa (*Multi-Layer Perceptron* en PyTorch) que captura relaciones matemáticas complejas ignoradas por los árboles de decisión.
 4. **Modelo Caza-Empates (Draw-Catcher):** Un modelo binario enfocado exclusivamente en cazar la rentabilidad oculta de los empates.
 5. **Modelo de Dinámica de Mercado:** Extrae información puramente financiera ("Steam" y "Vig") de las casas de apuestas más eficientes (Pinnacle/Asia).
-6. **Meta-Modelo de Doble Stacking:** Consiste en dos niveles. Primero consolida un *Stacker Fundamental* con las probabilidades puramente deportivas y luego las cruza en un *Stacker Final* con las variables de mercado aplicando una fuerte penalidad L2 (Ridge) para evitar que el algoritmo se vuelva "perezoso" y asegurar un valor esperado (EV) genuino.
+6. **Modelo Cuantitativo GBM:** Evalúa la ineficiencia de las cuotas utilizando la física del Movimiento Browniano Geométrico en el espacio Log-Odds. Mide el "Drift", extrae la "Volatilidad Implícita" del mercado para cada equipo y detecta pánico (sobre-reacción) mediante desviaciones Z-Score de la trayectoria teórica.
+7. **Meta-Modelo de Doble Stacking:** Consiste en dos niveles. Primero consolida un *Stacker Fundamental* con las probabilidades puramente deportivas y luego las cruza en un *Stacker Final* con las variables de mercado aplicando una fuerte penalidad L2 (Ridge) para evitar que el algoritmo se vuelva "perezoso" y asegurar un valor esperado (EV) genuino.
 
 <!-- ## Instalacion
 
@@ -69,19 +70,19 @@ python core/data_adapter.py
 ```
 Este script generara un dataset intermedio tabular unificado en `data/interim/intermediate_dataset.parquet`.
 
-### 3. Extracción de Cuotas (Bookmaker Odds)
-Descarga el historial de cuotas de casas de apuestas globales para entrenar el metamodelo y simular rentabilidad:
-```bash
-python ingestion/fetch_odds.py
-```
-Este script descarga cuotas de apertura (PSH) y cierre (PSCH) para las 15 ligas, convirtiéndolas a probabilidades implícitas (Vig-free).
-
-### 4. Procesamiento Matemático (Feature Engineering)
+### 3. Procesamiento Matemático (Feature Engineering)
 El motor de Prophetia2 cruza las estadísticas tácticas avanzadas (Rolling Averages), el ELO Clásico, los ratings Glicko y fusiona los millones de euros de Transfermarkt con cada evento:
 ```bash
 python core/feature_engineering.py
 ```
-Se generará el dataset final de entrenamiento listo para la IA en `data/processed/matches_dataset.parquet`.
+Se generará el dataset principal en `data/processed/matches_dataset.parquet`.
+
+### 4. Extracción de Cuotas (Bookmaker Odds)
+Una vez procesados los datos matemáticos, descarga el historial de cuotas de casas de apuestas globales para entrenar el metamodelo financiero:
+```bash
+python ingestion/fetch_odds.py
+```
+Este script usa el dataset principal generado en el paso anterior y cruza las cuotas de apertura (PSH) y cierre (PSCH) para las ligas, convirtiéndolas a probabilidades implícitas (Vig-free), generando el dataset final en `data/processed/matches_with_odds.parquet`.
 
 ### 5. Entrenamiento de la Arquitectura de Stacking (Pipeline Principal)
 Una vez procesados los más de 65,000 partidos históricos, ejecuta el orquestador principal que entrenará de manera secuencial todos los modelos especializados sin fuga de datos (Data Leakage):
@@ -94,8 +95,9 @@ Este script orquesta los siguientes pasos automáticamente:
 3. **train_nn.py**: Entrena la Red Neuronal Profunda (`PyTorch`) para encontrar relaciones no-lineales.
 4. **train_draws.py**: Entrena el modelo binario "Caza-Empates" especializado.
 5. **train_market.py**: Entrena el modelo financiero que analiza el movimiento del "Smart Money".
-6. **train_stacker.py**: Ejecuta el **Doble Stacking**, combinando predicciones fundamentales y financieras, aplicando Calibración Isotónica y emitiendo el `test_predictions.parquet` final.
-7. **train_clv_model.py (Meta-Modelo Odds Drift):** Para proteger el bankroll, inyecta métricas de **Divergencia** para predecir hacia dónde se moverá la cuota de cierre y detectar trampas de valor.
+6. **train_gbm_model.py**: Aplica matemáticas financieras complejas (Geometric Brownian Motion) sobre el espacio Log-Odds para capturar ineficiencias de sentimiento y sobre-reacción pública.
+7. **train_stacker.py**: Ejecuta el **Doble Stacking**, combinando predicciones fundamentales y financieras (incluyendo GBM), aplicando Calibración Isotónica y emitiendo el `test_predictions.parquet` final.
+8. **train_clv_model.py (Meta-Modelo Odds Drift):** Para proteger el bankroll, inyecta métricas de **Divergencia** para predecir hacia dónde se moverá la cuota de cierre y detectar trampas de valor.
 
 ### 7. Evaluación Financiera (Simulador de Bankroll)
 Por último, evalúa el desempeño de la estrategia aplicando Kelly Criterion y Bayesian Blending:

@@ -2,7 +2,6 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import logging
 import joblib
 import torch
 import torch.nn as nn
@@ -18,8 +17,14 @@ import optuna
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_splitter import get_base_dataset, get_train_test_split, get_cv_strategy
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'train_nn')
+
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 MODEL_SAVE_DIR = os.path.join(BASE_DIR, 'core/save_models/')

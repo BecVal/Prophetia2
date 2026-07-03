@@ -18,22 +18,34 @@ STACKER_MODEL_PATH = 'save_models/stacker_model.pkl'
 DATASET_PATH = '../data/processed/matches_with_odds.parquet'
 FALLBACK_DATASET = '../data/processed/matches_dataset.parquet'
 
-def calc_dixon_coles_draw(lam_scored, lam_conceded, rho=-0.15):
-    prob = 0
-    for i in range(6):
-        p_scored = poisson.pmf(i, lam_scored)
-        p_conceded = poisson.pmf(i, lam_conceded)
-        base_prob = p_scored * p_conceded
-        
-        tau = 1.0
-        if i == 0:
-            tau = 1 - (lam_scored * lam_conceded * rho)
-        elif i == 1:
-            tau = 1 - rho
-            
-        tau = max(0, tau)
-        prob += base_prob * tau
-    return prob
+def calc_match_probabilities(lam_scored, lam_conceded, rho=-0.15, max_goals=10):
+    x = np.arange(max_goals + 1)
+    y = np.arange(max_goals + 1)
+    
+    pmf_scored = poisson.pmf(x, lam_scored)
+    pmf_conceded = poisson.pmf(y, lam_conceded)
+    
+    prob_matrix = np.outer(pmf_scored, pmf_conceded)
+    
+    tau_00 = max(0, 1 - (lam_scored * lam_conceded * rho))
+    tau_01 = max(0, 1 + (lam_scored * rho))
+    tau_10 = max(0, 1 + (lam_conceded * rho))
+    tau_11 = max(0, 1 - rho)
+    
+    prob_matrix[0, 0] *= tau_00
+    prob_matrix[0, 1] *= tau_01
+    prob_matrix[1, 0] *= tau_10
+    prob_matrix[1, 1] *= tau_11
+    
+    win_prob = np.tril(prob_matrix, -1).sum()
+    draw_prob = np.trace(prob_matrix)
+    loss_prob = np.triu(prob_matrix, 1).sum()
+    
+    total = win_prob + draw_prob + loss_prob
+    if total > 0:
+        return win_prob / total, draw_prob / total, loss_prob / total
+    else:
+        return 0.0, 0.0, 0.0
 
 def load_data():
     path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
@@ -178,7 +190,7 @@ def main():
         lam_conceded *= (1 - (injuries_away * 0.02))
         lam_scored *= (1 + (injuries_away * 0.02))
         
-    poisson_draw = calc_dixon_coles_draw(lam_scored, lam_conceded)
+    poisson_win, poisson_draw, poisson_loss = calc_match_probabilities(lam_scored, lam_conceded)
     
     # 2. Modelo Contexto
     df_context = df_input_full[context_features]
@@ -188,7 +200,9 @@ def main():
     stacker_input = {
         'predicted_xg_scored': lam_scored,
         'predicted_xg_conceded': lam_conceded,
+        'poisson_win_prob': poisson_win,
         'poisson_draw_prob': poisson_draw,
+        'poisson_loss_prob': poisson_loss,
         'prob_loss_ctx': ctx_probs[0],
         'prob_draw_ctx': ctx_probs[1],
         'prob_win_ctx': ctx_probs[2],
@@ -237,6 +251,13 @@ def main():
     blend_1X = blend_win + blend_draw
     ev_1X = (blend_1X * net_combined_odds_1X) - 1 - EXPECTED_CLV_DROP
     
+    # Dutching X2 (Doble Oportunidad Empate o Visita)
+    total_implied_X2 = impl_draw + impl_loss
+    combined_odds_X2 = 1 / total_implied_X2
+    net_combined_odds_X2 = 1 + (combined_odds_X2 - 1) * (1 - TAX_RETENTION_RATE)
+    blend_X2 = blend_draw + blend_loss
+    ev_X2 = (blend_X2 * net_combined_odds_X2) - 1 - EXPECTED_CLV_DROP
+    
     # Kelly Criterion
     def calc_kelly_stake(ev, net_odd):
         b = net_odd - 1
@@ -246,9 +267,12 @@ def main():
     k_draw = calc_kelly_stake(ev_draw, net_odds_X)
     k_loss = calc_kelly_stake(ev_loss, net_odds_2)
     k_1X = calc_kelly_stake(ev_1X, net_combined_odds_1X)
+    k_X2 = calc_kelly_stake(ev_X2, net_combined_odds_X2)
     
     # Mostrar resultados en tabla
     console.print("\n[bold]=== ANÁLISIS CUANTITATIVO DEL PARTIDO ===[/bold]")
+    console.print(f"[bold cyan]Marcador Esperado (xG):[/bold cyan] {home_team} [bold yellow]{lam_scored:.2f} - {lam_conceded:.2f}[/bold yellow] {away_team}\n")
+
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Mercado", style="cyan")
     table.add_column("Odds (Brutas)")
@@ -275,13 +299,16 @@ def main():
     table.add_row(
         "1X (Local o Empate)", f"{combined_odds_1X:.2f}", f"{(market_prob_win + market_prob_draw)*100:.1f}%", color_prob(blend_1X, market_prob_win + market_prob_draw), color_ev(ev_1X), f"{k_1X*100:.2f}%"
     )
+    table.add_row(
+        "X2 (Empate o Visita)", f"{combined_odds_X2:.2f}", f"{(market_prob_draw + market_prob_loss)*100:.1f}%", color_prob(blend_X2, market_prob_draw + market_prob_loss), color_ev(ev_X2), f"{k_X2*100:.2f}%"
+    )
     
     console.print(table)
     
     # Recomendación Final
     console.print("\n[bold]=== RECOMENDACIÓN DE STAKING ===[/bold]")
     
-    best_ev = max(ev_win, ev_draw, ev_loss, ev_1X)
+    best_ev = max(ev_win, ev_draw, ev_loss, ev_1X, ev_X2)
     if best_ev > 0:
         if best_ev == ev_win:
             selection = "Local (1)"
@@ -295,6 +322,10 @@ def main():
             selection = "Doble Oportunidad (1X) / Dutching"
             k_pct = k_1X * kelly_fraction
             odds = combined_odds_1X
+        elif best_ev == ev_X2:
+            selection = "Doble Oportunidad (X2) / Dutching"
+            k_pct = k_X2 * kelly_fraction
+            odds = combined_odds_X2
         else:
             selection = "Visitante (2)"
             k_pct = k_loss * kelly_fraction

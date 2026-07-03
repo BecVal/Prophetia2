@@ -53,3 +53,7 @@ Thumbs.db
 
 #MCP
 .codebase-memory/
+
+# Logs
+logs/
+*.log

@@ -4,15 +4,20 @@ import time
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-import logging
 from tqdm import tqdm
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(script_dir))
 from core.team_mapping import normalize_team_name
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from core.logger_config import get_logger
+
+logger = get_logger(__name__, 'transfermarkt_scraper')
+
 
 # Map football-data.co.uk league codes to Transfermarkt details (url_name, league_id)
 TRANSFERMARKT_LEAGUES = {
@@ -31,6 +36,15 @@ TRANSFERMARKT_LEAGUES = {
     'P1': ('liga-portugal', 'PO1'),
     'T1': ('super-lig', 'TR1'),
     'G1': ('super-league-1', 'GR1'),
+    'SC0': ('scottish-premiership', 'SC1'),
+    'E2': ('league-one', 'GB3'),
+    'USA': ('major-league-soccer', 'MLS1'),
+    'JPN': ('j1-league', 'JAP1'),
+    'SWE': ('allsvenskan', 'SE1'),
+    'NOR': ('eliteserien', 'NO1'),
+    'DNK': ('superligaen', 'DK1'),
+    'SWZ': ('super-league', 'C1'),
+    'AUT': ('bundesliga', 'A1'),
 }
 
 # The years in transfermarkt map to the start of the season (e.g. 2014 for 1415 season)
@@ -77,10 +91,27 @@ def fetch_squad_values():
     # Crear directorio si no existe
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     
+    # Cargar datos existentes para saltar si ya están scrapeados
+    processed_combinations = set()
+    if os.path.exists(OUTPUT_PATH):
+        try:
+            existing_df = pd.read_parquet(OUTPUT_PATH, engine='fastparquet')
+            if 'league_code' in existing_df.columns and 'season_year' in existing_df.columns:
+                processed_combinations = set(zip(existing_df['league_code'], existing_df['season_year']))
+                # Also keep existing records so they aren't lost when we overwrite!
+                results = existing_df.to_dict('records')
+                logger.info(f"Cargados {len(results)} registros existentes. Se omitirán {len(processed_combinations)} pares (liga, temporada).")
+        except Exception as e:
+            logger.warning(f"No se pudo cargar el archivo existente: {e}")
+
     for league_code, (league_name, tm_league_id) in TRANSFERMARKT_LEAGUES.items():
         logger.info(f"Procesando liga {league_code} ({league_name})...")
         
         for year in SEASONS_YEARS:
+            if (league_code, year) in processed_combinations:
+                logger.info(f"Omitiendo {league_code} - temporada {year} (ya descargada).")
+                continue
+                
             # Transfermarkt URL format
             url = f"https://www.transfermarkt.com/{league_name}/startseite/wettbewerb/{tm_league_id}/plus/?saison_id={year}"
             
