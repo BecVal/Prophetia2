@@ -97,8 +97,9 @@ def get_expanding_predictions(estimator_factory, X, y, dates):
     y_first = y.iloc[first_train_idx]
     dates_first = dates.iloc[first_train_idx] if dates is not None else None
     
-    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con TimeSeriesSplit(5) para evitar Leakage...")
-    kf = TimeSeriesSplit(n_splits=5)
+    from sklearn.model_selection import KFold
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para obtener OOF completos...")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
     for kf_train, kf_val in kf.split(X_first):
         X_kf_train, y_kf_train = X_first.iloc[kf_train], y_first.iloc[kf_train]
         X_kf_val = X_first.iloc[kf_val]
@@ -191,8 +192,20 @@ def train_poisson():
     # Test Probs
     win_prob_test, draw_prob_test, loss_prob_test = v_calc_probs(pred_scored_test, pred_conceded_test)
     
+    from sklearn.metrics import log_loss
+    
+    y_true_train = df['outcome'].iloc[:split_idx].replace({-1: 0, 0: 1, 1: 2})
+    pred_probs_train_stack = np.column_stack((loss_prob_train, draw_prob_train, win_prob_train))
+    poisson_logloss_train = log_loss(y_true_train, pred_probs_train_stack)
+    
+    y_true_test = df['outcome'].iloc[split_idx:].replace({-1: 0, 0: 1, 1: 2})
+    pred_probs_test_stack = np.column_stack((loss_prob_test, draw_prob_test, win_prob_test))
+    poisson_logloss_test = log_loss(y_true_test, pred_probs_test_stack)
+    
     # LOGS: Verificacion de los resultados de Poisson
-    logger.info("Estadísticas del Entrenamiento:")
+    logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO A ===")
+    logger.info(f" - Poisson Log-Loss (Train OOF): {poisson_logloss_train:.4f}")
+    logger.info(f" - Poisson Log-Loss (Test OOS): {poisson_logloss_test:.4f}")
     logger.info(f" - Media xG Scored predicho: {pred_scored_train.mean():.3f} (Real: {y_scored_train.mean():.3f})")
     logger.info(f" - Media xG Conceded predicho: {pred_conceded_train.mean():.3f} (Real: {y_conceded_train.mean():.3f})")
     logger.info(f" - Promedio Prob Victoria: {win_prob_train.mean()*100:.1f}%")

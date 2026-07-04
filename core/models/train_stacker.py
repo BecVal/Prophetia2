@@ -58,23 +58,31 @@ def train_stacker():
     logger.info("Cargando predicciones OOF de los modelos base...")
     
     oof_data = {}
-    for mod in ['poisson', 'context', 'nn', 'draws', 'market', 'gbm']:
+    for mod in ['quant', 'poisson', 'context', 'nn', 'draws', 'market', 'gbm']:
         tr, ts = load_oof(mod, split_idx)
         if tr is not None:
             oof_data[mod] = (tr, ts)
             
     # ====== ETAPA 1: FUNDAMENTAL STACKER ======
-    # Modelos fundamentales: poisson, context, nn, draws
+    # Modelos fundamentales: quant (o poisson), context, nn, draws
     fundamental_train_list = []
     fundamental_test_list = []
     
-    for mod in ['poisson', 'context', 'nn', 'draws']:
+    # Determinar si usamos quant (Plan A) o poisson (Plan B)
+    if 'quant' in oof_data:
+        logger.info("Modelo 'quant' encontrado. Se usará como modelo base en lugar de 'poisson'.")
+        base_models = ['quant', 'context', 'nn', 'draws']
+    else:
+        logger.info("Modelo 'quant' no encontrado. Se usará 'poisson' como plan B.")
+        base_models = ['poisson', 'context', 'nn', 'draws']
+        
+    for mod in base_models:
         if mod in oof_data:
             fundamental_train_list.append(oof_data[mod][0])
             fundamental_test_list.append(oof_data[mod][1])
             
     if not fundamental_train_list:
-        raise ValueError("No se encontraron modelos fundamentales. Debes entrenar al menos poisson o context primero.")
+        raise ValueError("No se encontraron modelos fundamentales. Debes entrenar al menos quant, poisson o context primero.")
         
     X_train_fund = pd.concat(fundamental_train_list, axis=1).fillna(0)
     X_test_fund = pd.concat(fundamental_test_list, axis=1).fillna(0)
@@ -202,9 +210,20 @@ def train_stacker():
     # Guardar resultados y datasets para el modelo CLV y el Simulador
     df_train = pd.DataFrame({
         'match_date': df['match_date'].iloc[:split_idx].values if 'match_date' in df.columns else np.array([None]*len(y_train)),
+        'competition': df['competition'].iloc[:split_idx].values if 'competition' in df.columns else np.array([None]*len(y_train)),
+        'team': df['team'].iloc[:split_idx].values,
+        'opponent': df['opponent'].iloc[:split_idx].values,
+        'is_home': df['is_home'].iloc[:split_idx].values,
         'prob_loss': y_prob_train[:, 0],
         'prob_draw': y_prob_train[:, 1],
         'prob_win': y_prob_train[:, 2],
+        'outcome': y_train.values,
+        'odds_win': df['open_odds_win'].iloc[:split_idx].values if 'open_odds_win' in df.columns else df['odds_win'].iloc[:split_idx].values,
+        'odds_draw': df['open_odds_draw'].iloc[:split_idx].values if 'open_odds_draw' in df.columns else df['odds_draw'].iloc[:split_idx].values,
+        'odds_loss': df['open_odds_loss'].iloc[:split_idx].values if 'open_odds_loss' in df.columns else df['odds_loss'].iloc[:split_idx].values,
+        'closing_odds_win': df['odds_win'].iloc[:split_idx].values,
+        'closing_odds_draw': df['odds_draw'].iloc[:split_idx].values,
+        'closing_odds_loss': df['odds_loss'].iloc[:split_idx].values
     })
     
     has_odds = 'odds_win' in df.columns

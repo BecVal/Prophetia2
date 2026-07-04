@@ -308,8 +308,9 @@ def train_nn():
     y_first = y_train.iloc[first_train_idx]
     dates_first = train_dates.iloc[first_train_idx] if train_dates is not None else None
     
-    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con TimeSeriesSplit(5) para evitar Leakage...")
-    kf = TimeSeriesSplit(n_splits=5)
+    from sklearn.model_selection import KFold
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para obtener OOF completos...")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
     for kf_train, kf_val in kf.split(X_first):
         X_kf_train, y_kf_train = X_first.iloc[kf_train], y_first.iloc[kf_train]
         X_kf_val = X_first.iloc[kf_val]

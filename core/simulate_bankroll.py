@@ -16,13 +16,13 @@ logger = get_logger(__name__, 'simulate_bankroll')
 
 
 # Configuración Quant
-FILTER_BY_WHITELIST = False  # True: ignora partidos fuera de Whitelist en la simulación financiera
-WHITELIST_LEAGUES = ['I1', 'D2', 'SP1', 'F2', 'G1', 'D1', 'T1', 'F1']
+FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
+WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0']
 
 # --- CONFIGURACIÓN DE OPTIMIZACIÓN ---
 # Opciones: 'NONE', 'ALL', 'WHITELIST', o una liga específica como 'I1'
-OPTIMIZATION_MODE = 'NONE' 
-OPTUNA_TRIALS = 200
+OPTIMIZATION_MODE = 'WHITELIST' 
+OPTUNA_TRIALS = 1000
 OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
 
 # Diccionarios de riesgo por liga iniciales/por defecto
@@ -37,9 +37,9 @@ MARKET_BLEND_ALPHA = 0.85  # Peso del modelo vs mercado (85% modelo, 15% mercado
 EXPECTED_CLV_DROP = 0.015  # Penalización por slippage esperado del CLV (-1.5%)
 MAX_BET_LIQUIDITY = {      # Límites de liquidez absolutos en USD o Unidad Base
     'D1': 2000.0, 'SP1': 2000.0, 'I1': 2000.0, 'G1': 2000.0, 'F1': 2000.0,
-    'D2': 1000.0, 'F2': 1000.0,
-    'T1': 500.0,
-    'DEFAULT': 200.0
+    'D2': 2000.0, 'F2': 2000.0,
+    'T1': 2000.0,
+    'DEFAULT': 2000.0
 }
 
 def load_optimized_params():
@@ -249,8 +249,9 @@ def optimize_league(df, league_name):
         return None, None
         
     def objective(trial):
-        ev_thresh = trial.suggest_float('ev_thresh', 0.001, 0.05)
-        kelly_fraction = trial.suggest_float('kelly_fraction', 0.005, 0.15)
+        ev_thresh = trial.suggest_float('ev_thresh', 0.015, 0.050)
+        # Configuración del kelly máximo para Optuna
+        kelly_fraction = trial.suggest_float('kelly_fraction', 0.005, 0.17)
         
         roi, mdd = evaluate_league_params(df_league, ev_thresh, kelly_fraction)
         
@@ -259,6 +260,8 @@ def optimize_league(df, league_name):
             
         # Riesgo Ajustado: ROI / (MDD + 1%)
         score = roi / (mdd + 0.01)
+        if mdd > 0.25:
+            score -= (mdd - 0.25) * 2.0  # Penalización severa si pasa del 25% de MDD
         return score
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -290,25 +293,32 @@ def run_simulation():
 
     # 1. OPTIMIZACIÓN O CARGA DE PARÁMETROS
     if OPTIMIZATION_MODE != 'NONE':
-        leagues_to_optimize = []
-        if OPTIMIZATION_MODE == 'ALL':
-            leagues_to_optimize = df['competition'].unique()
-        elif OPTIMIZATION_MODE == 'WHITELIST':
-            leagues_to_optimize = [L for L in df['competition'].unique() if L in WHITELIST_LEAGUES]
+        TRAIN_PREDS_PATH = '../data/processed/train_predictions.parquet'
+        if not os.path.exists(TRAIN_PREDS_PATH):
+            logger.error("No se puede optimizar: falta train_predictions.parquet")
         else:
-            leagues_to_optimize = [OPTIMIZATION_MODE] # Asumimos que es el nombre de la liga (ej 'I1')
+            logger.info(f"Cargando predicciones del set de TRAIN para Optimización: {TRAIN_PREDS_PATH}...")
+            df_train_opt = pd.read_parquet(TRAIN_PREDS_PATH, engine='fastparquet')
             
-        logger.info(f"Modo Optimización Activado: Optimizando {len(leagues_to_optimize)} ligas.")
-        for comp in leagues_to_optimize:
-            if FILTER_BY_WHITELIST and comp not in WHITELIST_LEAGUES:
-                continue
-            ev_opt, kelly_opt = optimize_league(df, comp)
-            if ev_opt is not None:
-                EV_THRESHOLDS[comp] = ev_opt
-                KELLY_FRACTIONS[comp] = kelly_opt
+            leagues_to_optimize = []
+            if OPTIMIZATION_MODE == 'ALL':
+                leagues_to_optimize = df_train_opt['competition'].unique()
+            elif OPTIMIZATION_MODE == 'WHITELIST':
+                leagues_to_optimize = [L for L in df_train_opt['competition'].unique() if L in WHITELIST_LEAGUES]
+            else:
+                leagues_to_optimize = [OPTIMIZATION_MODE] 
                 
-        # Guardar resultados para futuro uso
-        save_optimized_params()
+            logger.info(f"Modo Optimización Activado: Optimizando {len(leagues_to_optimize)} ligas en el set de ENTRENAMIENTO (OOF).")
+            for comp in leagues_to_optimize:
+                if FILTER_BY_WHITELIST and comp not in WHITELIST_LEAGUES:
+                    continue
+                ev_opt, kelly_opt = optimize_league(df_train_opt, comp)
+                if ev_opt is not None:
+                    EV_THRESHOLDS[comp] = ev_opt
+                    KELLY_FRACTIONS[comp] = kelly_opt
+                    
+            # Guardar resultados para futuro uso
+            save_optimized_params()
     else:
         # Cargar si existe el archivo
         load_optimized_params()
@@ -499,6 +509,9 @@ def run_simulation():
                 total_expected_profit += (stake * best_ev)
                 avg_odds_list.append(odds[best_choice])
                 
+                if comp not in league_stats:
+                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
+
                 if has_closing_odds:
                     idx = bet['index']
                     c_loss = c_odds_loss[idx]
@@ -516,9 +529,8 @@ def run_simulation():
                         fair_c_odd = fair_closing_odds[best_choice]
                         true_clv = (odds[best_choice] / fair_c_odd) - 1
                         clv_list.append(true_clv)
+                        league_stats[comp]['clv_list'].append(true_clv)
                 
-                if comp not in league_stats:
-                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
                 league_stats[comp]['bets'] += 1
                 league_stats[comp]['staked'] += stake
                 
@@ -571,6 +583,9 @@ def run_simulation():
                 total_expected_profit += (total_dutch_stake * best_ev) 
                 avg_odds_list.append(combined_odds)
                 
+                if comp not in league_stats:
+                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
+
                 if has_closing_odds:
                     idx = bet['index']
                     c_loss = c_odds_loss[idx]
@@ -584,9 +599,8 @@ def run_simulation():
                         fair_c_combined_odds = 1 / (fair_prob_1 + fair_prob_X)
                         true_clv = (combined_odds / fair_c_combined_odds) - 1
                         clv_list.append(true_clv)
+                        league_stats[comp]['clv_list'].append(true_clv)
                 
-                if comp not in league_stats:
-                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0}
                 league_stats[comp]['bets'] += 1
                 league_stats[comp]['staked'] += total_dutch_stake
                 
@@ -680,7 +694,9 @@ def run_simulation():
         if stats['bets'] > 0:
             l_winrate = (stats['won'] / stats['bets']) * 100
             l_yield = (stats['profit'] / stats['staked']) * 100
-            logger.info(f"Liga {comp}: {stats['bets']} apuestas | WinRate: {l_winrate:.1f}% | Yield: {l_yield:.2f}% | Profit: ${stats['profit']:.2f} | Kelly: {KELLY_FRACTIONS.get(comp,0):.3f} | EV: {EV_THRESHOLDS.get(comp,0):.3f}")
+            l_clv = (np.mean(stats['clv_list']) * 100) if stats.get('clv_list') else 0.0
+            clv_str = f" | CLV: {l_clv:.2f}%" if stats.get('clv_list') else ""
+            logger.info(f"Liga {comp}: {stats['bets']} apuestas | WinRate: {l_winrate:.1f}% | Yield: {l_yield:.2f}% | Profit: ${stats['profit']:.2f} | Kelly: {KELLY_FRACTIONS.get(comp,0):.3f} | EV: {EV_THRESHOLDS.get(comp,0):.3f}{clv_str}")
     
     if yield_pct > 0:
         logger.info("EL MODELO ES RENTABLE. (Tiene Edge real contra el mercado).")

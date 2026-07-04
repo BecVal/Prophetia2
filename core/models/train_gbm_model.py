@@ -101,8 +101,8 @@ def compute_gbm_features(df):
         # Z = (Drift_Actual - Media_Drift) / Sigma
         df[z_col] = (df[mu_col] - df[mean_drift_col]) / df[sigma_col].replace(0, 1e-5)
     
-    # Sort back to original if needed by match_date
-    df = df.sort_values(by='match_date')
+    # Restablecer el orden exacto original por su índice
+    df = df.sort_index()
     
     return df
 
