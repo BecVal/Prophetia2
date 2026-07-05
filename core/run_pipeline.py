@@ -38,7 +38,7 @@ if __name__ == "__main__":
         "models/train_market.py",
         "models/train_gbm_model.py",
         "models/train_stacker.py",
-        "train_clv_model.py",
+        "train_clv_model.py"
     ]
     
     for script in scripts:

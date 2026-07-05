@@ -3,25 +3,23 @@ import sys
 import pandas as pd
 import numpy as np
 import joblib
+import optuna
+from scipy.stats import entropy
 from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.frozen import FrozenEstimator
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from data_splitter import get_base_dataset, get_train_test_split
+from data_splitter import get_base_dataset, get_train_test_split, get_cv_strategy
 
-import sys
-import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from core.logger_config import get_logger
 
 logger = get_logger(__name__, 'train_stacker')
-
 
 MODEL_SAVE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../core/save_models'))
 MODEL_SAVE_PATH_FUND = os.path.join(MODEL_SAVE_DIR, 'stacker_fundamental_model.pkl')
@@ -44,6 +42,49 @@ def load_oof(model_name, split_idx):
     else:
         logger.warning(f"OOF para {model_name} no encontrado. Se omitirá.")
         return None, None
+        
+def compute_meta_features(X_base, df_orig, prefix=""):
+    # X_base contiene las probabilidades de los modelos
+    meta = pd.DataFrame(index=X_base.index)
+    
+    # 1. Varianza de los modelos
+    cols_loss = [c for c in X_base.columns if 'loss' in c.lower()]
+    cols_draw = [c for c in X_base.columns if 'draw' in c.lower()]
+    cols_win = [c for c in X_base.columns if 'win' in c.lower()]
+    
+    if cols_loss: meta[f'{prefix}std_loss'] = X_base[cols_loss].std(axis=1).fillna(0)
+    if cols_draw: meta[f'{prefix}std_draw'] = X_base[cols_draw].std(axis=1).fillna(0)
+    if cols_win: meta[f'{prefix}std_win'] = X_base[cols_win].std(axis=1).fillna(0)
+    
+    # 2. Entropía Media del consenso (Para saber qué tan seguro está el consenso general)
+    mean_probs = pd.DataFrame({
+        'loss': X_base[cols_loss].mean(axis=1) if cols_loss else 0,
+        'draw': X_base[cols_draw].mean(axis=1) if cols_draw else 0,
+        'win': X_base[cols_win].mean(axis=1) if cols_win else 1,
+    })
+    
+    # Normalizar para entropía (por si no suman 1 perfectamente)
+    sums = mean_probs.sum(axis=1)
+    mean_probs = mean_probs.div(np.where(sums > 0, sums, 1), axis=0)
+    
+    def calc_entropy(row):
+        return entropy(row + 1e-9)
+        
+    meta[f'{prefix}entropy'] = mean_probs.apply(calc_entropy, axis=1)
+    
+    # 3. Cuotas Implícitas (Contexto de Mercado)
+    if 'open_odds_win' in df_orig.columns:
+        meta['implied_open_loss'] = (1 / df_orig['open_odds_loss'].clip(lower=1.01)).fillna(0)
+        meta['implied_open_draw'] = (1 / df_orig['open_odds_draw'].clip(lower=1.01)).fillna(0)
+        meta['implied_open_win'] = (1 / df_orig['open_odds_win'].clip(lower=1.01)).fillna(0)
+    
+    # 4. ID de Competición (Para reducir la ceguera)
+    if 'competition' in df_orig.columns:
+        meta['competition_id'] = pd.factorize(df_orig['competition'])[0]
+    else:
+        meta['competition_id'] = 0
+        
+    return pd.concat([X_base, meta], axis=1)
 
 def train_stacker():
     df = get_base_dataset()
@@ -52,6 +93,9 @@ def train_stacker():
     y = df['outcome'].replace({-1: 0, 0: 1, 1: 2})
     y_train = y.iloc[:split_idx]
     y_test = y.iloc[split_idx:]
+    
+    df_train_orig = df.iloc[:split_idx].copy()
+    df_test_orig = df.iloc[split_idx:].copy()
     
     train_dates = pd.to_datetime(df['match_date'].iloc[:split_idx]) if 'match_date' in df.columns else None
     
@@ -64,13 +108,11 @@ def train_stacker():
             oof_data[mod] = (tr, ts)
             
     # ====== ETAPA 1: FUNDAMENTAL STACKER ======
-    # Modelos fundamentales: quant (o poisson), context, nn, draws
     fundamental_train_list = []
     fundamental_test_list = []
     
-    # Determinar si usamos quant (Plan A) o poisson (Plan B)
     if 'quant' in oof_data:
-        logger.info("Modelo 'quant' encontrado. Se usará como modelo base en lugar de 'poisson'.")
+        logger.info("Modelo 'quant' encontrado. Se usará como modelo base fundamental.")
         base_models = ['quant', 'context', 'nn', 'draws']
     else:
         logger.info("Modelo 'quant' no encontrado. Se usará 'poisson' como plan B.")
@@ -82,50 +124,36 @@ def train_stacker():
             fundamental_test_list.append(oof_data[mod][1])
             
     if not fundamental_train_list:
-        raise ValueError("No se encontraron modelos fundamentales. Debes entrenar al menos quant, poisson o context primero.")
+        raise ValueError("No se encontraron modelos fundamentales.")
         
     X_train_fund = pd.concat(fundamental_train_list, axis=1).fillna(0)
     X_test_fund = pd.concat(fundamental_test_list, axis=1).fillna(0)
     
     logger.info("Entrenando Stacker Fundamental (Nivel 1)...")
     
+    # Eliminamos Isotonic Calibration. Usamos regresión logística simple con L2 moderada (para evitar curvas dentadas)
     fund_pipeline = Pipeline([
         ('scaler', StandardScaler()),
-        # C=1.0 para L2 moderada
         ('lr', LogisticRegression(max_iter=1000, random_state=42, C=1.0))
     ])
     
-    # Calibración para Nivel 1
-    calib_idx = int(len(X_train_fund) * 0.75)
-    X_tr_f_sub, X_calib_f = X_train_fund.iloc[:calib_idx], X_train_fund.iloc[calib_idx:]
-    y_tr_sub, y_calib = y_train.iloc[:calib_idx], y_train.iloc[calib_idx:]
+    w_train = get_time_weights(train_dates) if train_dates is not None else None
     
-    w_tr_sub = get_time_weights(train_dates.iloc[:calib_idx]) if train_dates is not None else None
-    w_calib = get_time_weights(train_dates.iloc[calib_idx:]) if train_dates is not None else None
-    
-    if w_tr_sub is not None:
-        fund_pipeline.fit(X_tr_f_sub, y_tr_sub, lr__sample_weight=w_tr_sub)
+    if w_train is not None:
+        fund_pipeline.fit(X_train_fund, y_train, lr__sample_weight=w_train)
     else:
-        fund_pipeline.fit(X_tr_f_sub, y_tr_sub)
-        
-    calibrated_fund = CalibratedClassifierCV(estimator=FrozenEstimator(fund_pipeline), method='isotonic')
-    
-    if w_calib is not None:
-        calibrated_fund.fit(X_calib_f, y_calib, sample_weight=w_calib)
-    else:
-        calibrated_fund.fit(X_calib_f, y_calib)
+        fund_pipeline.fit(X_train_fund, y_train)
         
     # Obtener predicciones fundamentales para pasar al Nivel 2
-    fund_prob_train = calibrated_fund.predict_proba(X_train_fund)
-    fund_prob_test = calibrated_fund.predict_proba(X_test_fund)
+    fund_prob_train = fund_pipeline.predict_proba(X_train_fund)
+    fund_prob_test = fund_pipeline.predict_proba(X_test_fund)
     
     df_fund_train = pd.DataFrame(fund_prob_train, columns=['fund_prob_loss', 'fund_prob_draw', 'fund_prob_win'], index=X_train_fund.index)
     df_fund_test = pd.DataFrame(fund_prob_test, columns=['fund_prob_loss', 'fund_prob_draw', 'fund_prob_win'], index=X_test_fund.index)
     
-    joblib.dump({'model': calibrated_fund, 'features': X_train_fund.columns.tolist()}, MODEL_SAVE_PATH_FUND)
+    joblib.dump({'model': fund_pipeline, 'features': X_train_fund.columns.tolist()}, MODEL_SAVE_PATH_FUND)
     
-    # ====== ETAPA 2: FINAL (MARKET) STACKER ======
-    # Combina Predicciones Fundamentales con el Modelo de Mercado
+    # ====== ETAPA 2: FINAL (MARKET) STACKER con Optuna + Meta-Features ======
     logger.info("Entrenando Stacker Final (Nivel 2) combinando Fundamentales + Mercado + GBM...")
     
     market_models = []
@@ -140,37 +168,73 @@ def train_stacker():
         X_train_meta = pd.concat([df_fund_train, mkt_train], axis=1).fillna(0)
         X_test_meta = pd.concat([df_fund_test, mkt_test], axis=1).fillna(0)
     else:
-        logger.warning("No se encontró OOF de Market. El Stacker Final usará open_probs si existen, o será igual al Fundamental.")
+        logger.warning("No se encontró OOF de Market. El Stacker Final será igual al Fundamental, pero mejorado con árboles.")
         X_train_meta = df_fund_train.copy()
         X_test_meta = df_fund_test.copy()
-        if 'open_prob_win' in df.columns:
-            open_probs_train = df[['open_prob_loss', 'open_prob_draw', 'open_prob_win']].iloc[:split_idx]
-            open_probs_test = df[['open_prob_loss', 'open_prob_draw', 'open_prob_win']].iloc[split_idx:]
-            X_train_meta = pd.concat([X_train_meta, open_probs_train], axis=1).fillna(0)
-            X_test_meta = pd.concat([X_test_meta, open_probs_test], axis=1).fillna(0)
-    
-    # Para evitar que Mercado domine (Lazy Stacker), usamos regularización más fuerte (C=0.1)
-    final_pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('lr', LogisticRegression(max_iter=1000, random_state=42, C=0.1))
-    ])
-    
-    X_tr_m_sub, X_calib_m = X_train_meta.iloc[:calib_idx], X_train_meta.iloc[calib_idx:]
-    
-    if w_tr_sub is not None:
-        final_pipeline.fit(X_tr_m_sub, y_tr_sub, lr__sample_weight=w_tr_sub)
-    else:
-        final_pipeline.fit(X_tr_m_sub, y_tr_sub)
         
-    calibrated_final = CalibratedClassifierCV(estimator=FrozenEstimator(final_pipeline), method='isotonic')
+    # Inyectar Meta-Features (Ceguera curada)
+    X_train_meta = compute_meta_features(X_train_meta, df_train_orig, prefix="meta_")
+    X_test_meta = compute_meta_features(X_test_meta, df_test_orig, prefix="meta_")
     
-    if w_calib is not None:
-        calibrated_final.fit(X_calib_m, y_calib, sample_weight=w_calib)
-    else:
-        calibrated_final.fit(X_calib_m, y_calib)
+    # Determinar columnas categóricas (la competición) para HistGradientBoosting
+    cat_features = [i for i, col in enumerate(X_train_meta.columns) if col == 'competition_id']
+    if not cat_features:
+        cat_features = None
+    
+    # Optuna para el Nivel 2
+    logger.info("Iniciando optimización con Optuna para el Nivel 2 (HistGradientBoosting)...")
+    
+    # Creamos un pequeño split temporal de validación para Optuna dentro del Train set (20% más reciente)
+    opt_split = int(len(X_train_meta) * 0.8)
+    X_opt_train, y_opt_train = X_train_meta.iloc[:opt_split], y_train.iloc[:opt_split]
+    X_opt_val, y_opt_val = X_train_meta.iloc[opt_split:], y_train.iloc[opt_split:]
+    
+    w_opt_train = w_train[:opt_split] if w_train is not None else None
+    
+    def objective(trial):
+        params = {
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+            'max_iter': trial.suggest_int('max_iter', 50, 300),
+            'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 15, 63),
+            'l2_regularization': trial.suggest_float('l2_regularization', 1e-4, 10.0, log=True),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 20, 100),
+            'categorical_features': cat_features,
+            'random_state': 42
+        }
         
-    final_model = calibrated_final
+        model = HistGradientBoostingClassifier(**params)
+        
+        # HistGradientBoosting no acepta sample_weight en fit en algunas versiones via pipeline,
+        # pero sí directamente. Usaremos fit directo.
+        try:
+            model.fit(X_opt_train, y_opt_train, sample_weight=w_opt_train)
+        except TypeError:
+            # Por si la versión de sklearn no soporta sample_weight aquí
+            model.fit(X_opt_train, y_opt_train)
+            
+        preds = model.predict_proba(X_opt_val)
+        return log_loss(y_opt_val, preds)
+
+    study = optuna.create_study(direction='minimize')
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    # n_trials 100 para buscar parámetros óptimos de manera más exhaustiva
+    study.optimize(objective, n_trials=100, timeout=1800)
     
+    best_params = study.best_params
+    best_params['categorical_features'] = cat_features
+    best_params['random_state'] = 42
+    logger.info(f"Mejores parámetros encontrados por Optuna para Nivel 2: {study.best_params}")
+    
+    # Entrenar el modelo final de árboles con todos los datos de Train
+    final_model = HistGradientBoostingClassifier(**best_params)
+    try:
+        if w_train is not None:
+            final_model.fit(X_train_meta, y_train, sample_weight=w_train)
+        else:
+            final_model.fit(X_train_meta, y_train)
+    except TypeError:
+        final_model.fit(X_train_meta, y_train)
+        
     # Evaluación
     y_prob_train = final_model.predict_proba(X_train_meta)
     y_prob_train = y_prob_train / y_prob_train.sum(axis=1, keepdims=True)
@@ -182,17 +246,10 @@ def train_stacker():
     acc = accuracy_score(y_test, y_pred)
     loss = log_loss(y_test, y_prob_test)
     
-    logger.info("=== RESULTADOS META-MODELO FINAL (DOBLE STACKING) ===")
+    logger.info("=== RESULTADOS META-MODELO FINAL (HGB + META-FEATURES) ===")
     logger.info(f"Accuracy Global: {acc:.4f}")
     logger.info(f"Log-Loss: {loss:.4f}")
     
-    # Análisis de pesos de Nivel 2
-    try:
-        lr_coefs = final_pipeline.named_steps['lr'].coef_
-        logger.info(f"Coeficientes Nivel 2 (Regresión Logística L2): {lr_coefs}")
-    except:
-        pass
-        
     # LOGS: Verificacion de calibracion (Auditoría)
     logger.info("=== AUDITORÍA ESTADÍSTICA DEL ENSAMBLE FINAL ===")
     real_loss = (y_train == 0).mean()
@@ -208,65 +265,66 @@ def train_stacker():
     logger.info(f" - Victoria (Win) | Predicha: {pred_win*100:.1f}% | Real en Train Dataset: {real_win*100:.1f}%")
     
     # Guardar resultados y datasets para el modelo CLV y el Simulador
-    df_train = pd.DataFrame({
-        'match_date': df['match_date'].iloc[:split_idx].values if 'match_date' in df.columns else np.array([None]*len(y_train)),
-        'competition': df['competition'].iloc[:split_idx].values if 'competition' in df.columns else np.array([None]*len(y_train)),
-        'team': df['team'].iloc[:split_idx].values,
-        'opponent': df['opponent'].iloc[:split_idx].values,
-        'is_home': df['is_home'].iloc[:split_idx].values,
+    # Usar df_orig asegura que no tengamos variables meta en el simulador
+    df_train_save = pd.DataFrame({
+        'match_date': df_train_orig['match_date'].values if 'match_date' in df.columns else np.array([None]*len(y_train)),
+        'competition': df_train_orig['competition'].values if 'competition' in df.columns else np.array([None]*len(y_train)),
+        'team': df_train_orig['team'].values,
+        'opponent': df_train_orig['opponent'].values,
+        'is_home': df_train_orig['is_home'].values,
         'prob_loss': y_prob_train[:, 0],
         'prob_draw': y_prob_train[:, 1],
         'prob_win': y_prob_train[:, 2],
         'outcome': y_train.values,
-        'odds_win': df['open_odds_win'].iloc[:split_idx].values if 'open_odds_win' in df.columns else df['odds_win'].iloc[:split_idx].values,
-        'odds_draw': df['open_odds_draw'].iloc[:split_idx].values if 'open_odds_draw' in df.columns else df['odds_draw'].iloc[:split_idx].values,
-        'odds_loss': df['open_odds_loss'].iloc[:split_idx].values if 'open_odds_loss' in df.columns else df['odds_loss'].iloc[:split_idx].values,
-        'closing_odds_win': df['odds_win'].iloc[:split_idx].values,
-        'closing_odds_draw': df['odds_draw'].iloc[:split_idx].values,
-        'closing_odds_loss': df['odds_loss'].iloc[:split_idx].values
+        'odds_win': df_train_orig['open_odds_win'].values if 'open_odds_win' in df.columns else df_train_orig['odds_win'].values,
+        'odds_draw': df_train_orig['open_odds_draw'].values if 'open_odds_draw' in df.columns else df_train_orig['odds_draw'].values,
+        'odds_loss': df_train_orig['open_odds_loss'].values if 'open_odds_loss' in df.columns else df_train_orig['odds_loss'].values,
+        'closing_odds_win': df_train_orig['odds_win'].values,
+        'closing_odds_draw': df_train_orig['odds_draw'].values,
+        'closing_odds_loss': df_train_orig['odds_loss'].values
     })
     
     has_odds = 'odds_win' in df.columns
     if has_odds:
-        df_test = pd.DataFrame({
-            'match_date': df['match_date'].iloc[split_idx:].values if 'match_date' in df.columns else np.array([None]*len(y_test)),
-            'competition': df['competition'].iloc[split_idx:].values if 'competition' in df.columns else np.array([None]*len(y_test)),
-            'team': df['team'].iloc[split_idx:].values,
-            'opponent': df['opponent'].iloc[split_idx:].values,
-            'is_home': df['is_home'].iloc[split_idx:].values,
+        df_test_save = pd.DataFrame({
+            'match_date': df_test_orig['match_date'].values if 'match_date' in df.columns else np.array([None]*len(y_test)),
+            'competition': df_test_orig['competition'].values if 'competition' in df.columns else np.array([None]*len(y_test)),
+            'team': df_test_orig['team'].values,
+            'opponent': df_test_orig['opponent'].values,
+            'is_home': df_test_orig['is_home'].values,
             'prob_loss': y_prob_test[:, 0],
             'prob_draw': y_prob_test[:, 1],
             'prob_win': y_prob_test[:, 2],
             'outcome': y_test.values,
-            'odds_win': df['open_odds_win'].iloc[split_idx:].values if 'open_odds_win' in df.columns else df['odds_win'].iloc[split_idx:].values,
-            'odds_draw': df['open_odds_draw'].iloc[split_idx:].values if 'open_odds_draw' in df.columns else df['odds_draw'].iloc[split_idx:].values,
-            'odds_loss': df['open_odds_loss'].iloc[split_idx:].values if 'open_odds_loss' in df.columns else df['odds_loss'].iloc[split_idx:].values,
-            'closing_odds_win': df['odds_win'].iloc[split_idx:].values,
-            'closing_odds_draw': df['odds_draw'].iloc[split_idx:].values,
-            'closing_odds_loss': df['odds_loss'].iloc[split_idx:].values
+            'odds_win': df_test_orig['open_odds_win'].values if 'open_odds_win' in df.columns else df_test_orig['odds_win'].values,
+            'odds_draw': df_test_orig['open_odds_draw'].values if 'open_odds_draw' in df.columns else df_test_orig['odds_draw'].values,
+            'odds_loss': df_test_orig['open_odds_loss'].values if 'open_odds_loss' in df.columns else df_test_orig['odds_loss'].values,
+            'closing_odds_win': df_test_orig['odds_win'].values,
+            'closing_odds_draw': df_test_orig['odds_draw'].values,
+            'closing_odds_loss': df_test_orig['odds_loss'].values
         })
         
-        df_test.to_parquet(os.path.join(PROCESSED_DIR, 'test_predictions.parquet'), engine='fastparquet')
+        df_test_save.to_parquet(os.path.join(PROCESSED_DIR, 'test_predictions.parquet'), engine='fastparquet')
         logger.info("Guardado test_predictions.parquet")
     
-    df_train.to_parquet(os.path.join(PROCESSED_DIR, 'train_predictions.parquet'), engine='fastparquet')
+    df_train_save.to_parquet(os.path.join(PROCESSED_DIR, 'train_predictions.parquet'), engine='fastparquet')
     
     # Pasar variables fair si existen
     if 'fair_loss' in df.columns:
         for col in ['fair_loss', 'fair_draw', 'fair_win']:
-            X_train_meta[col] = df[col].iloc[:split_idx].values
-            X_test_meta[col] = df[col].iloc[split_idx:].values
+            X_train_meta[col] = df_train_orig[col].values
+            X_test_meta[col] = df_test_orig[col].values
             
     if 'open_fair_loss' in df.columns:
         for col in ['open_fair_loss', 'open_fair_draw', 'open_fair_win']:
-            X_train_meta[col] = df[col].iloc[:split_idx].values
-            X_test_meta[col] = df[col].iloc[split_idx:].values
+            X_train_meta[col] = df_train_orig[col].values
+            X_test_meta[col] = df_test_orig[col].values
 
     X_train_meta.to_parquet(os.path.join(PROCESSED_DIR, 'X_train.parquet'), engine='fastparquet')
     X_test_meta.to_parquet(os.path.join(PROCESSED_DIR, 'X_test.parquet'), engine='fastparquet')
     
     joblib.dump({'model': final_model, 'features': X_train_meta.columns.tolist()}, MODEL_SAVE_PATH_FINAL)
-    logger.info(f"Modelo Stacker Final guardado en {MODEL_SAVE_PATH_FINAL}")
+    logger.info(f"Modelo Stacker Final (HGB) guardado en {MODEL_SAVE_PATH_FINAL}")
 
 if __name__ == "__main__":
     train_stacker()

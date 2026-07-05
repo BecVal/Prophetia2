@@ -44,7 +44,8 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         'n_estimators': trial.suggest_int('n_estimators', 100, 400),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 7)
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 7),
+        'enable_categorical': True
     }
     
     cv_scores = []
@@ -65,6 +66,14 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
 
 def train_context():
     df = get_base_dataset()
+    
+    if 'competition' in df.columns:
+        df['competition_id'] = pd.factorize(df['competition'])[0]
+        df['competition_id'] = df['competition_id'].astype('category')
+    else:
+        df['competition_id'] = 0
+        df['competition_id'] = df['competition_id'].astype('category')
+        
     split_idx = get_train_test_split(df)
     
     # Modelo B: Contexto y Táctica
@@ -79,6 +88,8 @@ def train_context():
     ]
     
     feature_cols = [
+        'competition_id',
+        'team_elo', 'opp_elo', 'elo_diff',
         'is_home', 'rest_days', 'rest_diff',
         'team_squad_value', 'opp_squad_value', 'squad_value_diff',
         'h2h_games_played', 'h2h_points_last_5', 'h2h_win_rate_hist', 'h2h_draw_rate_hist', 'is_european_hangover',
@@ -108,9 +119,9 @@ def train_context():
     
     cv_strategy = get_cv_strategy(n_splits=5)
     
-    logger.info("Optimizando Modelo B (Contexto) con Optuna (50 Trials)...")
+    logger.info("Optimizando Modelo B (Contexto) con Optuna (100 Trials)...")
     study = optuna.create_study(direction='minimize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=50)
+    study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=100)
     
     logger.info(f"Mejores parámetros XGBoost Contexto: {study.best_params}")
     
@@ -119,7 +130,8 @@ def train_context():
         objective='multi:softprob',
         num_class=3,
         random_state=42,
-        device='cuda'
+        device='cuda',
+        enable_categorical=True
     )
     
     logger.info("Calculando predicciones OOF para Train (Contexto)...")

@@ -4,6 +4,7 @@ import numpy as np
 import optuna
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, accuracy_score, precision_score, recall_score
+import joblib
 
 import sys
 import os
@@ -177,6 +178,27 @@ def train_clv_model():
     print_metrics(y_drift_loss_test, pred_drift_loss, "Loss (Visitante)")
     
     logger.info("Actualizando test_predictions.parquet con el meta-modelo optimizado...")
+    
+    # GUARDAR MODELOS
+    os.makedirs('../save_models', exist_ok=True)
+    clv_features = list(X_train.columns)
+    
+    joblib.dump({
+        'model': model_win,
+        'features': clv_features
+    }, '../save_models/clv_model_win.pkl')
+    
+    joblib.dump({
+        'model': model_draw,
+        'features': clv_features
+    }, '../save_models/clv_model_draw.pkl')
+    
+    joblib.dump({
+        'model': model_loss,
+        'features': clv_features
+    }, '../save_models/clv_model_loss.pkl')
+    logger.info("Modelos CLV guardados en '../save_models/'")
+
     
     # Convertimos de Log-Ratio (pred_clv) a % matemático lineal (como requiere el simulador)
     df_test_preds['pred_clv_loss'] = np.exp(pred_drift_loss) - 1
