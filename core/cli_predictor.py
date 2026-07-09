@@ -219,7 +219,7 @@ def main():
     prob_loss, prob_draw, prob_win = y_prob
     
     # Quant Blending Parámetros
-    TAX_RETENTION_RATE = 0.07
+    TAX_RETENTION_RATE = 0.0075
     MARKET_BLEND_ALPHA = 0.85
     EXPECTED_CLV_DROP = 0.015
     

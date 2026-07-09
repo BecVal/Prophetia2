@@ -225,7 +225,7 @@ def train_nn():
     # === OPTUNA HYPERPARAMETER TUNING ===
     def objective(trial):
         # Hyperparameter search space
-        n_layers = trial.suggest_int('n_layers', 1, 3)
+        n_layers = trial.suggest_int('n_layers', 2, 4)
         hidden_dims = []
         for i in range(n_layers):
             hidden_dims.append(trial.suggest_categorical(f'n_units_l{i}', [64, 128, 256, 512]))
@@ -233,7 +233,7 @@ def train_nn():
         dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5, step=0.1)
         lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
         weight_decay = trial.suggest_float('weight_decay', 1e-4, 1e-1, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [64, 128, 256])
+        batch_size = trial.suggest_categorical('batch_size', [256, 512, 1024, 2048])
         
         # Validacion Cruzada para evaluar estos parametros
         kf = TimeSeriesSplit(n_splits=3) # Usamos 3 splits en Optuna para velocidad
@@ -252,10 +252,10 @@ def train_nn():
                 hidden_dims=hidden_dims, 
                 dropout_rate=dropout_rate,
                 weight_decay=weight_decay,
-                epochs=50, 
+                epochs=100, 
                 batch_size=batch_size, 
                 lr=lr, 
-                patience=4
+                patience=7
             )
             
             estimator.fit(X_tr, y_tr, sample_weight=w_tr)

@@ -235,8 +235,60 @@ def train_stacker():
     except TypeError:
         final_model.fit(X_train_meta, y_train)
         
-    # Evaluación
-    y_prob_train = final_model.predict_proba(X_train_meta)
+    # Evaluación OOF para evitar Data Leakage (In-Sample) y Look-Ahead Bias
+    from sklearn.model_selection import TimeSeriesSplit, KFold
+    y_prob_train = np.zeros((len(X_train_meta), 3))
+    y_prob_train[:] = np.nan
+    
+    cv = TimeSeriesSplit(n_splits=5)
+    splits = list(cv.split(X_train_meta))
+    
+    # 1. Resolver el primer bloque usando K-Fold para tener OOF
+    first_idx = splits[0][0]
+    X_first, y_first = X_train_meta.iloc[first_idx], y_train.iloc[first_idx]
+    
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    for tr_kf, va_kf in kf.split(X_first):
+        X_tr, y_tr = X_first.iloc[tr_kf], y_first.iloc[tr_kf]
+        X_va = X_first.iloc[va_kf]
+        
+        if w_train is not None:
+            if isinstance(w_train, pd.Series) or isinstance(w_train, np.ndarray):
+                w_tr = w_train.iloc[first_idx[tr_kf]] if isinstance(w_train, pd.Series) else w_train[first_idx[tr_kf]]
+            else:
+                w_tr = None
+        else:
+            w_tr = None
+            
+        m = HistGradientBoostingClassifier(**best_params)
+        try:
+            m.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
+        except TypeError:
+            m.fit(X_tr, y_tr)
+            
+        y_prob_train[first_idx[va_kf]] = m.predict_proba(X_va)
+        
+    # 2. Resolver los demás bloques respetando la flecha del tiempo
+    for tr_idx, va_idx in splits:
+        X_tr, y_tr = X_train_meta.iloc[tr_idx], y_train.iloc[tr_idx]
+        X_va = X_train_meta.iloc[va_idx]
+        
+        if w_train is not None:
+            if isinstance(w_train, pd.Series) or isinstance(w_train, np.ndarray):
+                w_tr = w_train.iloc[tr_idx] if isinstance(w_train, pd.Series) else w_train[tr_idx]
+            else:
+                w_tr = None
+        else:
+            w_tr = None
+            
+        m = HistGradientBoostingClassifier(**best_params)
+        try:
+            m.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
+        except TypeError:
+            m.fit(X_tr, y_tr)
+            
+        y_prob_train[va_idx] = m.predict_proba(X_va)
+        
     y_prob_train = y_prob_train / y_prob_train.sum(axis=1, keepdims=True)
     
     y_prob_test = final_model.predict_proba(X_test_meta)

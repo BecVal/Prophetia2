@@ -21,7 +21,7 @@ WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0']
 
 # --- CONFIGURACIÓN DE OPTIMIZACIÓN ---
 # Opciones: 'NONE', 'ALL', 'WHITELIST', o una liga específica como 'I1'
-OPTIMIZATION_MODE = 'WHITELIST' 
+OPTIMIZATION_MODE = 'NONE' 
 OPTUNA_TRIALS = 1000
 OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
 
@@ -32,7 +32,7 @@ EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 
 MAX_STAKE_PCT = 0.03  # Cap reducido al 3% para mayor seguridad con el nuevo filtro
 
 # Parámetros Institucionales/Fricción Añadidos
-TAX_RETENTION_RATE = 0.07  # Retención del 7% sobre ganancias netas (Común en MX: 1% federal + 6% estatal, p.ej. Caliente/Draftea)
+TAX_RETENTION_RATE = 0.0075  # Retención del 0.75% sobre ganancias netas (Polymarket)
 MARKET_BLEND_ALPHA = 0.85  # Peso del modelo vs mercado (85% modelo, 15% mercado)
 EXPECTED_CLV_DROP = 0.015  # Penalización por slippage esperado del CLV (-1.5%)
 MAX_BET_LIQUIDITY = {      # Límites de liquidez absolutos en USD o Unidad Base
@@ -251,17 +251,26 @@ def optimize_league(df, league_name):
     def objective(trial):
         ev_thresh = trial.suggest_float('ev_thresh', 0.015, 0.050)
         # Configuración del kelly máximo para Optuna
-        kelly_fraction = trial.suggest_float('kelly_fraction', 0.005, 0.17)
+        kelly_fraction = trial.suggest_float('kelly_fraction', 0.005, 0.25)
         
         roi, mdd = evaluate_league_params(df_league, ev_thresh, kelly_fraction)
         
-        if roi <= -0.99:
-            return -999.0 # Ruina penalizada
+        if roi <= 0.0:
+            return roi - (mdd * 2.0) # Penalizar pérdida de forma continua
             
-        # Riesgo Ajustado: ROI / (MDD + 1%)
-        score = roi / (mdd + 0.01)
+        # --- NUEVA LÓGICA DE UTILIDAD (Mean-Variance adaptada) ---
+        # La función anterior (ROI / (MDD + 0.01)) causaba que Optuna siempre eligiera
+        # el kelly máximo porque el ROI sube más rápido que el divisor.
+        # Al usar una penalización cuadrática para el Drawdown, creamos un verdadero "punto dulce".
+        # Ligas más inestables (con saltos de MDD altos) verán su score destruido por el mdd^2
+        # obligando a Optuna a elegir un kelly_fraction mucho menor.
+        
+        penalty_factor = 10.0  # Nivel de aversión al riesgo
+        score = roi - penalty_factor * (mdd ** 2)
+        
         if mdd > 0.25:
-            score -= (mdd - 0.25) * 2.0  # Penalización severa si pasa del 25% de MDD
+            score -= (mdd - 0.25) * 5.0  # Penalización severa si pasa del 25% de MDD
+            
         return score
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -673,7 +682,7 @@ def run_simulation():
     logger.info(f"Apuestas Realizadas: {bets_placed} ({bet_percentage:.1f}% de selectividad) | Apuestas Ganadas: {bets_won} ({(bets_won/bets_placed)*100:.1f}% WinRate)" if bets_placed > 0 else "Apuestas Realizadas: 0")
     logger.info(f"Cuota Promedio Apostada: {avg_odds:.2f}")
     logger.info(f"Volumen Apostado (Turnover): ${total_staked:.2f}")
-    logger.info(f"Fricción de Mercado Simulada (Impuestos / Ganancias Neta): {TAX_RETENTION_RATE*100:.1f}%")
+    logger.info(f"Fricción de Mercado Simulada (Impuestos / Ganancias Neta): {TAX_RETENTION_RATE*100:.2f}%")
     logger.info(f"Yield Real (Beneficio Neto / Turnover): {yield_pct:.2f}% | Expected Yield (xYield): {x_yield_pct:.2f}%")
     logger.info(f"Profit Factor (Ganancias / Pérdidas): {profit_factor:.2f}")
     logger.info(f"ROI del Capital Inicial: {roi_pct:.2f}%")

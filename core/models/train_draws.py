@@ -44,7 +44,7 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         'n_estimators': trial.suggest_int('n_estimators', 100, 400),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 3.0) # Empates son minoría
+        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 2.5, 3.5) # Empates son minoría (aprox 26%, peso ideal ~2.84)
     }
     
     cv_scores = []

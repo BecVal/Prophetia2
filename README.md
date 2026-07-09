@@ -123,7 +123,19 @@ En lugar de dar un resultado seco, el modelo expulsa **probabilidades calibradas
 - Probabilidad de Empate ajustada por Dixon-Coles (ej. 24.5%)
 - Expectativa Matemática de la Apuesta (EV) frente a la línea de cierre.
 
-### 7. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
+### 7. Ejecución Automatizada (Polymarket Quant HFT Bot)
+Prophetia2 cuenta con un bot de trading automatizado diseñado para explotar ineficiencias en mercados predictivos on-chain como **Polymarket**. El bot incorpora en tiempo real todo el pipeline cuántico del simulador de Bankroll:
+- **Inferencia en Cascada (9 Modelos):** Computa métricas fundamentales (Poisson, Context), dinámicas de mercado (Steam, Vig), estocásticas (Z-Score del *Geometric Brownian Motion*) y de dispersión (Entropía del consenso) a través del motor `ProphetiaPredictor`.
+- **Filtro Estricto de Closing Line Value (CLV):** Tres modelos XGBoost predicen hacia dónde colapsará la línea antes del pitido inicial. Si se proyecta que la cuota se moverá en nuestra contra (`pred_clv < 0.005`), el bot aborta el trade protegiendo el capital.
+- **Riesgo Institucional & Alpha Blending:** El `PortfolioManager` emplea *Dynamic Alpha Blending* (reduciendo el peso de nuestra probabilidad frente a divergencias severas del mercado), ajusta el Criterio de Kelly por liga y respeta topes de liquidez absolutos (`MAX_BET_LIQUIDITY`). Además, orquesta operaciones de *Dutching* (1X, X2) comprando múltiples tokens simultáneamente de forma óptima.
+
+Para ejecutar el bot (actualmente en modo *Paper Trading* y simulación de mercado local):
+```bash
+cd polymarket_bot
+python main.py
+```
+
+### 8. Visualizacion y Prediccion Cientifica (Jupyter Notebooks)
 El analisis interactivo y las predicciones individuales se gestionan a traves de Jupyter Notebooks. Inicie su servidor de Jupyter:
 ```bash
 jupyter notebook
@@ -134,7 +146,7 @@ Navegue a la carpeta `notebooks/` y utilice los siguientes archivos:
 *   **02_model_selection.ipynb**: Genera visualizaciones graficas sobre la correlacion tactica y revela que estadisticas (Feature Importance) considera XGBoost mas determinantes para ganar.
 *   **03_live_dashboard.ipynb**: Contiene un panel interactivo (Dashboard). Ejecute todas las celdas para habilitar un selector desplegable de partidos. Al seleccionar un encuentro, el sistema utilizara el modelo entrenado para emitir las probabilidades exactas de Victoria, Empate o Derrota, comparando ademas la prediccion con el flujo tactico real del partido.
 
-### 8. Predicción Financiera en Terminal (CLI)
+### 9. Predicción Financiera en Terminal (CLI)
 Para ejecutar pronósticos en tiempo real basados en los últimos partidos procesados y calcular el riesgo (Bankroll Staking), utiliza nuestro menú interactivo de predicción cuantitativa:
 ```bash
 cd core

@@ -16,7 +16,7 @@ class PortfolioManager:
         self.active_positions = {}
         
         # Parámetros de Fricción (de simulate_bankroll.py)
-        self.tax_retention_rate = 0.07
+        self.tax_retention_rate = 0.0075
         self.expected_clv_drop = 0.015
         self.max_stake_pct = 0.03 # 3% máximo por orden
         self.market_blend_alpha = 0.85 # Peso del modelo vs mercado (85% modelo)
