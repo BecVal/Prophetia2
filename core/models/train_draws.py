@@ -7,6 +7,7 @@ import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import log_loss
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.calibration import CalibratedClassifierCV
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -43,8 +44,7 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
         'n_estimators': trial.suggest_int('n_estimators', 100, 400),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 2.5, 3.5) # Empates son minoría (aprox 26%, peso ideal ~2.84)
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0)
     }
     
     cv_scores = []
@@ -135,8 +135,12 @@ def train_draws():
         dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
         w_tr = get_time_weights(dates_kf_train)
         
-        kf_estimator = XGBClassifier(**xgb_best.get_params())
-        kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr)
+        kf_estimator_base = XGBClassifier(**xgb_best.get_params())
+        kf_estimator = CalibratedClassifierCV(estimator=kf_estimator_base, method='isotonic', cv=3)
+        try:
+            kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr) if w_tr is not None else kf_estimator.fit(X_kf_train, y_kf_train)
+        except TypeError:
+            kf_estimator.fit(X_kf_train, y_kf_train)
         
         val_indices_in_original = first_train_idx[kf_val]
         pred_probs_train[val_indices_in_original] = kf_estimator.predict_proba(X_kf_val)
@@ -150,14 +154,22 @@ def train_draws():
         dates_tr = train_dates.iloc[train_idx] if train_dates is not None else None
         w_tr = get_time_weights(dates_tr)
         
-        fold_estimator = XGBClassifier(**xgb_best.get_params())
-        fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
+        fold_estimator_base = XGBClassifier(**xgb_best.get_params())
+        fold_estimator = CalibratedClassifierCV(estimator=fold_estimator_base, method='isotonic', cv=3)
+        try:
+            fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else fold_estimator.fit(X_tr, y_tr)
+        except TypeError:
+            fold_estimator.fit(X_tr, y_tr)
         pred_probs_train[val_idx] = fold_estimator.predict_proba(X_val)
         
-    logger.info("Entrenando Modelo Draws final y prediciendo Test...")
+    logger.info("Entrenando Modelo Draws final (Isotonic Calibration) y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
-    xgb_best.fit(X_train, y_train, sample_weight=final_w_tr)
-    pred_probs_test = xgb_best.predict_proba(X_test)
+    final_model = CalibratedClassifierCV(estimator=xgb_best, method='isotonic', cv=get_cv_strategy(n_splits=5))
+    try:
+        final_model.fit(X_train, y_train, sample_weight=final_w_tr) if final_w_tr is not None else final_model.fit(X_train, y_train)
+    except TypeError:
+        final_model.fit(X_train, y_train)
+    pred_probs_test = final_model.predict_proba(X_test)
     
     # Nos interesa solo la probabilidad de la clase positiva (Empate)
     # Extraemos la columna 1 (prob_draw)
@@ -183,7 +195,7 @@ def train_draws():
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         
-    joblib.dump({'model': xgb_best, 'features': feature_cols}, MODEL_SAVE_PATH)
+    joblib.dump({'model': final_model, 'features': feature_cols}, MODEL_SAVE_PATH)
     logger.info(f"=== MODELO DRAWS FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":

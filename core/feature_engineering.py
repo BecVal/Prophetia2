@@ -50,12 +50,16 @@ def add_ema_features(df, spans=[3, 5]):
 
     roll_cols = [c for c in stats_cols if c in df.columns]
 
+    new_cols = {}
     for col in roll_cols:
         for span in spans:
             # shift(1) asegura que NO usemos los datos del partido actual (Fix Data Leakage)
-            df[f'{col}_ema{span}'] = df.groupby('team')[col].transform(
-                lambda x: x.shift(1).ewm(span=span, min_periods=2).mean()
+            # min_periods=1 reduce los NaNs al primer partido únicamente
+            new_cols[f'{col}_ema{span}'] = df.groupby('team')[col].transform(
+                lambda x: x.shift(1).ewm(span=span, min_periods=1).mean()
             )
+            
+    df = pd.concat([df, pd.DataFrame(new_cols)], axis=1)
 
     df = df.sort_values('match_date').reset_index(drop=True)
     return df
@@ -98,7 +102,7 @@ def add_elo_ratings(df):
         'elo_diff': np.zeros(len(df))
     }
     
-    grouped = df.groupby('match_id')
+    grouped = df.groupby('match_id', sort=False)
     
     for match_id, match_indices in grouped.groups.items():
         if len(match_indices) != 2:
@@ -175,9 +179,11 @@ def add_elo_ratings(df):
         results['opp_elo'][away_idx] = home_elo_pre
         results['elo_diff'][away_idx] = away_elo_pre - home_elo_pre
 
-    # Asignar al DataFrame vectorizado
+    # Asignar al DataFrame vectorizado y desfragmentar
     for col, values in results.items():
         df[col] = values
+        
+    df = df.copy()
         
     elapsed = time.time() - start_time
     logger.info(f"Cálculo de ELO finalizado en {elapsed:.2f} segundos.")
@@ -268,7 +274,8 @@ def add_contextual_features(df):
             
     df['volatility_diff'] = df['xg_volatility_5'] - df['opp_xg_volatility_5']
 
-    df = df.sort_values('match_date').reset_index(drop=True)
+    # Desfragmentar explícitamente y ordenar
+    df = df.copy().sort_values('match_date').reset_index(drop=True)
     elapsed = time.time() - start_time
     logger.info(f"Variables contextuales procesadas en {elapsed:.2f} segundos.")
     return df
@@ -350,15 +357,16 @@ def add_squad_value_features(df):
         how='left'
     )
     
-    # Fill NaN para equipos sin datos de Transfermarkt (ej. recién ascendidos) con el mínimo de la liga
-    df['team_squad_value'] = df.groupby(['season_year'])['team_squad_value'].transform(lambda x: x.fillna(x.min() if not pd.isna(x.min()) else 10.0))
-    df['opp_squad_value'] = df.groupby(['season_year'])['opp_squad_value'].transform(lambda x: x.fillna(x.min() if not pd.isna(x.min()) else 10.0))
+    # Fill NaN para equipos sin datos de Transfermarkt usando el mínimo histórico (expanding) para evitar data leakage
+    df['team_squad_value'] = df.groupby(['season_year'])['team_squad_value'].transform(lambda x: x.fillna(x.expanding().min().fillna(10.0)))
+    df['opp_squad_value'] = df.groupby(['season_year'])['opp_squad_value'].transform(lambda x: x.fillna(x.expanding().min().fillna(10.0)))
     
     # Calcular diferencia de valor
     df['squad_value_diff'] = df['team_squad_value'] - df['opp_squad_value']
     
     df = df.drop(columns=['season_year'])
-    df = df.sort_values('match_date').reset_index(drop=True)
+    # Desfragmentar explícitamente y ordenar
+    df = df.copy().sort_values('match_date').reset_index(drop=True)
     return df
 
 
@@ -406,6 +414,24 @@ def build_processed_dataset():
         f"Dataset de entrenamiento avanzado guardado exitosamente en: {OUTPUT_PATH}")
     logger.info(
         f"Estructura del dataset final: {final_df.shape}")
+
+    # --- Auditoría Final ---
+    logger.info("=== AUDITORÍA DE DATOS Y FEATURE ENGINEERING ===")
+    logger.info(f"Total de Filas: {len(final_df)}")
+    logger.info(f"Total de Columnas: {len(final_df.columns)}")
+    
+    nan_counts = final_df.isna().sum()
+    cols_with_nans = nan_counts[nan_counts > 0].sort_values(ascending=False)
+    
+    if not cols_with_nans.empty:
+        logger.info(f"Variables con valores nulos (Top 10):\n{cols_with_nans.head(10).to_string()}")
+    else:
+        logger.info("No hay valores nulos en el dataset.")
+        
+    if 'xg_created_ema3' in final_df.columns:
+        logger.info(f"NaNs esperados en xg_created_ema3 (partidos sin historia): {final_df['xg_created_ema3'].isna().sum()}")
+    
+    logger.info("================================================")
 
     # Mostrar muestra de las nuevas features rolling
     cols_to_show = [

@@ -9,7 +9,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, log_loss
+from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
+from sklearn.calibration import CalibratedClassifierCV
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -226,7 +227,9 @@ def train_stacker():
     logger.info(f"Mejores parámetros encontrados por Optuna para Nivel 2: {study.best_params}")
     
     # Entrenar el modelo final de árboles con todos los datos de Train
-    final_model = HistGradientBoostingClassifier(**best_params)
+    base_final_model = HistGradientBoostingClassifier(**best_params)
+    tscv_final = get_cv_strategy(n_splits=5)
+    final_model = CalibratedClassifierCV(estimator=base_final_model, method='isotonic', cv=tscv_final)
     try:
         if w_train is not None:
             final_model.fit(X_train_meta, y_train, sample_weight=w_train)
@@ -260,7 +263,9 @@ def train_stacker():
         else:
             w_tr = None
             
-        m = HistGradientBoostingClassifier(**best_params)
+        m_base = HistGradientBoostingClassifier(**best_params)
+        tscv_m = get_cv_strategy(n_splits=3)
+        m = CalibratedClassifierCV(estimator=m_base, method='isotonic', cv=tscv_m)
         try:
             m.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
         except TypeError:
@@ -281,7 +286,9 @@ def train_stacker():
         else:
             w_tr = None
             
-        m = HistGradientBoostingClassifier(**best_params)
+        m_base = HistGradientBoostingClassifier(**best_params)
+        tscv_m = get_cv_strategy(n_splits=3)
+        m = CalibratedClassifierCV(estimator=m_base, method='isotonic', cv=tscv_m)
         try:
             m.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
         except TypeError:
@@ -301,6 +308,18 @@ def train_stacker():
     logger.info("=== RESULTADOS META-MODELO FINAL (HGB + META-FEATURES) ===")
     logger.info(f"Accuracy Global: {acc:.4f}")
     logger.info(f"Log-Loss: {loss:.4f}")
+    
+    y_test_arr = y_test.values if isinstance(y_test, pd.Series) else y_test
+    y_test_oh = np.zeros_like(y_prob_test)
+    y_test_oh[np.arange(len(y_test_arr)), y_test_arr] = 1
+    
+    brier_loss = brier_score_loss(y_test_oh[:, 0], y_prob_test[:, 0])
+    brier_draw = brier_score_loss(y_test_oh[:, 1], y_prob_test[:, 1])
+    brier_win = brier_score_loss(y_test_oh[:, 2], y_prob_test[:, 2])
+    brier_global = np.mean([brier_loss, brier_draw, brier_win])
+    
+    logger.info(f"Brier Score Global (Promedio de Clases): {brier_global:.4f}")
+    logger.info(f"Brier Score por Clase -> Loss: {brier_loss:.4f} | Draw: {brier_draw:.4f} | Win: {brier_win:.4f}")
     
     # LOGS: Verificacion de calibracion (Auditoría)
     logger.info("=== AUDITORÍA ESTADÍSTICA DEL ENSAMBLE FINAL ===")

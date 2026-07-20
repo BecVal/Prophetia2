@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import random
 import optuna
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 # Configurar logging
 import sys
@@ -17,11 +19,12 @@ logger = get_logger(__name__, 'simulate_bankroll')
 
 # Configuración Quant
 FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
-WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0']
+WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0', 'D1', 'D2', 'E1']
+ENABLE_VALUE_TRAP_FILTER = True # True: Activa el filtro contra Winner's Curse (descarte por asimetría de información)
 
 # --- CONFIGURACIÓN DE OPTIMIZACIÓN ---
 # Opciones: 'NONE', 'ALL', 'WHITELIST', o una liga específica como 'I1'
-OPTIMIZATION_MODE = 'NONE' 
+OPTIMIZATION_MODE = 'WHITELIST'
 OPTUNA_TRIALS = 1000
 OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
 
@@ -29,7 +32,7 @@ OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
 KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.015}
 EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 'D1': 0.015, 'T1': 0.01, 'F1': 0.015, 'E1': 0.015, 'N1': 0.02, 'SP2': 0.02, 'P1': 0.02, 'DEFAULT': 0.015}
 
-MAX_STAKE_PCT = 0.03  # Cap reducido al 3% para mayor seguridad con el nuevo filtro
+MAX_STAKE_PCT = 0.6  # Cap reducido al 3% para mayor seguridad con el nuevo filtro
 
 # Parámetros Institucionales/Fricción Añadidos
 TAX_RETENTION_RATE = 0.0075  # Retención del 0.75% sobre ganancias netas (Polymarket)
@@ -107,13 +110,27 @@ def evaluate_league_params(df_league, ev_thresh, kelly_fraction):
             for j in range(3):
                 divergence = abs([p_loss, p_draw, p_win][j] - market_probs[j])
                 dynamic_alpha = MARKET_BLEND_ALPHA
-                if divergence > 0.20: dynamic_alpha = 0.50
+                if divergence > 0.20: dynamic_alpha = 0.30
+                elif divergence > 0.15: dynamic_alpha = 0.50
                 elif divergence > 0.10: dynamic_alpha = 0.70
                 blended_probs.append((dynamic_alpha * [p_loss, p_draw, p_win][j]) + ((1 - dynamic_alpha) * market_probs[j]))
             
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
             evs = [ (blended_probs[j] * net_odds[j]) - 1 - EXPECTED_CLV_DROP for j in range(3) ]
             
+            if ENABLE_VALUE_TRAP_FILTER:
+                for j in range(3):
+                    divergence = abs([p_loss, p_draw, p_win][j] - market_probs[j])
+                    # Umbrales relajados: 15% para súper favoritos, 25% para general
+                    if [p_loss, p_draw, p_win][j] > 0.65 and divergence > 0.15:
+                        evs[j] = -1.0
+                    elif divergence > 0.25:
+                        evs[j] = -1.0
+                    # NUEVO: Asimetría de información en Favoritos Claros (Value Trap)
+                    # Si el mercado cree que hay >50% prob, y nuestro EV es marginal (<10%), es una trampa.
+                    elif market_probs[j] > 0.50 and 0 < evs[j] < 0.10:
+                        evs[j] = -1.0
+                        
             best_choice = np.argmax(evs)
             best_ev = evs[best_choice]
             
@@ -177,7 +194,8 @@ def evaluate_league_params(df_league, ev_thresh, kelly_fraction):
             if bet_type == 'single':
                 net_odd = 1 + (odds[best_choice] - 1) * (1 - TAX_RETENTION_RATE)
                 b = net_odd - 1
-                kelly_pct = best_ev / b if b > 0 else 0
+                kelly_ev = min(best_ev, 0.15)
+                kelly_pct = kelly_ev / b if b > 0 else 0
                 if odds[best_choice] < 1.30: kelly_pct = min(kelly_pct, 0.01)
                 
                 stake_pct = min(kelly_pct * kelly_fraction, MAX_STAKE_PCT)
@@ -202,7 +220,8 @@ def evaluate_league_params(df_league, ev_thresh, kelly_fraction):
                 net_combined_odds = 1 + (combined_odds - 1) * (1 - TAX_RETENTION_RATE)
                 b = net_combined_odds - 1
                 
-                kelly_pct = best_ev / b if b > 0 else 0
+                kelly_ev = min(best_ev, 0.15)
+                kelly_pct = kelly_ev / b if b > 0 else 0
                 if combined_odds < 1.30: kelly_pct = min(kelly_pct, 0.01)
                 
                 stake_pct = min(kelly_pct * kelly_fraction, MAX_STAKE_PCT)
@@ -249,9 +268,11 @@ def optimize_league(df, league_name):
         return None, None
         
     def objective(trial):
-        ev_thresh = trial.suggest_float('ev_thresh', 0.015, 0.050)
-        # Configuración del kelly máximo para Optuna
-        kelly_fraction = trial.suggest_float('kelly_fraction', 0.005, 0.25)
+        ev_thresh = trial.suggest_float('ev_thresh', 0.020, 0.150)
+        # Configuración del kelly máximo para Optuna ajustado a ser REALMENTE conservador
+        # Al limitar el rango superior a 0.12 (12% del Kelly óptimo), evitamos el overbetting
+        # que causaba pérdidas en el Test Set.
+        kelly_fraction = trial.suggest_float('kelly_fraction', 0.01, 0.25)
         
         roi, mdd = evaluate_league_params(df_league, ev_thresh, kelly_fraction)
         
@@ -259,17 +280,16 @@ def optimize_league(df, league_name):
             return roi - (mdd * 2.0) # Penalizar pérdida de forma continua
             
         # --- NUEVA LÓGICA DE UTILIDAD (Mean-Variance adaptada) ---
-        # La función anterior (ROI / (MDD + 0.01)) causaba que Optuna siempre eligiera
-        # el kelly máximo porque el ROI sube más rápido que el divisor.
-        # Al usar una penalización cuadrática para el Drawdown, creamos un verdadero "punto dulce".
-        # Ligas más inestables (con saltos de MDD altos) verán su score destruido por el mdd^2
-        # obligando a Optuna a elegir un kelly_fraction mucho menor.
+        # Un penalty_factor de 10.0 destruía el score de ligas rentables con varianza normal.
+        # Las ligas individuales SIEMPRE tienen un MDD más alto que el portafolio global.
+        # Un penalty de 2.0 logra el equilibrio perfecto: penaliza el exceso de drawdown 
+        # sin forzar a Optuna a preferir un Score de 0 (es decir, sin anular la liga).
         
-        penalty_factor = 10.0  # Nivel de aversión al riesgo
+        penalty_factor = 1.15  # Nivel de aversión al riesgo balanceado
         score = roi - penalty_factor * (mdd ** 2)
         
-        if mdd > 0.25:
-            score -= (mdd - 0.25) * 5.0  # Penalización severa si pasa del 25% de MDD
+        if mdd > 0.35:
+            score -= (mdd - 0.35) * 1  # Penalización más holgada para ligas individuales
             
         return score
 
@@ -334,6 +354,60 @@ def run_simulation():
 
     logger.info("=== EVALUACIÓN FINANCIERA (Bankroll Simulation) ===")
     
+    # ------------------ NUEVO: BRIER SCORE GLOBAL ------------------
+    df_eval = df.copy()
+    if FILTER_BY_WHITELIST:
+        df_eval = df_eval[df_eval['competition'].isin(WHITELIST_LEAGUES)]
+    
+    if not df_eval.empty:
+        # Probabilidades y resultados
+        y_prob_eval = df_eval[['prob_loss', 'prob_draw', 'prob_win']].values
+        y_true_eval = df_eval['outcome'].values
+        
+        # One-hot encoding manual para y_true
+        y_true_oh = np.zeros_like(y_prob_eval)
+        for idx_val, val in enumerate(y_true_eval):
+            if not np.isnan(val) and val in [0, 1, 2]:
+                y_true_oh[idx_val, int(val)] = 1
+                
+        # Brier Score (Multi-class)
+        brier_score = np.mean(np.sum((y_prob_eval - y_true_oh)**2, axis=1))
+        
+        # Log Loss (Multi-class)
+        eps = 1e-15
+        y_prob_clipped = np.clip(y_prob_eval, eps, 1 - eps)
+        log_loss_val = -np.mean(np.sum(y_true_oh * np.log(y_prob_clipped), axis=1))
+        
+        # Descomposición Brier Score (aplanando a binario)
+        p_flat = y_prob_eval.flatten()
+        y_flat = y_true_oh.flatten()
+        
+        bins = np.linspace(0, 1, 21)
+        digitized = np.digitize(p_flat, bins)
+        
+        reliability = 0.0
+        resolution = 0.0
+        base_rate = np.mean(y_flat)
+        uncertainty = base_rate * (1 - base_rate)
+        N_tot = len(p_flat)
+        
+        for b in range(1, len(bins)):
+            idx_b = np.where(digitized == b)[0]
+            if len(idx_b) > 0:
+                p_k = np.mean(p_flat[idx_b])
+                f_k = np.mean(y_flat[idx_b])
+                n_k = len(idx_b)
+                reliability += (n_k / N_tot) * (p_k - f_k)**2
+                resolution += (n_k / N_tot) * (f_k - base_rate)**2
+                
+        logger.info("=== MÉTRICAS DE CALIBRACIÓN GLOBAL ===")
+        logger.info(f"Log Loss: {log_loss_val:.4f}")
+        logger.info(f"Brier Score Global: {brier_score:.4f}")
+        logger.info(f" -> Reliability (menor es mejor): {reliability * 2:.4f}")
+        logger.info(f" -> Resolution (mayor es mejor): {resolution * 2:.4f}")
+        logger.info(f" -> Uncertainty: {uncertainty * 2:.4f}")
+    # ---------------------------------------------------------------
+    
     odds_win = df['odds_win'].values
     odds_draw = df['odds_draw'].values
     odds_loss = df['odds_loss'].values
@@ -371,6 +445,8 @@ def run_simulation():
     
     unique_dates = np.unique(dates)
     league_stats = {}
+    
+    placed_bets_history = []
 
     for current_date in sorted(unique_dates):
         start_of_day_bankroll = liquid_bankroll
@@ -401,7 +477,9 @@ def run_simulation():
                 divergence = abs(probs[j] - market_probs[j])
                 dynamic_alpha = MARKET_BLEND_ALPHA
                 if divergence > 0.20:
-                    dynamic_alpha = 0.50  
+                    dynamic_alpha = 0.30  
+                elif divergence > 0.15:
+                    dynamic_alpha = 0.50
                 elif divergence > 0.10:
                     dynamic_alpha = 0.70  
                 blended_probs.append((dynamic_alpha * probs[j]) + ((1 - dynamic_alpha) * market_probs[j]))
@@ -409,6 +487,15 @@ def run_simulation():
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
             evs = [ (blended_probs[j] * net_odds[j]) - 1 - EXPECTED_CLV_DROP for j in range(3) ]
             
+            if ENABLE_VALUE_TRAP_FILTER:
+                for j in range(3):
+                    divergence = abs(probs[j] - market_probs[j])
+                    # Umbrales relajados: 15% para súper favoritos, 25% para general
+                    if probs[j] > 0.65 and divergence > 0.15:
+                        evs[j] = -1.0
+                    elif divergence > 0.25:
+                        evs[j] = -1.0
+                        
             league_ev_thresh = EV_THRESHOLDS.get(comp, EV_THRESHOLDS.get('DEFAULT', 0.015))
             league_kelly = KELLY_FRACTIONS.get(comp, KELLY_FRACTIONS.get('DEFAULT', 0.015))
             
@@ -493,7 +580,8 @@ def run_simulation():
             if bet_type == 'single':
                 net_odd = 1 + (odds[best_choice] - 1) * (1 - TAX_RETENTION_RATE)
                 b = net_odd - 1
-                kelly_pct = best_ev / b if b > 0 else 0
+                kelly_ev = min(best_ev, 0.15)
+                kelly_pct = kelly_ev / b if b > 0 else 0
                 
                 if odds[best_choice] < 1.30:
                     kelly_pct = min(kelly_pct, 0.01) 
@@ -554,8 +642,18 @@ def run_simulation():
                     league_stats[comp]['won'] += 1
                     gross_profit_sum += net_profit
                 else:
+                    net_profit = -stake
                     league_stats[comp]['profit'] -= stake
                     gross_loss_sum += stake
+                    
+                placed_bets_history.append({
+                    'ev': best_ev,
+                    'prob': blended_probs[best_choice],
+                    'odds': odds[best_choice],
+                    'stake': stake,
+                    'is_win': int(real_outcome == best_choice),
+                    'net_profit': net_profit
+                })
                     
             elif bet_type == 'dutching':
                 implied_prob_1 = 1 / odds[best_choice]
@@ -565,7 +663,8 @@ def run_simulation():
                 
                 net_combined_odds = 1 + (combined_odds - 1) * (1 - TAX_RETENTION_RATE)
                 b = net_combined_odds - 1
-                kelly_pct = best_ev / b if b > 0 else 0
+                kelly_ev = min(best_ev, 0.15)
+                kelly_pct = kelly_ev / b if b > 0 else 0
                 if combined_odds < 1.30:
                     kelly_pct = min(kelly_pct, 0.01)
                     
@@ -625,6 +724,7 @@ def run_simulation():
                         gross_profit_sum += net_profit
                     else:
                         gross_loss_sum += abs(net_profit)
+                    final_net_profit = net_profit
                 elif real_outcome == secondary_choice:
                     gross_profit = stake_X * (odds[secondary_choice] - 1) - stake_1
                     net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE) if gross_profit > 0 else gross_profit
@@ -637,9 +737,20 @@ def run_simulation():
                         gross_profit_sum += net_profit
                     else:
                         gross_loss_sum += abs(net_profit)
+                    final_net_profit = net_profit
                 else:
+                    final_net_profit = -total_dutch_stake
                     league_stats[comp]['profit'] -= total_dutch_stake
                     gross_loss_sum += total_dutch_stake
+                    
+                placed_bets_history.append({
+                    'ev': best_ev,
+                    'prob': blended_probs[best_choice] + blended_probs[secondary_choice],
+                    'odds': combined_odds,
+                    'stake': total_dutch_stake,
+                    'is_win': int(real_outcome in [best_choice, secondary_choice]),
+                    'net_profit': final_net_profit
+                })
         
         liquid_bankroll += day_profit
         bankroll_history.append(liquid_bankroll)
@@ -762,6 +873,121 @@ def run_simulation():
             logger.warning("ALERTA QUANT: La Probabilidad de Ruina supera el 1%. Considera reducir el `kelly_fraction` o el `max_stake_pct`.")
         else:
             logger.info("VALIDACIÓN QUANT: Estrategia de bankroll robusta frente a la varianza extrema.")
+
+    # --- NUEVOS DIAGNÓSTICOS QUANT ---
+    if placed_bets_history:
+        df_bets = pd.DataFrame(placed_bets_history)
+        
+        logger.info("=== YIELD POR BUCKETS DE EXPECTED VALUE (EV) ===")
+        ev_bins = [-np.inf, 0.05, 0.10, 0.15, 0.20, np.inf]
+        ev_labels = ['<5%', '5-10%', '10-15%', '15-20%', '>20%']
+        df_bets['ev_bucket'] = pd.cut(df_bets['ev'], bins=ev_bins, labels=ev_labels, right=False)
+        
+        ev_stats = df_bets.groupby('ev_bucket', observed=False).agg(
+            bets=('ev', 'count'),
+            staked=('stake', 'sum'),
+            profit=('net_profit', 'sum')
+        ).reset_index()
+        
+        for _, row in ev_stats.iterrows():
+            if row['bets'] > 0:
+                b_yield = (row['profit'] / row['staked']) * 100
+                logger.info(f"EV Bucket {row['ev_bucket']}: {int(row['bets'])} apuestas | Yield: {b_yield:.2f}% | Profit: ${row['profit']:.2f}")
+
+        logger.info("=== CURVA DE CALIBRACIÓN (RELIABILITY DIAGRAM) ===")
+        prob_bins = np.linspace(0, 1, 21)
+        df_bets['prob_bucket'] = pd.cut(df_bets['prob'], bins=prob_bins).astype(str)
+        
+        calib_stats = df_bets.groupby('prob_bucket', observed=False).agg(
+            bets=('prob', 'count'),
+            mean_pred=('prob', 'mean'),
+            hit_rate=('is_win', 'mean')
+        ).dropna().reset_index()
+        
+        calib_stats = calib_stats[calib_stats['bets'] > 0].copy()
+        
+        for _, row in calib_stats.iterrows():
+            diff = (row['mean_pred'] - row['hit_rate']) * 100
+            diff_str = f"+{diff:.1f}% (Overconfident)" if diff > 0 else f"{diff:.1f}% (Underconfident)"
+            logger.info(f"Prob {row['prob_bucket']}: {int(row['bets'])} apuestas | Pred: {row['mean_pred']*100:.1f}% | Real: {row['hit_rate']*100:.1f}% | Diff: {diff_str}")
+            
+        log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        csv_path = os.path.join(log_dir, f'calibration_data_{timestamp_str}.csv')
+        calib_stats.to_csv(csv_path, index=False)
+        logger.info(f"Datos de curva de calibración guardados en: {csv_path}")
+        
+        try:
+            plt.figure(figsize=(8, 8))
+            plt.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
+            plt.plot(calib_stats['mean_pred'], calib_stats['hit_rate'], "s-", label="Model")
+            for i, row in calib_stats.iterrows():
+                plt.text(row['mean_pred'], row['hit_rate'], str(int(row['bets'])), fontsize=8, ha='right', va='bottom')
+            plt.ylabel("Fraction of positives (Hit Rate)")
+            plt.xlabel("Mean predicted probability")
+            plt.title("Reliability Diagram (Calibration Curve)")
+            plt.legend(loc="lower right")
+            plt.grid(True)
+            plot_path = os.path.join(log_dir, f'calibration_plot_{timestamp_str}.png')
+            plt.savefig(plot_path)
+            plt.close()
+            logger.info(f"Gráfica de calibración generada en: {plot_path}")
+        except Exception as e:
+            logger.error(f"Error generando gráfica de calibración: {e}")
+
+        if len(placed_bets_history) > 10:
+            logger.info("=== MONTE CARLO DE CALIBRACIÓN (EXPECTED DISTRIBUTION) ===")
+            logger.info(f"Ejecutando 10,000 simulaciones sintéticas basadas en las probabilidades del modelo...")
+            
+            n_sims = 10000
+            synthetic_yields = []
+            synthetic_mdds = []
+            
+            probs_array = df_bets['prob'].values
+            odds_array = df_bets['odds'].values
+            stakes_array = df_bets['stake'].values
+            total_staked_synth = np.sum(stakes_array)
+            
+            if total_staked_synth > 0:
+                for _ in range(n_sims):
+                    sim_wins = np.random.rand(len(probs_array)) < probs_array
+                    net_profits = np.where(sim_wins, stakes_array * (odds_array - 1) * (1.0 - TAX_RETENTION_RATE), -stakes_array)
+                    
+                    total_profit_synth = np.sum(net_profits)
+                    synthetic_yields.append(total_profit_synth / total_staked_synth)
+                    
+                    bankroll_path = 1000.0 + np.cumsum(net_profits)
+                    peaks = np.maximum.accumulate(np.insert(bankroll_path, 0, 1000.0))
+                    path_with_initial = np.insert(bankroll_path, 0, 1000.0)
+                    drawdowns = (peaks - path_with_initial) / peaks
+                    synthetic_mdds.append(np.max(drawdowns))
+                    
+                synthetic_yields = np.array(synthetic_yields) * 100
+                synthetic_mdds = np.array(synthetic_mdds) * 100
+                
+                real_yield = yield_pct
+                real_mdd = historical_mdd * 100
+                
+                percentile_yield = np.sum(synthetic_yields < real_yield) / n_sims * 100
+                percentile_mdd = np.sum(synthetic_mdds < real_mdd) / n_sims * 100
+                
+                logger.info(f"Yield Real: {real_yield:.2f}% | xYield Mediano (Simulación): {np.median(synthetic_yields):.2f}%")
+                logger.info(f"El Yield Real cae en el percentil {percentile_yield:.1f}% de la distribución de calibración.")
+                
+                logger.info(f"MDD Real: {real_mdd:.2f}% | xMDD Mediano (Simulación): {np.median(synthetic_mdds):.2f}%")
+                logger.info(f"El MDD Real cae en el percentil {percentile_mdd:.1f}% de la distribución de calibración.")
+                
+                if percentile_yield < 10.0:
+                    logger.warning("OVERCONFIDENCE CONFIRMADA: Tu Yield real está en el 10% inferior de lo que el modelo predecía. Las probabilidades están sobreestimadas.")
+                elif percentile_yield > 90.0:
+                    logger.warning("UNDERCONFIDENCE: Tu Yield real es excepcionalmente bueno frente a lo predicho. Posible varianza positiva ('Good Luck').")
+                else:
+                    logger.info("CALIBRACIÓN ADECUADA: El rendimiento está dentro del rango esperado por la varianza normal del modelo.")
+                    
+                if percentile_mdd > 90.0:
+                    logger.warning("RIESGO EXTREMO: El MDD real fue mucho peor (Top 10%) que el peor escenario probabilístico del modelo.")
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))

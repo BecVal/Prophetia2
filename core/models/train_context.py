@@ -7,6 +7,7 @@ import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import log_loss
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.calibration import CalibratedClassifierCV
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -57,9 +58,13 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         w_tr = get_time_weights(dates_tr)
         
         xgb_eval = XGBClassifier(**param)
-        xgb_eval.fit(X_tr, y_tr, sample_weight=w_tr)
+        calibrated_eval = CalibratedClassifierCV(estimator=xgb_eval, method='isotonic', cv=3)
+        if w_tr is not None:
+            calibrated_eval.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            calibrated_eval.fit(X_tr, y_tr)
         
-        y_prob = xgb_eval.predict_proba(X_val)
+        y_prob = calibrated_eval.predict_proba(X_val)
         cv_scores.append(log_loss(y_val, y_prob))
         
     return np.mean(cv_scores)
@@ -156,8 +161,12 @@ def train_context():
         dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
         w_tr = get_time_weights(dates_kf_train)
         
-        kf_estimator = XGBClassifier(**xgb_best.get_params())
-        kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr)
+        base_kf = XGBClassifier(**xgb_best.get_params())
+        kf_estimator = CalibratedClassifierCV(estimator=base_kf, method='isotonic', cv=3)
+        if w_tr is not None:
+            kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            kf_estimator.fit(X_kf_train, y_kf_train)
         
         val_indices_in_original = first_train_idx[kf_val]
         pred_probs_train[val_indices_in_original] = kf_estimator.predict_proba(X_kf_val)
@@ -171,14 +180,23 @@ def train_context():
         dates_tr = train_dates.iloc[train_idx] if train_dates is not None else None
         w_tr = get_time_weights(dates_tr)
         
-        fold_estimator = XGBClassifier(**xgb_best.get_params())
-        fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
+        base_fold = XGBClassifier(**xgb_best.get_params())
+        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='isotonic', cv=3)
+        if w_tr is not None:
+            fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            fold_estimator.fit(X_tr, y_tr)
         pred_probs_train[val_idx] = fold_estimator.predict_proba(X_val)
         
     logger.info("Entrenando Modelo B final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
-    xgb_best.fit(X_train, y_train, sample_weight=final_w_tr)
-    pred_probs_test = xgb_best.predict_proba(X_test)
+    base_final = XGBClassifier(**xgb_best.get_params())
+    final_estimator = CalibratedClassifierCV(estimator=base_final, method='isotonic', cv=3)
+    if final_w_tr is not None:
+        final_estimator.fit(X_train, y_train, sample_weight=final_w_tr.values if isinstance(final_w_tr, pd.Series) else final_w_tr)
+    else:
+        final_estimator.fit(X_train, y_train)
+    pred_probs_test = final_estimator.predict_proba(X_test)
     
     # LOGS: Verificacion de calibracion
     logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO B ===")
@@ -207,7 +225,7 @@ def train_context():
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         
-    joblib.dump({'model': xgb_best, 'features': feature_cols}, MODEL_SAVE_PATH)
+    joblib.dump({'model': final_estimator, 'features': feature_cols}, MODEL_SAVE_PATH)
     logger.info(f"=== MODELO CONTEXTO FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":

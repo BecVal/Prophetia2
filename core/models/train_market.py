@@ -7,6 +7,7 @@ import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import log_loss, brier_score_loss
 from sklearn.model_selection import TimeSeriesSplit, KFold
+from sklearn.calibration import CalibratedClassifierCV
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -55,9 +56,13 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         w_tr = get_time_weights(dates_tr)
         
         xgb_eval = XGBClassifier(**param)
-        xgb_eval.fit(X_tr, y_tr, sample_weight=w_tr)
+        calibrated_eval = CalibratedClassifierCV(estimator=xgb_eval, method='isotonic', cv=3)
+        if w_tr is not None:
+            calibrated_eval.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            calibrated_eval.fit(X_tr, y_tr)
         
-        y_prob = xgb_eval.predict_proba(X_val)
+        y_prob = calibrated_eval.predict_proba(X_val)
         y_prob = y_prob / y_prob.sum(axis=1, keepdims=True)
         cv_scores.append(log_loss(y_val, y_prob, labels=[0, 1, 2]))
         
@@ -166,8 +171,12 @@ def train_market():
         dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
         w_tr = get_time_weights(dates_kf_train)
         
-        kf_estimator = XGBClassifier(**xgb_best.get_params())
-        kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr)
+        base_kf = XGBClassifier(**xgb_best.get_params())
+        kf_estimator = CalibratedClassifierCV(estimator=base_kf, method='isotonic', cv=3)
+        if w_tr is not None:
+            kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            kf_estimator.fit(X_kf_train, y_kf_train)
         
         val_indices_in_original = first_train_idx[kf_val]
         pred_probs_train[val_indices_in_original] = kf_estimator.predict_proba(X_kf_val)
@@ -181,14 +190,23 @@ def train_market():
         dates_tr = train_dates.iloc[train_idx] if train_dates is not None else None
         w_tr = get_time_weights(dates_tr)
         
-        fold_estimator = XGBClassifier(**xgb_best.get_params())
-        fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
+        base_fold = XGBClassifier(**xgb_best.get_params())
+        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='isotonic', cv=3)
+        if w_tr is not None:
+            fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            fold_estimator.fit(X_tr, y_tr)
         pred_probs_train[val_idx] = fold_estimator.predict_proba(X_val)
         
     logger.info("Entrenando Modelo de Mercado final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
-    xgb_best.fit(X_train, y_train, sample_weight=final_w_tr)
-    pred_probs_test = xgb_best.predict_proba(X_test)
+    base_final = XGBClassifier(**xgb_best.get_params())
+    final_estimator = CalibratedClassifierCV(estimator=base_final, method='isotonic', cv=3)
+    if final_w_tr is not None:
+        final_estimator.fit(X_train, y_train, sample_weight=final_w_tr.values if isinstance(final_w_tr, pd.Series) else final_w_tr)
+    else:
+        final_estimator.fit(X_train, y_train)
+    pred_probs_test = final_estimator.predict_proba(X_test)
     pred_probs_test = pred_probs_test / pred_probs_test.sum(axis=1, keepdims=True)
     
     # Normalizar OOF (silencia warnings de suma != 1)
@@ -222,7 +240,7 @@ def train_market():
         logger.info(f" - Victoria (Win) | Predicha: {pred_win*100:.1f}% | Real: {real_win*100:.1f}% | Brier Score: {brier_win:.4f}")
         
         # Feature Importances
-        importances = xgb_best.feature_importances_
+        importances = np.mean([clf.estimator.feature_importances_ for clf in final_estimator.calibrated_classifiers_], axis=0)
         feat_imp = pd.DataFrame({'Feature': feature_cols, 'Importance': importances}).sort_values(by='Importance', ascending=False)
         logger.info("=== IMPORTANCIA DE VARIABLES (TOP 5) ===")
         for _, row in feat_imp.head(5).iterrows():
@@ -241,7 +259,7 @@ def train_market():
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         
-    joblib.dump({'model': xgb_best, 'features': feature_cols}, MODEL_SAVE_PATH)
+    joblib.dump({'model': final_estimator, 'features': feature_cols}, MODEL_SAVE_PATH)
     logger.info(f"=== MODELO MERCADO FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":

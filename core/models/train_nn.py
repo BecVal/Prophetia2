@@ -11,6 +11,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss, accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.calibration import CalibratedClassifierCV
 import optuna
 
 # Asegurar import de data_splitter
@@ -55,7 +57,7 @@ class PyTorchMLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class SklearnPyTorchWrapper:
+class SklearnPyTorchWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, input_dim, hidden_dims=[128, 64], dropout_rate=0.3, weight_decay=1e-2, num_classes=3, epochs=100, batch_size=128, lr=1e-3, device='cuda', patience=7):
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
@@ -75,6 +77,7 @@ class SklearnPyTorchWrapper:
         self.model = PyTorchMLP(self.input_dim, self.hidden_dims, self.dropout_rate, self.num_classes).to(self.device)
         
     def fit(self, X, y, sample_weight=None):
+        self.classes_ = np.unique(y)
         self._init_model() # Reinicializar para asegurar pesos limpios por cada fold
         
         # Validacion Interna para Early Stopping (Split primero para evitar Data Leakage)
@@ -160,7 +163,7 @@ class SklearnPyTorchWrapper:
             probs = torch.softmax(logits, dim=1)
         return probs.cpu().numpy()
         
-    def get_params(self):
+    def get_params(self, deep=True):
         return {
             'input_dim': self.input_dim,
             'hidden_dims': self.hidden_dims,
@@ -257,9 +260,10 @@ def train_nn():
                 lr=lr, 
                 patience=7
             )
+            calibrated_estimator = CalibratedClassifierCV(estimator=estimator, method='isotonic', cv=3)
             
-            estimator.fit(X_tr, y_tr, sample_weight=w_tr)
-            preds = estimator.predict_proba(X_val)
+            calibrated_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+            preds = calibrated_estimator.predict_proba(X_val)
             fold_loss = log_loss(y_val, preds)
             fold_losses.append(fold_loss)
             
@@ -318,8 +322,9 @@ def train_nn():
         dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
         w_tr = get_time_weights(dates_kf_train)
         
-        kf_estimator = SklearnPyTorchWrapper(**nn_best.get_params())
-        kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr)
+        kf_estimator_base = SklearnPyTorchWrapper(**nn_best.get_params())
+        kf_estimator = CalibratedClassifierCV(estimator=kf_estimator_base, method='isotonic', cv=3)
+        kf_estimator.fit(X_kf_train, y_kf_train, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         
         val_indices_in_original = first_train_idx[kf_val]
         pred_probs_train[val_indices_in_original] = kf_estimator.predict_proba(X_kf_val)
@@ -333,14 +338,17 @@ def train_nn():
         dates_tr = train_dates.iloc[train_idx] if train_dates is not None else None
         w_tr = get_time_weights(dates_tr)
         
-        fold_estimator = SklearnPyTorchWrapper(**nn_best.get_params())
-        fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr)
+        fold_estimator_base = SklearnPyTorchWrapper(**nn_best.get_params())
+        fold_estimator = CalibratedClassifierCV(estimator=fold_estimator_base, method='isotonic', cv=3)
+        fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         pred_probs_train[val_idx] = fold_estimator.predict_proba(X_val)
         
     logger.info("Entrenando Modelo NN final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
-    nn_best.fit(X_train, y_train, sample_weight=final_w_tr)
-    pred_probs_test = nn_best.predict_proba(X_test)
+    base_final = SklearnPyTorchWrapper(**nn_best.get_params())
+    final_estimator = CalibratedClassifierCV(estimator=base_final, method='isotonic', cv=3)
+    final_estimator.fit(X_train, y_train, sample_weight=final_w_tr.values if isinstance(final_w_tr, pd.Series) else final_w_tr)
+    pred_probs_test = final_estimator.predict_proba(X_test)
     
     # LOGS: Verificacion de calibracion
     logger.info("=== ESTADÍSTICAS Y AUDITORÍA DEL MODELO NN ===")
@@ -382,7 +390,7 @@ def train_nn():
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         
-    joblib.dump({'model': nn_best, 'features': feature_cols}, MODEL_SAVE_PATH)
+    joblib.dump({'model': final_estimator, 'features': feature_cols}, MODEL_SAVE_PATH)
     logger.info(f"=== MODELO NN FINALIZADO === Guardado en {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
