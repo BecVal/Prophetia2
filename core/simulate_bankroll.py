@@ -20,17 +20,21 @@ logger = get_logger(__name__, 'simulate_bankroll')
 # Configuración Quant
 FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
 WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0', 'D1', 'D2', 'E1']
-ENABLE_VALUE_TRAP_FILTER = True # True: Activa el filtro contra Winner's Curse (descarte por asimetría de información)
+ENABLE_VALUE_TRAP_FILTER = False # True: Activa el filtro contra Winner's Curse (descarte por asimetría de información)
 
 # --- CONFIGURACIÓN DE OPTIMIZACIÓN ---
 # Opciones: 'NONE', 'ALL', 'WHITELIST', o una liga específica como 'I1'
-OPTIMIZATION_MODE = 'WHITELIST'
+OPTIMIZATION_MODE = 'NONE'
 OPTUNA_TRIALS = 1000
 OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
 
 # Diccionarios de riesgo por liga iniciales/por defecto
 KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.015}
 EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 'D1': 0.015, 'T1': 0.01, 'F1': 0.015, 'E1': 0.015, 'N1': 0.02, 'SP2': 0.02, 'P1': 0.02, 'DEFAULT': 0.015}
+
+ALPHA_DIV_LOW = {'DEFAULT': 0.85}
+ALPHA_DIV_MED = {'DEFAULT': 0.70}
+ALPHA_DIV_HIGH = {'DEFAULT': 0.50}
 
 MAX_STAKE_PCT = 0.6  # Cap reducido al 3% para mayor seguridad con el nuevo filtro
 
@@ -46,7 +50,7 @@ MAX_BET_LIQUIDITY = {      # Límites de liquidez absolutos en USD o Unidad Base
 }
 
 def load_optimized_params():
-    global KELLY_FRACTIONS, EV_THRESHOLDS
+    global KELLY_FRACTIONS, EV_THRESHOLDS, ALPHA_DIV_LOW, ALPHA_DIV_MED, ALPHA_DIV_HIGH
     if os.path.exists(OPTIMIZED_PARAMS_FILE):
         try:
             with open(OPTIMIZED_PARAMS_FILE, 'r') as f:
@@ -55,6 +59,12 @@ def load_optimized_params():
                     KELLY_FRACTIONS.update(data['KELLY_FRACTIONS'])
                 if 'EV_THRESHOLDS' in data:
                     EV_THRESHOLDS.update(data['EV_THRESHOLDS'])
+                if 'ALPHA_DIV_LOW' in data:
+                    ALPHA_DIV_LOW.update(data['ALPHA_DIV_LOW'])
+                if 'ALPHA_DIV_MED' in data:
+                    ALPHA_DIV_MED.update(data['ALPHA_DIV_MED'])
+                if 'ALPHA_DIV_HIGH' in data:
+                    ALPHA_DIV_HIGH.update(data['ALPHA_DIV_HIGH'])
             logger.info("Parámetros optimizados cargados desde archivo local.")
         except Exception as e:
             logger.error(f"Error al cargar parámetros optimizados: {e}")
@@ -64,7 +74,10 @@ def load_optimized_params():
 def save_optimized_params():
     data = {
         'KELLY_FRACTIONS': KELLY_FRACTIONS,
-        'EV_THRESHOLDS': EV_THRESHOLDS
+        'EV_THRESHOLDS': EV_THRESHOLDS,
+        'ALPHA_DIV_LOW': ALPHA_DIV_LOW,
+        'ALPHA_DIV_MED': ALPHA_DIV_MED,
+        'ALPHA_DIV_HIGH': ALPHA_DIV_HIGH
     }
     try:
         os.makedirs(os.path.dirname(OPTIMIZED_PARAMS_FILE), exist_ok=True)
@@ -74,7 +87,7 @@ def save_optimized_params():
     except Exception as e:
         logger.error(f"Error al guardar parámetros optimizados: {e}")
 
-def evaluate_league_params(df_league, ev_thresh, kelly_fraction):
+def evaluate_league_params(df_league, ev_thresh, kelly_fraction, alpha_low, alpha_med, alpha_high):
     """ Función rápida para simular el bankroll de una sola liga de forma independiente """
     liquid_bankroll = 1000.0
     historical_peak = liquid_bankroll
@@ -109,10 +122,11 @@ def evaluate_league_params(df_league, ev_thresh, kelly_fraction):
             blended_probs = []
             for j in range(3):
                 divergence = abs([p_loss, p_draw, p_win][j] - market_probs[j])
-                dynamic_alpha = MARKET_BLEND_ALPHA
                 if divergence > 0.20: dynamic_alpha = 0.30
                 elif divergence > 0.15: dynamic_alpha = 0.50
-                elif divergence > 0.10: dynamic_alpha = 0.70
+                elif divergence > 0.10: dynamic_alpha = alpha_high
+                elif divergence > 0.05: dynamic_alpha = alpha_med
+                else: dynamic_alpha = alpha_low
                 blended_probs.append((dynamic_alpha * [p_loss, p_draw, p_win][j]) + ((1 - dynamic_alpha) * market_probs[j]))
             
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
@@ -125,10 +139,6 @@ def evaluate_league_params(df_league, ev_thresh, kelly_fraction):
                     if [p_loss, p_draw, p_win][j] > 0.65 and divergence > 0.15:
                         evs[j] = -1.0
                     elif divergence > 0.25:
-                        evs[j] = -1.0
-                    # NUEVO: Asimetría de información en Favoritos Claros (Value Trap)
-                    # Si el mercado cree que hay >50% prob, y nuestro EV es marginal (<10%), es una trampa.
-                    elif market_probs[j] > 0.50 and 0 < evs[j] < 0.10:
                         evs[j] = -1.0
                         
             best_choice = np.argmax(evs)
@@ -265,16 +275,19 @@ def optimize_league(df, league_name):
     df_league = df[df['competition'] == league_name].copy()
     if df_league.empty:
         logger.warning(f"No hay datos para {league_name}.")
-        return None, None
+        return None
         
     def objective(trial):
-        ev_thresh = trial.suggest_float('ev_thresh', 0.020, 0.150)
+        ev_thresh = trial.suggest_float('ev_thresh', 0.015, 0.050)
         # Configuración del kelly máximo para Optuna ajustado a ser REALMENTE conservador
         # Al limitar el rango superior a 0.12 (12% del Kelly óptimo), evitamos el overbetting
         # que causaba pérdidas en el Test Set.
         kelly_fraction = trial.suggest_float('kelly_fraction', 0.01, 0.25)
+        alpha_low = trial.suggest_float('alpha_low', 0.10, 0.95)
+        alpha_med = trial.suggest_float('alpha_med', 0.10, 0.95)
+        alpha_high = trial.suggest_float('alpha_high', 0.10, 0.95)
         
-        roi, mdd = evaluate_league_params(df_league, ev_thresh, kelly_fraction)
+        roi, mdd = evaluate_league_params(df_league, ev_thresh, kelly_fraction, alpha_low, alpha_med, alpha_high)
         
         if roi <= 0.0:
             return roi - (mdd * 2.0) # Penalizar pérdida de forma continua
@@ -301,7 +314,7 @@ def optimize_league(df, league_name):
     best_value = study.best_value
     logger.info(f"Mejores parámetros para {league_name} encontrados: EV={best_params['ev_thresh']:.4f}, Kelly={best_params['kelly_fraction']:.4f} | Score Ajustado: {best_value:.2f}")
     
-    return best_params['ev_thresh'], best_params['kelly_fraction']
+    return best_params
 
 def run_simulation():
     PREDICTIONS_PATH = '../data/processed/test_predictions.parquet'
@@ -341,10 +354,13 @@ def run_simulation():
             for comp in leagues_to_optimize:
                 if FILTER_BY_WHITELIST and comp not in WHITELIST_LEAGUES:
                     continue
-                ev_opt, kelly_opt = optimize_league(df_train_opt, comp)
-                if ev_opt is not None:
-                    EV_THRESHOLDS[comp] = ev_opt
-                    KELLY_FRACTIONS[comp] = kelly_opt
+                best_params = optimize_league(df_train_opt, comp)
+                if best_params is not None:
+                    EV_THRESHOLDS[comp] = best_params['ev_thresh']
+                    KELLY_FRACTIONS[comp] = best_params['kelly_fraction']
+                    ALPHA_DIV_LOW[comp] = best_params['alpha_low']
+                    ALPHA_DIV_MED[comp] = best_params['alpha_med']
+                    ALPHA_DIV_HIGH[comp] = best_params['alpha_high']
                     
             # Guardar resultados para futuro uso
             save_optimized_params()
@@ -473,15 +489,21 @@ def run_simulation():
             market_probs = [p / margin for p in market_implied]
             
             blended_probs = []
+            league_alpha_low = ALPHA_DIV_LOW.get(comp, ALPHA_DIV_LOW.get('DEFAULT', 0.85))
+            league_alpha_med = ALPHA_DIV_MED.get(comp, ALPHA_DIV_MED.get('DEFAULT', 0.70))
+            league_alpha_high = ALPHA_DIV_HIGH.get(comp, ALPHA_DIV_HIGH.get('DEFAULT', 0.50))
             for j in range(3):
                 divergence = abs(probs[j] - market_probs[j])
-                dynamic_alpha = MARKET_BLEND_ALPHA
                 if divergence > 0.20:
                     dynamic_alpha = 0.30  
                 elif divergence > 0.15:
                     dynamic_alpha = 0.50
                 elif divergence > 0.10:
-                    dynamic_alpha = 0.70  
+                    dynamic_alpha = league_alpha_high
+                elif divergence > 0.05:
+                    dynamic_alpha = league_alpha_med
+                else:
+                    dynamic_alpha = league_alpha_low
                 blended_probs.append((dynamic_alpha * probs[j]) + ((1 - dynamic_alpha) * market_probs[j]))
             
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
