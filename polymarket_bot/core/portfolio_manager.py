@@ -18,8 +18,7 @@ class PortfolioManager:
         # Parámetros de Fricción (de simulate_bankroll.py)
         self.tax_retention_rate = 0.0075
         self.expected_clv_drop = 0.015
-        self.max_stake_pct = 0.03 # 3% máximo por orden
-        self.market_blend_alpha = 0.85 # Peso del modelo vs mercado (85% modelo)
+        self.max_stake_pct = 0.6 # 60% máximo por orden
         
         self.max_bet_liquidity = {
             'D1': 2000.0, 'SP1': 2000.0, 'I1': 2000.0, 'G1': 2000.0, 'F1': 2000.0,
@@ -31,14 +30,20 @@ class PortfolioManager:
         # Cargar parámetros óptimos por liga
         self.kelly_fractions = {'DEFAULT': 0.015}
         self.ev_thresholds = {'DEFAULT': 0.015}
+        self.alpha_div_low = {'DEFAULT': 0.85}
+        self.alpha_div_med = {'DEFAULT': 0.70}
+        self.alpha_div_high = {'DEFAULT': 0.50}
         
-        params_file = os.path.join(core_dir, '..', 'data', 'processed', 'optimal_bankroll_params.json')
+        params_file = os.path.join(core_dir, '..', 'data', 'processed', 'models_best_parameters', 'optimal_bankroll_params.json')
         if os.path.exists(params_file):
             try:
                 with open(params_file, 'r') as f:
                     data = json.load(f)
                     self.kelly_fractions.update(data.get('KELLY_FRACTIONS', {}))
                     self.ev_thresholds.update(data.get('EV_THRESHOLDS', {}))
+                    self.alpha_div_low.update(data.get('ALPHA_DIV_LOW', {}))
+                    self.alpha_div_med.update(data.get('ALPHA_DIV_MED', {}))
+                    self.alpha_div_high.update(data.get('ALPHA_DIV_HIGH', {}))
                 logger.info(f"Parámetros óptimos cargados de {params_file}")
             except Exception as e:
                 logger.error(f"Error leyendo parámetros óptimos: {e}")
@@ -54,6 +59,9 @@ class PortfolioManager:
         """
         league_ev_thresh = self.ev_thresholds.get(competition, self.ev_thresholds.get('DEFAULT', 0.015))
         league_kelly = self.kelly_fractions.get(competition, self.kelly_fractions.get('DEFAULT', 0.015))
+        league_alpha_low = self.alpha_div_low.get(competition, self.alpha_div_low.get('DEFAULT', 0.85))
+        league_alpha_med = self.alpha_div_med.get(competition, self.alpha_div_med.get('DEFAULT', 0.70))
+        league_alpha_high = self.alpha_div_high.get(competition, self.alpha_div_high.get('DEFAULT', 0.50))
         
         # Calcular Net Odds y EV por cada token en Polymarket
         net_odds = {}
@@ -77,11 +85,16 @@ class PortfolioManager:
                 # Dynamic Alpha Blending
                 prob = probs[f"{outcome}_prob"]
                 divergence = abs(prob - market_prob)
-                dynamic_alpha = self.market_blend_alpha
                 if divergence > 0.20:
+                    dynamic_alpha = 0.30
+                elif divergence > 0.15:
                     dynamic_alpha = 0.50
                 elif divergence > 0.10:
-                    dynamic_alpha = 0.70
+                    dynamic_alpha = league_alpha_high
+                elif divergence > 0.05:
+                    dynamic_alpha = league_alpha_med
+                else:
+                    dynamic_alpha = league_alpha_low
                     
                 blended_prob = (dynamic_alpha * prob) + ((1 - dynamic_alpha) * market_prob)
                 
@@ -120,7 +133,10 @@ class PortfolioManager:
             if ev_1X > league_ev_thresh:
                 # Calcular Kelly para Dutching
                 b = net_combined_odd - 1
-                kelly_pct = ev_1X / b if b > 0 else 0
+                kelly_ev = min(ev_1X, 0.15)
+                kelly_pct = kelly_ev / b if b > 0 else 0
+                if combined_odd < 1.30:
+                    kelly_pct = min(kelly_pct, 0.01)
                 stake_pct = min(kelly_pct * league_kelly, self.max_stake_pct)
                 
                 if stake_pct >= 0.001:
@@ -152,7 +168,10 @@ class PortfolioManager:
             
             if ev_X2 > league_ev_thresh:
                 b = net_combined_odd - 1
-                kelly_pct = ev_X2 / b if b > 0 else 0
+                kelly_ev = min(ev_X2, 0.15)
+                kelly_pct = kelly_ev / b if b > 0 else 0
+                if combined_odd < 1.30:
+                    kelly_pct = min(kelly_pct, 0.01)
                 stake_pct = min(kelly_pct * league_kelly, self.max_stake_pct)
                 
                 if stake_pct >= 0.001:
@@ -173,8 +192,13 @@ class PortfolioManager:
         # Si no hay Dutching, evaluamos el Single
         if not bet_plan and best_single_ev > league_ev_thresh:
             b = net_odds[best_single_outcome] - 1
-            kelly_pct = best_single_ev / b if b > 0 else 0
+            kelly_ev = min(best_single_ev, 0.15)
+            kelly_pct = kelly_ev / b if b > 0 else 0
             
+            raw_odd = 1.0 / poly_prices[best_single_outcome]
+            if raw_odd < 1.30:
+                kelly_pct = min(kelly_pct, 0.01)
+                
             stake_pct = min(kelly_pct * league_kelly, self.max_stake_pct)
             if stake_pct >= 0.001:
                 stake = min(self.bankroll * stake_pct, league_liquidity)

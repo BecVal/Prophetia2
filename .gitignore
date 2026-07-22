@@ -19,7 +19,9 @@ env/
 .venv/
 
 # Carpeta de agentes
+.agent/
 .agents/
+AGENTS.md
 
 # Archivos de Python y basura del sistema
 __pycache__/

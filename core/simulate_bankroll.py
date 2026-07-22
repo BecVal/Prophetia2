@@ -20,13 +20,12 @@ logger = get_logger(__name__, 'simulate_bankroll')
 # Configuración Quant
 FILTER_BY_WHITELIST = True  # True: ignora partidos fuera de Whitelist en la simulación financiera
 WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0', 'D1', 'D2', 'E1']
-ENABLE_VALUE_TRAP_FILTER = False # True: Activa el filtro contra Winner's Curse (descarte por asimetría de información)
 
 # --- CONFIGURACIÓN DE OPTIMIZACIÓN ---
 # Opciones: 'NONE', 'ALL', 'WHITELIST', o una liga específica como 'I1'
 OPTIMIZATION_MODE = 'NONE'
 OPTUNA_TRIALS = 1000
-OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
+OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
 
 # Diccionarios de riesgo por liga iniciales/por defecto
 KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.015}
@@ -132,15 +131,6 @@ def evaluate_league_params(df_league, ev_thresh, kelly_fraction, alpha_low, alph
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
             evs = [ (blended_probs[j] * net_odds[j]) - 1 - EXPECTED_CLV_DROP for j in range(3) ]
             
-            if ENABLE_VALUE_TRAP_FILTER:
-                for j in range(3):
-                    divergence = abs([p_loss, p_draw, p_win][j] - market_probs[j])
-                    # Umbrales relajados: 15% para súper favoritos, 25% para general
-                    if [p_loss, p_draw, p_win][j] > 0.65 and divergence > 0.15:
-                        evs[j] = -1.0
-                    elif divergence > 0.25:
-                        evs[j] = -1.0
-                        
             best_choice = np.argmax(evs)
             best_ev = evs[best_choice]
             
@@ -509,15 +499,6 @@ def run_simulation():
             net_odds = [1 + (odds[j] - 1) * (1 - TAX_RETENTION_RATE) for j in range(3)]
             evs = [ (blended_probs[j] * net_odds[j]) - 1 - EXPECTED_CLV_DROP for j in range(3) ]
             
-            if ENABLE_VALUE_TRAP_FILTER:
-                for j in range(3):
-                    divergence = abs(probs[j] - market_probs[j])
-                    # Umbrales relajados: 15% para súper favoritos, 25% para general
-                    if probs[j] > 0.65 and divergence > 0.15:
-                        evs[j] = -1.0
-                    elif divergence > 0.25:
-                        evs[j] = -1.0
-                        
             league_ev_thresh = EV_THRESHOLDS.get(comp, EV_THRESHOLDS.get('DEFAULT', 0.015))
             league_kelly = KELLY_FRACTIONS.get(comp, KELLY_FRACTIONS.get('DEFAULT', 0.015))
             
@@ -896,7 +877,6 @@ def run_simulation():
         else:
             logger.info("VALIDACIÓN QUANT: Estrategia de bankroll robusta frente a la varianza extrema.")
 
-    # --- NUEVOS DIAGNÓSTICOS QUANT ---
     if placed_bets_history:
         df_bets = pd.DataFrame(placed_bets_history)
         

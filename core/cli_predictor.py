@@ -34,7 +34,7 @@ FINAL_PATH = os.path.join(MODEL_DIR, 'stacker_final_model.pkl')
 
 DATASET_PATH = '../data/processed/matches_with_odds.parquet'
 FALLBACK_DATASET = '../data/processed/matches_dataset.parquet'
-OPTIMIZED_PARAMS_FILE = '../data/processed/optimal_bankroll_params.json'
+OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
 
 def load_data():
     path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
@@ -133,16 +133,25 @@ def main():
     
     kelly_fractions = {}
     ev_thresholds = {}
+    alpha_div_low_dict = {}
+    alpha_div_med_dict = {}
+    alpha_div_high_dict = {}
     if os.path.exists(OPTIMIZED_PARAMS_FILE):
         with open(OPTIMIZED_PARAMS_FILE, 'r') as f:
             data = json.load(f)
             kelly_fractions = data.get('KELLY_FRACTIONS', {})
             ev_thresholds = data.get('EV_THRESHOLDS', {})
+            alpha_div_low_dict = data.get('ALPHA_DIV_LOW', {})
+            alpha_div_med_dict = data.get('ALPHA_DIV_MED', {})
+            alpha_div_high_dict = data.get('ALPHA_DIV_HIGH', {})
             
     league_kelly = kelly_fractions.get(comp, kelly_fractions.get('DEFAULT', 0.015))
     league_ev_thresh = ev_thresholds.get(comp, ev_thresholds.get('DEFAULT', 0.015))
+    league_alpha_low = alpha_div_low_dict.get(comp, alpha_div_low_dict.get('DEFAULT', 0.85))
+    league_alpha_med = alpha_div_med_dict.get(comp, alpha_div_med_dict.get('DEFAULT', 0.70))
+    league_alpha_high = alpha_div_high_dict.get(comp, alpha_div_high_dict.get('DEFAULT', 0.50))
     
-    console.print(f"[dim]Parámetros cargados para la liga {comp}: EV Threshold = {league_ev_thresh:.4f}, Kelly = {league_kelly:.4f}[/dim]")
+    console.print(f"[dim]Parámetros cargados para la liga {comp}: EV Threshold = {league_ev_thresh:.4f}, Kelly = {league_kelly:.4f}, Alphas = [{league_alpha_low:.2f}, {league_alpha_med:.2f}, {league_alpha_high:.2f}][/dim]")
     
     home_stats = get_latest_team_stats(df, home_team)
     away_stats = get_latest_team_stats(df, away_team)
@@ -324,16 +333,32 @@ def main():
     
     # Quant Blending Parámetros
     TAX_RETENTION_RATE = 0.0075
-    MARKET_BLEND_ALPHA = 0.85
     EXPECTED_CLV_DROP = 0.015
     
     market_prob_win = impl_win / margin
     market_prob_draw = impl_draw / margin
     market_prob_loss = impl_loss / margin
     
-    blend_win = (MARKET_BLEND_ALPHA * prob_win) + ((1 - MARKET_BLEND_ALPHA) * market_prob_win)
-    blend_draw = (MARKET_BLEND_ALPHA * prob_draw) + ((1 - MARKET_BLEND_ALPHA) * market_prob_draw)
-    blend_loss = (MARKET_BLEND_ALPHA * prob_loss) + ((1 - MARKET_BLEND_ALPHA) * market_prob_loss)
+    def get_dynamic_alpha(prob, market_prob):
+        divergence = abs(prob - market_prob)
+        if divergence > 0.20:
+            return 0.30
+        elif divergence > 0.15:
+            return 0.50
+        elif divergence > 0.10:
+            return league_alpha_high
+        elif divergence > 0.05:
+            return league_alpha_med
+        else:
+            return league_alpha_low
+
+    alpha_win = get_dynamic_alpha(prob_win, market_prob_win)
+    alpha_draw = get_dynamic_alpha(prob_draw, market_prob_draw)
+    alpha_loss = get_dynamic_alpha(prob_loss, market_prob_loss)
+    
+    blend_win = (alpha_win * prob_win) + ((1 - alpha_win) * market_prob_win)
+    blend_draw = (alpha_draw * prob_draw) + ((1 - alpha_draw) * market_prob_draw)
+    blend_loss = (alpha_loss * prob_loss) + ((1 - alpha_loss) * market_prob_loss)
     
     net_odds_1 = 1 + (odds_1 - 1) * (1 - TAX_RETENTION_RATE)
     net_odds_X = 1 + (odds_X - 1) * (1 - TAX_RETENTION_RATE)
@@ -355,15 +380,19 @@ def main():
     blend_X2 = blend_draw + blend_loss
     ev_X2 = (blend_X2 * net_combined_odds_X2) - 1 - EXPECTED_CLV_DROP
     
-    def calc_kelly_stake(ev, net_odd):
+    def calc_kelly_stake(ev, net_odd, raw_odd):
         b = net_odd - 1
-        return (ev / b) if b > 0 and ev > 0 else 0
+        kelly_ev = min(ev, 0.15)
+        kelly_pct = (kelly_ev / b) if b > 0 and kelly_ev > 0 else 0
+        if raw_odd < 1.30:
+            kelly_pct = min(kelly_pct, 0.01)
+        return kelly_pct
         
-    k_win = calc_kelly_stake(ev_win, net_odds_1)
-    k_draw = calc_kelly_stake(ev_draw, net_odds_X)
-    k_loss = calc_kelly_stake(ev_loss, net_odds_2)
-    k_1X = calc_kelly_stake(ev_1X, net_combined_odds_1X)
-    k_X2 = calc_kelly_stake(ev_X2, net_combined_odds_X2)
+    k_win = calc_kelly_stake(ev_win, net_odds_1, odds_1)
+    k_draw = calc_kelly_stake(ev_draw, net_odds_X, odds_X)
+    k_loss = calc_kelly_stake(ev_loss, net_odds_2, odds_2)
+    k_1X = calc_kelly_stake(ev_1X, net_combined_odds_1X, combined_odds_1X)
+    k_X2 = calc_kelly_stake(ev_X2, net_combined_odds_X2, combined_odds_X2)
     
     console.print("\n[bold]=== ANÁLISIS CUANTITATIVO DEL PARTIDO ===[/bold]")
     console.print(f"[bold cyan]Marcador Esperado Quant (xG):[/bold cyan] {home_team} [bold yellow]{xg_s:.2f} - {xg_c:.2f}[/bold yellow] {away_team}\n")
@@ -405,10 +434,20 @@ def main():
         else:
             selection, k_pct, odds = "Visitante (2)", k_loss * league_kelly, odds_2
             
-        MAX_STAKE_PCT = 0.03
+        MAX_STAKE_PCT = 0.6
         if k_pct > MAX_STAKE_PCT: k_pct = MAX_STAKE_PCT
             
         stake_amount = bankroll * k_pct
+        
+        MAX_BET_LIQUIDITY = {
+            'D1': 2000.0, 'SP1': 2000.0, 'I1': 2000.0, 'G1': 2000.0, 'F1': 2000.0,
+            'D2': 2000.0, 'F2': 2000.0,
+            'T1': 2000.0,
+            'DEFAULT': 2000.0
+        }
+        max_liquidity = MAX_BET_LIQUIDITY.get(comp, MAX_BET_LIQUIDITY.get('DEFAULT', 200.0))
+        if stake_amount > max_liquidity:
+            stake_amount = max_liquidity
         
         if k_pct < 0.001:
             console.print(f"[yellow]Edge > umbral pero Kelly es muy bajo (< 0.1%).[/yellow] -> [bold]PASS / NO BET[/bold]")

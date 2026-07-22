@@ -1,4 +1,9 @@
 import os
+
+import json
+
+RUN_OPTUNA = False
+OPTUNA_TRIALS = 20
 import sys
 import pandas as pd
 import numpy as np
@@ -19,6 +24,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from core.logger_config import get_logger
 
+
+OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_context.json'))
+os.makedirs(os.path.dirname(OPTUNA_PARAMS_FILE), exist_ok=True)
 logger = get_logger(__name__, 'train_context')
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -124,14 +132,31 @@ def train_context():
     
     cv_strategy = get_cv_strategy(n_splits=5)
     
-    logger.info("Optimizando Modelo B (Contexto) con Optuna (100 Trials)...")
-    study = optuna.create_study(direction='minimize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=100)
-    
-    logger.info(f"Mejores parámetros XGBoost Contexto: {study.best_params}")
+    if RUN_OPTUNA:
+        logger.info(f"Optimizando Modelo B (Contexto) con Optuna ({OPTUNA_TRIALS} Trials)...")
+        study = optuna.create_study(direction='minimize')
+        study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=OPTUNA_TRIALS)
+        best_params = study.best_params
+        with open(OPTUNA_PARAMS_FILE, 'w') as f:
+            json.dump(best_params, f, indent=4)
+        logger.info(f"Mejores parámetros guardados en {OPTUNA_PARAMS_FILE}")
+    else:
+        logger.info("Cargando mejores parámetros de Optuna guardados...")
+        if os.path.exists(OPTUNA_PARAMS_FILE):
+            with open(OPTUNA_PARAMS_FILE, 'r') as f:
+                best_params = json.load(f)
+        else:
+            logger.warning(f"Archivo de parámetros {OPTUNA_PARAMS_FILE} no encontrado. Ejecutando Optuna como fallback.")
+            study = optuna.create_study(direction='minimize')
+            study.optimize(lambda trial: objective(trial, X_train, y_train, train_dates, cv_strategy), n_trials=OPTUNA_TRIALS)
+            best_params = study.best_params
+            with open(OPTUNA_PARAMS_FILE, 'w') as f:
+                json.dump(best_params, f, indent=4)
+                
+    logger.info(f"Mejores parámetros XGBoost Contexto: {best_params}")
     
     xgb_best = XGBClassifier(
-        **study.best_params,
+        **best_params,
         objective='multi:softprob',
         num_class=3,
         random_state=42,

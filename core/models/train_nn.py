@@ -1,4 +1,9 @@
 import os
+
+import json
+
+RUN_OPTUNA = False
+OPTUNA_TRIALS = 20
 import sys
 import pandas as pd
 import numpy as np
@@ -25,6 +30,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from core.logger_config import get_logger
 
+
+OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_nn.json'))
+os.makedirs(os.path.dirname(OPTUNA_PARAMS_FILE), exist_ok=True)
 logger = get_logger(__name__, 'train_nn')
 
 
@@ -269,16 +277,31 @@ def train_nn():
             
         return np.mean(fold_losses)
         
-    # Puedes ajustar 'n_trials' aquí si tarda demasiado. 50 es exhaustivo.
-    n_trials = 50 
-    logger.info(f"Iniciando Optuna con {n_trials} trials...")
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-    
-    best_params = study.best_params
-    logger.info(f"Mejores hiperparámetros encontrados por Optuna: {best_params}")
-    logger.info(f"Mejor Log-Loss en validación (3 folds): {study.best_value:.4f}")
+    if RUN_OPTUNA:
+        logger.info(f"Iniciando Optuna con {OPTUNA_TRIALS} trials...")
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=OPTUNA_TRIALS, show_progress_bar=True)
+        best_params = study.best_params
+        logger.info(f"Mejores hiperparámetros encontrados por Optuna: {best_params}")
+        logger.info(f"Mejor Log-Loss en validación (3 folds): {study.best_value:.4f}")
+        with open(OPTUNA_PARAMS_FILE, 'w') as f:
+            json.dump(best_params, f, indent=4)
+    else:
+        logger.info("Cargando mejores parámetros de Optuna guardados...")
+        if os.path.exists(OPTUNA_PARAMS_FILE):
+            with open(OPTUNA_PARAMS_FILE, 'r') as f:
+                best_params = json.load(f)
+            logger.info(f"Mejores hiperparámetros cargados: {best_params}")
+        else:
+            logger.warning(f"Archivo de parámetros {OPTUNA_PARAMS_FILE} no encontrado. Ejecutando Optuna como fallback.")
+            study = optuna.create_study(direction='minimize')
+            study.optimize(objective, n_trials=OPTUNA_TRIALS, show_progress_bar=True)
+            best_params = study.best_params
+            logger.info(f"Mejores hiperparámetros encontrados por Optuna: {best_params}")
+            logger.info(f"Mejor Log-Loss en validación (3 folds): {study.best_value:.4f}")
+            with open(OPTUNA_PARAMS_FILE, 'w') as f:
+                json.dump(best_params, f, indent=4)
     
     # Reconstruir parametros del mejor trial
     best_n_layers = best_params['n_layers']

@@ -1,4 +1,9 @@
 import os
+
+import json
+
+RUN_OPTUNA = False
+OPTUNA_TRIALS = 20
 import sys
 import pandas as pd
 import numpy as np
@@ -20,6 +25,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from core.logger_config import get_logger
 
+
+OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_stacker.json'))
+os.makedirs(os.path.dirname(OPTUNA_PARAMS_FILE), exist_ok=True)
 logger = get_logger(__name__, 'train_stacker')
 
 MODEL_SAVE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../core/save_models'))
@@ -216,15 +224,32 @@ def train_stacker():
         preds = model.predict_proba(X_opt_val)
         return log_loss(y_opt_val, preds)
 
-    study = optuna.create_study(direction='minimize')
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    # n_trials 100 para buscar parámetros óptimos de manera más exhaustiva
-    study.optimize(objective, n_trials=100, timeout=1800)
-    
-    best_params = study.best_params
+    if RUN_OPTUNA:
+        logger.info(f"Iniciando optimización con Optuna ({OPTUNA_TRIALS} trials)...")
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=OPTUNA_TRIALS, timeout=1800)
+        best_params_optuna = study.best_params
+        with open(OPTUNA_PARAMS_FILE, 'w') as f:
+            json.dump(best_params_optuna, f, indent=4)
+        best_params = best_params_optuna.copy()
+    else:
+        logger.info("Cargando mejores parámetros de Optuna guardados...")
+        if os.path.exists(OPTUNA_PARAMS_FILE):
+            with open(OPTUNA_PARAMS_FILE, 'r') as f:
+                best_params = json.load(f)
+        else:
+            logger.warning(f"Archivo de parámetros {OPTUNA_PARAMS_FILE} no encontrado. Ejecutando Optuna como fallback.")
+            study = optuna.create_study(direction='minimize')
+            study.optimize(objective, n_trials=OPTUNA_TRIALS, timeout=1800)
+            best_params_optuna = study.best_params
+            with open(OPTUNA_PARAMS_FILE, 'w') as f:
+                json.dump(best_params_optuna, f, indent=4)
+            best_params = best_params_optuna.copy()
+            
     best_params['categorical_features'] = cat_features
     best_params['random_state'] = 42
-    logger.info(f"Mejores parámetros encontrados por Optuna para Nivel 2: {study.best_params}")
+    logger.info(f"Mejores parámetros encontrados para Nivel 2: {best_params}")
     
     # Entrenar el modelo final de árboles con todos los datos de Train
     base_final_model = HistGradientBoostingClassifier(**best_params)
