@@ -25,7 +25,7 @@ WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0', 'D1', 'D
 # Opciones: 'NONE', 'ALL', 'WHITELIST', o una liga específica como 'I1'
 OPTIMIZATION_MODE = 'NONE'
 OPTUNA_TRIALS = 1000
-OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
+OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'  # <-- NUEVA RUTA: models_best_parameters
 
 # Diccionarios de riesgo por liga iniciales/por defecto
 KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.015}

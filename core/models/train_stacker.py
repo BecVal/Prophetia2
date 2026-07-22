@@ -1,9 +1,5 @@
 import os
-
 import json
-
-RUN_OPTUNA = False
-OPTUNA_TRIALS = 20
 import sys
 import pandas as pd
 import numpy as np
@@ -26,7 +22,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from core.logger_config import get_logger
 
 
-OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_stacker.json'))
+
+# ==============================================================================
+# CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
+# ==============================================================================
+# Cambia RUN_OPTUNA a True si deseas volver a buscar los mejores hiperparámetros.
+# De lo contrario (False), cargará los mejores guardados en el archivo JSON.
+RUN_OPTUNA = False
+OPTUNA_TRIALS = 20
+# ==============================================================================
+
+OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_stacker.json'))  # <-- NUEVA RUTA: models_best_parameters
 os.makedirs(os.path.dirname(OPTUNA_PARAMS_FILE), exist_ok=True)
 logger = get_logger(__name__, 'train_stacker')
 
@@ -111,7 +117,7 @@ def train_stacker():
     logger.info("Cargando predicciones OOF de los modelos base...")
     
     oof_data = {}
-    for mod in ['quant', 'poisson', 'context', 'nn', 'draws', 'market', 'gbm']:
+    for mod in ['quant', 'poisson', 'context', 'nn', 'draws', 'market', 'gbm', 'corners']:
         tr, ts = load_oof(mod, split_idx)
         if tr is not None:
             oof_data[mod] = (tr, ts)
@@ -170,6 +176,8 @@ def train_stacker():
         market_models.append(oof_data['market'])
     if 'gbm' in oof_data:
         market_models.append(oof_data['gbm'])
+    if 'corners' in oof_data:
+        market_models.append(oof_data['corners'])
         
     if market_models:
         mkt_train = pd.concat([m[0] for m in market_models], axis=1)

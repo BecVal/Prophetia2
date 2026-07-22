@@ -34,7 +34,7 @@ FINAL_PATH = os.path.join(MODEL_DIR, 'stacker_final_model.pkl')
 
 DATASET_PATH = '../data/processed/matches_with_odds.parquet'
 FALLBACK_DATASET = '../data/processed/matches_dataset.parquet'
-OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
+OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'  # <-- NUEVA RUTA: models_best_parameters
 
 def load_data():
     path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET

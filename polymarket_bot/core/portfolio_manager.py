@@ -34,7 +34,7 @@ class PortfolioManager:
         self.alpha_div_med = {'DEFAULT': 0.70}
         self.alpha_div_high = {'DEFAULT': 0.50}
         
-        params_file = os.path.join(core_dir, '..', 'data', 'processed', 'models_best_parameters', 'optimal_bankroll_params.json')
+        params_file = os.path.join(core_dir, '..', 'data', 'processed', 'models_best_parameters', 'optimal_bankroll_params.json')  # <-- NUEVA RUTA: models_best_parameters
         if os.path.exists(params_file):
             try:
                 with open(params_file, 'r') as f:

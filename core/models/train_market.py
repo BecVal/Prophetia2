@@ -1,9 +1,5 @@
 import os
-
 import json
-
-RUN_OPTUNA = False
-OPTUNA_TRIALS = 20
 import sys
 import pandas as pd
 import numpy as np
@@ -25,7 +21,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from core.logger_config import get_logger
 
 
-OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_market.json'))
+
+# ==============================================================================
+# CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
+# ==============================================================================
+# Cambia RUN_OPTUNA a True si deseas volver a buscar los mejores hiperparámetros.
+# De lo contrario (False), cargará los mejores guardados en el archivo JSON.
+RUN_OPTUNA = False
+OPTUNA_TRIALS = 20
+# ==============================================================================
+
+OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_market.json'))  # <-- NUEVA RUTA: models_best_parameters
 os.makedirs(os.path.dirname(OPTUNA_PARAMS_FILE), exist_ok=True)
 logger = get_logger(__name__, 'train_market')
 
