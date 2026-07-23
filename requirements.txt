@@ -12,3 +12,6 @@ optuna
 pymc
 pytensor
 arviz
+numpy
+scipy
+torch

@@ -28,13 +28,20 @@ El **Modelo Cuantitativo GBM** extrae la Volatilidad Implícita ($\sigma$) del c
 ### 4. Aprendizaje Profundo (Multi-Layer Perceptron)
 El *Modelo de Contexto* (XGBoost) captura relaciones jerárquicas en la táctica (posesión, xG-Chain, presión, valor de plantilla vía Transfermarkt). Paralelamente, una red neuronal profunda (`PyTorch`) con activación ReLU y Dropout es inyectada en el ensamble para aproximar funciones continuas altamente no-lineales que los particionamientos del espacio de características (árboles) no pueden resolver de manera óptima.
 
-### 5. Meta-Stacking y Rigor Out-Of-Fold (OOF)
-Las predicciones de los modelos base (Poisson, Red Neuronal, GBM, Caza-Empates, Mercado) se ensamblan mediante un *Meta-Modelo HistGradientBoosting* de Nivel 2. 
+### 5. Modelado Estocástico de Mercados Derivados (Córners, Tarjetas y Tiros al Arco)
+Prophetia2 expande su frontera predictiva bidimensional hacia los mercados accesorios mediante regresiones distribucionales enfocadas en variables aleatorias de conteo:
+- **Tiros al Arco (Shots on Goal):** El proceso ensambla un *Perceptrón Multicapa* (MLP) profundo optimizado iterativamente en `PyTorch` (AdamW, Weight Decay y Learning Rate Schedulers) con regresiones múltiples *Ridge* (Norma L2). La matriz topológica inyecta las inferencias algebraicas de Goles Esperados (xG) del modelo Cuantitativo primario como variables latentes exógenas. El mapeo del continuo resultante es sometido a una convolución bivariante de Poisson para derivar las probabilidades intrínsecas de superación de fronteras asimétricas en las líneas Over/Under (ej. $P(X > 4.5)$).
+- **Tiros de Esquina (Corners) y Puntos por Tarjetas (Booking Points):** Tratados algorítmicamente como procesos estocásticos discretos $\mathbb{N}_0$, estos mercados se resuelven mediante el ensamblado paramétrico de árboles de decisión (XGBoost) minimizando la función logarítmica negativa de verosimilitud de Poisson (`poisson-nloglik`). Las funciones de densidad condicionales para múltiples umbrales de cierre en el entorno de casas de apuestas se extraen analíticamente evaluando el complemento de la Función de Distribución Acumulada (CDF): 
+$$ P(X > k) = 1 - \sum_{i=0}^{\lfloor k \rfloor} \frac{e^{-\lambda_T} \lambda_T^i}{i!} $$
+donde $\lambda_T$ es la intensidad esperada global. Posteriormente, la sobredispersión inherente a la varianza deportiva se mitiga aplicando endomorfismos de Calibración Isotónica estrictamente monótonos.
+
+### 6. Meta-Stacking y Rigor Out-Of-Fold (OOF)
+Las predicciones de los modelos base (Poisson, Red Neuronal, GBM, Caza-Empates, Mercado, Córners, Tarjetas, Tiros) se ensamblan mediante un *Meta-Modelo HistGradientBoosting* de Nivel 2, utilizando entropía como metadato exógeno y reduciendo ceguera del consenso general. 
 Para asegurar la validez matemática y evitar *In-Sample Data Leakage* o *Look-Ahead Bias* (es decir, evitar que el modelo aprenda del futuro para predecir el pasado), la matriz de entrenamiento de Nivel 2 se genera utilizando una validación cruzada híbrida:
 - **TimeSeriesSplit** para respetar estrictamente la flecha temporal causal.
-- **L2 Regularization (Ridge)** para evitar que el Stacker confíe ciegamente en un solo modelo.
+- **L2 Regularization (Ridge)** y **K-Fold** segmentado inicial para garantizar ortogonalidad e independencia en las predicciones Out-Of-Fold.
 
-### 6. Calibración Probabilística Isotónica
+### 7. Calibración Probabilística Isotónica
 Las probabilidades brutas de un modelo ensamblado rara vez representan certezas matemáticas. Utilizamos **Calibración Isotónica** no-paramétrica (una regresión por pasos monótona) para mapear las salidas del HGB al espacio real de frecuencias relativas, garantizando que un evento con $P(x)=0.45$ ocurra empíricamente exactamente el 45% de las veces en el largo plazo (Test de Brier Score).
 
 ---

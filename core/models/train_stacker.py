@@ -28,7 +28,7 @@ from core.logger_config import get_logger
 # ==============================================================================
 # Cambia RUN_OPTUNA a True si deseas volver a buscar los mejores hiperparámetros.
 # De lo contrario (False), cargará los mejores guardados en el archivo JSON.
-RUN_OPTUNA = False
+RUN_OPTUNA = True
 OPTUNA_TRIALS = 20
 # ==============================================================================
 
@@ -53,7 +53,14 @@ def load_oof(model_name, split_idx):
     test_path = os.path.join(PROCESSED_DIR, f'oof_{model_name}_test.parquet')
     
     if os.path.exists(train_path) and os.path.exists(test_path):
-        return pd.read_parquet(train_path, engine='fastparquet'), pd.read_parquet(test_path, engine='fastparquet')
+        tr = pd.read_parquet(train_path, engine='fastparquet')
+        ts = pd.read_parquet(test_path, engine='fastparquet')
+        
+        if 'lambda_total' in tr.columns:
+            tr = tr.rename(columns={'lambda_total': f'lambda_total_{model_name}'})
+            ts = ts.rename(columns={'lambda_total': f'lambda_total_{model_name}'})
+            
+        return tr, ts
     else:
         logger.warning(f"OOF para {model_name} no encontrado. Se omitirá.")
         return None, None
@@ -117,7 +124,7 @@ def train_stacker():
     logger.info("Cargando predicciones OOF de los modelos base...")
     
     oof_data = {}
-    for mod in ['quant', 'poisson', 'context', 'nn', 'draws', 'market', 'gbm', 'corners']:
+    for mod in ['quant', 'poisson', 'context', 'nn', 'draws', 'market', 'gbm', 'corners', 'shots', 'cards']:
         tr, ts = load_oof(mod, split_idx)
         if tr is not None:
             oof_data[mod] = (tr, ts)
@@ -178,6 +185,10 @@ def train_stacker():
         market_models.append(oof_data['gbm'])
     if 'corners' in oof_data:
         market_models.append(oof_data['corners'])
+    if 'shots' in oof_data:
+        market_models.append(oof_data['shots'])
+    if 'cards' in oof_data:
+        market_models.append(oof_data['cards'])
         
     if market_models:
         mkt_train = pd.concat([m[0] for m in market_models], axis=1)

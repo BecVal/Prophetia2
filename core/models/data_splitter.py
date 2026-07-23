@@ -7,8 +7,8 @@ logger = logging.getLogger(__name__)
 
 import os
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
-DATASET_PATH = os.path.join(BASE_DIR, 'data/processed/matches_with_odds.parquet')
-FALLBACK_DATASET = os.path.join(BASE_DIR, 'data/processed/matches_dataset.parquet')
+DATASET_PATH = os.path.join(BASE_DIR, 'data/processed/matches_with_referees.parquet')
+FALLBACK_DATASET = os.path.join(BASE_DIR, 'data/processed/matches_with_odds.parquet')
 
 def get_base_dataset():
     """
