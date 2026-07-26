@@ -79,10 +79,11 @@ Prophetia2 consolida millones de filas y peticiones, por lo que demanda un ecosi
    python core/data_adapter.py
    ```
 2. **Ingeniería de Características y Dinámica de Cuotas**:
-   Generación de medias móviles temporales y cruce con Cuotas Institucionales asiáticas sin Vig.
+   Generación de medias móviles temporales, cruce con Cuotas Institucionales asiáticas sin Vig y extracción de métricas de disciplina arbitral.
    ```bash
    python core/feature_engineering.py
    python ingestion/fetch_odds.py
+   python ingestion/fetch_referees.py
    ```
 3. **Entrenamiento de Arquitectura Meta-Stacker**:
    Ejecución controlada y orquestada para los 9 modelos, con garantías de propagación OOF libre de fugas de datos.

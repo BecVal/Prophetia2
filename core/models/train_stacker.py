@@ -7,11 +7,12 @@ import joblib
 import optuna
 from scipy.stats import entropy
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import HistGradientBoostingClassifier
+from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 # Asegurar import de data_splitter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -28,8 +29,8 @@ from core.logger_config import get_logger
 # ==============================================================================
 # Cambia RUN_OPTUNA a True si deseas volver a buscar los mejores hiperparámetros.
 # De lo contrario (False), cargará los mejores guardados en el archivo JSON.
-RUN_OPTUNA = True
-OPTUNA_TRIALS = 20
+RUN_OPTUNA = False
+OPTUNA_TRIALS = 40
 # ==============================================================================
 
 OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_stacker.json'))  # <-- NUEVA RUTA: models_best_parameters
@@ -78,21 +79,17 @@ def compute_meta_features(X_base, df_orig, prefix=""):
     if cols_draw: meta[f'{prefix}std_draw'] = X_base[cols_draw].std(axis=1).fillna(0)
     if cols_win: meta[f'{prefix}std_win'] = X_base[cols_win].std(axis=1).fillna(0)
     
-    # 2. Entropía Media del consenso (Para saber qué tan seguro está el consenso general)
+    # 2. Entropía Media del consenso (Vectorizada para máxima eficiencia)
     mean_probs = pd.DataFrame({
         'loss': X_base[cols_loss].mean(axis=1) if cols_loss else 0,
         'draw': X_base[cols_draw].mean(axis=1) if cols_draw else 0,
         'win': X_base[cols_win].mean(axis=1) if cols_win else 1,
-    })
+    }, index=X_base.index)
     
-    # Normalizar para entropía (por si no suman 1 perfectamente)
-    sums = mean_probs.sum(axis=1)
-    mean_probs = mean_probs.div(np.where(sums > 0, sums, 1), axis=0)
-    
-    def calc_entropy(row):
-        return entropy(row + 1e-9)
-        
-    meta[f'{prefix}entropy'] = mean_probs.apply(calc_entropy, axis=1)
+    sums = mean_probs.sum(axis=1).values[:, None]
+    p = mean_probs.values / np.where(sums > 0, sums, 1.0)
+    p = np.clip(p, 1e-9, 1.0)
+    meta[f'{prefix}entropy'] = -np.sum(p * np.log(p), axis=1)
     
     # 3. Cuotas Implícitas (Contexto de Mercado)
     if 'open_odds_win' in df_orig.columns:
@@ -100,11 +97,12 @@ def compute_meta_features(X_base, df_orig, prefix=""):
         meta['implied_open_draw'] = (1 / df_orig['open_odds_draw'].clip(lower=1.01)).fillna(0)
         meta['implied_open_win'] = (1 / df_orig['open_odds_win'].clip(lower=1.01)).fillna(0)
     
-    # 4. ID de Competición (Para reducir la ceguera)
+    # 4. ID de Competición (Numérico para compatibilidad total)
     if 'competition' in df_orig.columns:
-        meta['competition_id'] = pd.factorize(df_orig['competition'])[0]
+        meta['competition_id'] = df_orig['competition'].astype('category').cat.codes
     else:
         meta['competition_id'] = 0
+
         
     return pd.concat([X_base, meta], axis=1)
 
@@ -151,24 +149,64 @@ def train_stacker():
     X_train_fund = pd.concat(fundamental_train_list, axis=1).fillna(0)
     X_test_fund = pd.concat(fundamental_test_list, axis=1).fillna(0)
     
-    logger.info("Entrenando Stacker Fundamental (Nivel 1)...")
+    logger.info("Entrenando Stacker Fundamental (Nivel 1) con predicciones Out-Of-Fold (sin Data Leakage)...")
     
-    # Eliminamos Isotonic Calibration. Usamos regresión logística simple con L2 moderada (para evitar curvas dentadas)
+    w_train = get_time_weights(train_dates) if train_dates is not None else None
+    
+    # Generar predicciones Out-Of-Fold (OOF) temporales estrictas para el set de Train
+    fund_prob_train = np.zeros((len(X_train_fund), 3))
+    tscv_l1 = TimeSeriesSplit(n_splits=5)
+    l1_splits = list(tscv_l1.split(X_train_fund))
+    
+    # Primer bloque temporal
+    first_idx_l1 = l1_splits[0][0]
+    sub_tscv = TimeSeriesSplit(n_splits=3)
+    for sub_tr, sub_va in sub_tscv.split(X_train_fund.iloc[first_idx_l1]):
+        m_sub = Pipeline([
+            ('scaler', StandardScaler()),
+            ('lr', LogisticRegression(max_iter=1000, random_state=42, C=1.0))
+        ])
+        sub_w = w_train.iloc[first_idx_l1[sub_tr]] if w_train is not None else None
+        m_sub.fit(X_train_fund.iloc[first_idx_l1[sub_tr]], y_train.iloc[first_idx_l1[sub_tr]], lr__sample_weight=sub_w) if sub_w is not None else m_sub.fit(X_train_fund.iloc[first_idx_l1[sub_tr]], y_train.iloc[first_idx_l1[sub_tr]])
+        fund_prob_train[first_idx_l1[sub_va]] = m_sub.predict_proba(X_train_fund.iloc[first_idx_l1[sub_va]])
+        
+    # Filas iniciales previas al primer sub-split
+    unfilled_l1 = (fund_prob_train.sum(axis=1) == 0)
+    if np.any(unfilled_l1):
+        init_m = Pipeline([
+            ('scaler', StandardScaler()),
+            ('lr', LogisticRegression(max_iter=1000, random_state=42, C=1.0))
+        ])
+        init_n = max(50, len(first_idx_l1) // 3)
+        init_w = w_train.iloc[:init_n] if w_train is not None else None
+        init_m.fit(X_train_fund.iloc[:init_n], y_train.iloc[:init_n], lr__sample_weight=init_w) if init_w is not None else init_m.fit(X_train_fund.iloc[:init_n], y_train.iloc[:init_n])
+        fund_prob_train[unfilled_l1] = init_m.predict_proba(X_train_fund.iloc[unfilled_l1])
+        
+    # Bloques temporales 1 a 4
+    for tr_idx, va_idx in l1_splits:
+        m_fold = Pipeline([
+            ('scaler', StandardScaler()),
+            ('lr', LogisticRegression(max_iter=1000, random_state=42, C=1.0))
+        ])
+        fold_w = w_train.iloc[tr_idx] if w_train is not None else None
+        m_fold.fit(X_train_fund.iloc[tr_idx], y_train.iloc[tr_idx], lr__sample_weight=fold_w) if fold_w is not None else m_fold.fit(X_train_fund.iloc[tr_idx], y_train.iloc[tr_idx])
+        fund_prob_train[va_idx] = m_fold.predict_proba(X_train_fund.iloc[va_idx])
+
+    # Normalizar por seguridad
+    fund_prob_train = fund_prob_train / fund_prob_train.sum(axis=1, keepdims=True)
+    
+    # Entrenar pipeline de Nivel 1 final sobre todo Train para predecir Test
     fund_pipeline = Pipeline([
         ('scaler', StandardScaler()),
         ('lr', LogisticRegression(max_iter=1000, random_state=42, C=1.0))
     ])
-    
-    w_train = get_time_weights(train_dates) if train_dates is not None else None
-    
     if w_train is not None:
         fund_pipeline.fit(X_train_fund, y_train, lr__sample_weight=w_train)
     else:
         fund_pipeline.fit(X_train_fund, y_train)
         
-    # Obtener predicciones fundamentales para pasar al Nivel 2
-    fund_prob_train = fund_pipeline.predict_proba(X_train_fund)
     fund_prob_test = fund_pipeline.predict_proba(X_test_fund)
+    fund_prob_test = fund_prob_test / fund_prob_test.sum(axis=1, keepdims=True)
     
     df_fund_train = pd.DataFrame(fund_prob_train, columns=['fund_prob_loss', 'fund_prob_draw', 'fund_prob_win'], index=X_train_fund.index)
     df_fund_test = pd.DataFrame(fund_prob_test, columns=['fund_prob_loss', 'fund_prob_draw', 'fund_prob_win'], index=X_test_fund.index)
@@ -204,13 +242,10 @@ def train_stacker():
     X_train_meta = compute_meta_features(X_train_meta, df_train_orig, prefix="meta_")
     X_test_meta = compute_meta_features(X_test_meta, df_test_orig, prefix="meta_")
     
-    # Determinar columnas categóricas (la competición) para HistGradientBoosting
-    cat_features = [i for i, col in enumerate(X_train_meta.columns) if col == 'competition_id']
-    if not cat_features:
-        cat_features = None
+    # XGBoost maneja categóricas de forma nativa si están como 'category' en pandas
     
     # Optuna para el Nivel 2
-    logger.info("Iniciando optimización con Optuna para el Nivel 2 (HistGradientBoosting)...")
+    logger.info("Iniciando optimización con Optuna para el Nivel 2 (XGBoost GPU)...")
     
     # Creamos un pequeño split temporal de validación para Optuna dentro del Train set (20% más reciente)
     opt_split = int(len(X_train_meta) * 0.8)
@@ -221,26 +256,27 @@ def train_stacker():
     
     def objective(trial):
         params = {
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
-            'max_iter': trial.suggest_int('max_iter', 50, 300),
-            'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 15, 63),
-            'l2_regularization': trial.suggest_float('l2_regularization', 1e-4, 10.0, log=True),
-            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 20, 100),
-            'categorical_features': cat_features,
-            'random_state': 42
+            'n_estimators': trial.suggest_int('n_estimators', 40, 250),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+            'max_depth': trial.suggest_int('max_depth', 2, 5),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 50.0, log=True),
+            'min_child_weight': trial.suggest_int('min_child_weight', 3, 20),
+            'random_state': 42,
+            'device': 'cuda',
+            'tree_method': 'hist',
+            'enable_categorical': True
         }
         
-        model = HistGradientBoostingClassifier(**params)
-        
-        # HistGradientBoosting no acepta sample_weight en fit en algunas versiones via pipeline,
-        # pero sí directamente. Usaremos fit directo.
-        try:
-            model.fit(X_opt_train, y_opt_train, sample_weight=w_opt_train)
-        except TypeError:
-            # Por si la versión de sklearn no soporta sample_weight aquí
-            model.fit(X_opt_train, y_opt_train)
+        base_m = XGBClassifier(**params)
+        calib_m = CalibratedClassifierCV(estimator=base_m, method='sigmoid', cv=5)
+        if w_opt_train is not None:
+            calib_m.fit(X_opt_train, y_opt_train, sample_weight=w_opt_train)
+        else:
+            calib_m.fit(X_opt_train, y_opt_train)
             
-        preds = model.predict_proba(X_opt_val)
+        preds = calib_m.predict_proba(X_opt_val)
         return log_loss(y_opt_val, preds)
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -266,79 +302,58 @@ def train_stacker():
                 json.dump(best_params_optuna, f, indent=4)
             best_params = best_params_optuna.copy()
             
-    best_params['categorical_features'] = cat_features
-    best_params['random_state'] = 42
-    logger.info(f"Mejores parámetros encontrados para Nivel 2: {best_params}")
-    
-    # Entrenar el modelo final de árboles con todos los datos de Train
-    base_final_model = HistGradientBoostingClassifier(**best_params)
-    tscv_final = get_cv_strategy(n_splits=5)
-    final_model = CalibratedClassifierCV(estimator=base_final_model, method='isotonic', cv=tscv_final)
-    try:
-        if w_train is not None:
-            final_model.fit(X_train_meta, y_train, sample_weight=w_train)
-        else:
-            final_model.fit(X_train_meta, y_train)
-    except TypeError:
+    # Registrar la lista exacta de características usadas para ajustar final_model
+    fit_features = X_train_meta.columns.tolist()
+
+    # Entrenar el modelo final de Nivel 2 (Regresión Logística L2 regularizada)
+
+    final_model = Pipeline([
+        ('scaler', StandardScaler()),
+        ('lr', LogisticRegression(max_iter=1000, random_state=42, C=0.1))
+    ])
+    if w_train is not None:
+        final_model.fit(X_train_meta, y_train, lr__sample_weight=w_train)
+    else:
         final_model.fit(X_train_meta, y_train)
         
-    # Evaluación OOF para evitar Data Leakage (In-Sample) y Look-Ahead Bias
-    from sklearn.model_selection import TimeSeriesSplit, KFold
+    # Evaluación OOF estricta temporal (sin KFold shuffle)
     y_prob_train = np.zeros((len(X_train_meta), 3))
-    y_prob_train[:] = np.nan
     
     cv = TimeSeriesSplit(n_splits=5)
     splits = list(cv.split(X_train_meta))
     
-    # 1. Resolver el primer bloque usando K-Fold para tener OOF
+    # 1. Primer bloque temporal usando sub-splits temporales
     first_idx = splits[0][0]
-    X_first, y_first = X_train_meta.iloc[first_idx], y_train.iloc[first_idx]
-    
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    for tr_kf, va_kf in kf.split(X_first):
-        X_tr, y_tr = X_first.iloc[tr_kf], y_first.iloc[tr_kf]
-        X_va = X_first.iloc[va_kf]
+    sub_cv = TimeSeriesSplit(n_splits=3)
+    for sub_tr, sub_va in sub_cv.split(X_train_meta.iloc[first_idx]):
+        X_tr, y_tr = X_train_meta.iloc[first_idx[sub_tr]], y_train.iloc[first_idx[sub_tr]]
+        X_va = X_train_meta.iloc[first_idx[sub_va]]
         
-        if w_train is not None:
-            if isinstance(w_train, pd.Series) or isinstance(w_train, np.ndarray):
-                w_tr = w_train.iloc[first_idx[tr_kf]] if isinstance(w_train, pd.Series) else w_train[first_idx[tr_kf]]
-            else:
-                w_tr = None
-        else:
-            w_tr = None
+        w_tr = w_train.iloc[first_idx[sub_tr]] if w_train is not None else None
             
-        m_base = HistGradientBoostingClassifier(**best_params)
-        tscv_m = get_cv_strategy(n_splits=3)
-        m = CalibratedClassifierCV(estimator=m_base, method='isotonic', cv=tscv_m)
-        try:
-            m.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
-        except TypeError:
-            m.fit(X_tr, y_tr)
-            
-        y_prob_train[first_idx[va_kf]] = m.predict_proba(X_va)
+        m = Pipeline([('scaler', StandardScaler()), ('lr', LogisticRegression(max_iter=1000, random_state=42, C=0.1))])
+        m.fit(X_tr, y_tr, lr__sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
+        y_prob_train[first_idx[sub_va]] = m.predict_proba(X_va)
+
+    unfilled = (y_prob_train.sum(axis=1) == 0)
+    if np.any(unfilled):
+        init_n = max(50, len(first_idx) // 3)
+        X_tr, y_tr = X_train_meta.iloc[:init_n], y_train.iloc[:init_n]
+        w_tr = w_train.iloc[:init_n] if w_train is not None else None
+        m = Pipeline([('scaler', StandardScaler()), ('lr', LogisticRegression(max_iter=1000, random_state=42, C=0.1))])
+        m.fit(X_tr, y_tr, lr__sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
+        y_prob_train[unfilled] = m.predict_proba(X_train_meta.iloc[unfilled])
         
-    # 2. Resolver los demás bloques respetando la flecha del tiempo
+    # 2. Demás bloques respetando la flecha del tiempo
     for tr_idx, va_idx in splits:
         X_tr, y_tr = X_train_meta.iloc[tr_idx], y_train.iloc[tr_idx]
         X_va = X_train_meta.iloc[va_idx]
-        
-        if w_train is not None:
-            if isinstance(w_train, pd.Series) or isinstance(w_train, np.ndarray):
-                w_tr = w_train.iloc[tr_idx] if isinstance(w_train, pd.Series) else w_train[tr_idx]
-            else:
-                w_tr = None
-        else:
-            w_tr = None
+        w_tr = w_train.iloc[tr_idx] if w_train is not None else None
             
-        m_base = HistGradientBoostingClassifier(**best_params)
-        tscv_m = get_cv_strategy(n_splits=3)
-        m = CalibratedClassifierCV(estimator=m_base, method='isotonic', cv=tscv_m)
-        try:
-            m.fit(X_tr, y_tr, sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
-        except TypeError:
-            m.fit(X_tr, y_tr)
-            
+        m = Pipeline([('scaler', StandardScaler()), ('lr', LogisticRegression(max_iter=1000, random_state=42, C=0.1))])
+        m.fit(X_tr, y_tr, lr__sample_weight=w_tr) if w_tr is not None else m.fit(X_tr, y_tr)
         y_prob_train[va_idx] = m.predict_proba(X_va)
+
         
     y_prob_train = y_prob_train / y_prob_train.sum(axis=1, keepdims=True)
     
@@ -438,8 +453,8 @@ def train_stacker():
     X_train_meta.to_parquet(os.path.join(PROCESSED_DIR, 'X_train.parquet'), engine='fastparquet')
     X_test_meta.to_parquet(os.path.join(PROCESSED_DIR, 'X_test.parquet'), engine='fastparquet')
     
-    joblib.dump({'model': final_model, 'features': X_train_meta.columns.tolist()}, MODEL_SAVE_PATH_FINAL)
-    logger.info(f"Modelo Stacker Final (HGB) guardado en {MODEL_SAVE_PATH_FINAL}")
+    joblib.dump({'model': final_model, 'features': fit_features}, MODEL_SAVE_PATH_FINAL)
+    logger.info(f"Modelo Stacker Final (XGBoost GPU) guardado en {MODEL_SAVE_PATH_FINAL}")
 
 if __name__ == "__main__":
     train_stacker()

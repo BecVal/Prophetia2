@@ -35,13 +35,13 @@ if __name__ == "__main__":
         "models/train_context.py",
         "models/train_nn.py",
         "models/train_draws.py",
-        "models/train_market.py",
-        "models/train_gbm_model.py",
+        "market_models/train_market.py",
+        "market_models/train_gbm_model.py",
         "models/train_corners_model.py",
         "models/train_shots_on_goal.py",
         "models/train_cards_model.py",
         "models/train_stacker.py",
-        "train_clv_model.py"
+        "market_models/train_clv_model.py"
     ]
     
     for script in scripts:

@@ -20,8 +20,6 @@ class ProphetiaPredictor:
     def __init__(self, core_dir):
         self.core_dir = core_dir
         self.core_save_dir = os.path.join(core_dir, 'save_models')
-        self.root_save_dir = os.path.join(core_dir, '..', 'save_models')
-            
         # 1. Modelos Base (Fundamentales)
         self.poisson_data = joblib.load(os.path.join(self.core_save_dir, 'poisson_model.pkl'))
         self.context_data = joblib.load(os.path.join(self.core_save_dir, 'context_model.pkl'))
@@ -35,9 +33,9 @@ class ProphetiaPredictor:
         self.stacker_final_data = joblib.load(os.path.join(self.core_save_dir, 'stacker_final_model.pkl'))
         
         # 4. CLV Models (guardados en root/save_models por train_clv_model.py)
-        self.clv_win_data = joblib.load(os.path.join(self.root_save_dir, 'clv_model_win.pkl'))
-        self.clv_draw_data = joblib.load(os.path.join(self.root_save_dir, 'clv_model_draw.pkl'))
-        self.clv_loss_data = joblib.load(os.path.join(self.root_save_dir, 'clv_model_loss.pkl'))
+        self.clv_win_data = joblib.load(os.path.join(self.core_save_dir, 'clv_model_win.pkl'))
+        self.clv_draw_data = joblib.load(os.path.join(self.core_save_dir, 'clv_model_draw.pkl'))
+        self.clv_loss_data = joblib.load(os.path.join(self.core_save_dir, 'clv_model_loss.pkl'))
         
         self.dataset_path = os.path.join(core_dir, '..', 'data', 'processed', 'matches_with_odds.parquet')
         self._load_data()
@@ -268,16 +266,22 @@ class ProphetiaPredictor:
         prob_loss, prob_draw, prob_win = final_probs / np.sum(final_probs)
         
         # --- LAYER 5: CLV MODEL ---
-        # Features: Todas las de df_final + prob_loss/draw/win + open_divergence_loss/draw/win
-        clv_input = final_input.copy()
-        clv_input.update({
-            'prob_loss': prob_loss,
-            'prob_draw': prob_draw,
-            'prob_win': prob_win,
-            'open_divergence_loss': np.log(np.clip(prob_loss / po_l, 1e-6, 1e6)),
-            'open_divergence_draw': np.log(np.clip(prob_draw / po_d, 1e-6, 1e6)),
-            'open_divergence_win': np.log(np.clip(prob_win / po_w, 1e-6, 1e6))
-        })
+        # Features: fund_prob, open_implied, edge_log, edge_diff, competition_id
+        clv_input = {
+            'fund_prob_loss': fund_prob_loss,
+            'fund_prob_draw': fund_prob_draw,
+            'fund_prob_win': fund_prob_win,
+            'open_implied_loss': 1 / max(open_odds_2, 1.01),
+            'open_implied_draw': 1 / max(open_odds_X, 1.01),
+            'open_implied_win': 1 / max(open_odds_1, 1.01),
+            'edge_log_loss': np.log(np.clip(fund_prob_loss / po_l, 1e-6, 1e6)),
+            'edge_log_draw': np.log(np.clip(fund_prob_draw / po_d, 1e-6, 1e6)),
+            'edge_log_win': np.log(np.clip(fund_prob_win / po_w, 1e-6, 1e6)),
+            'edge_diff_loss': fund_prob_loss - po_l,
+            'edge_diff_draw': fund_prob_draw - po_d,
+            'edge_diff_win': fund_prob_win - po_w,
+            'competition_id': comp_id
+        }
         
         df_clv = pd.DataFrame([clv_input])[self.clv_win_data['features']]
         

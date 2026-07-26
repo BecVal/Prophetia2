@@ -24,7 +24,8 @@ def get_base_dataset():
 
     if 'match_date' in df.columns:
         logger.info("Ordenando el dataset cronológicamente para evitar Data Leakage...")
-        df = df.sort_values('match_date').reset_index(drop=True)
+        sort_cols = ['match_date', 'match_id'] if 'match_id' in df.columns else ['match_date']
+        df = df.sort_values(sort_cols).reset_index(drop=True)
     else:
         logger.warning("No se encontró columna 'match_date'. Posible Data Leakage.")
 
