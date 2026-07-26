@@ -47,7 +47,7 @@ DATASET_PATH = os.path.abspath(os.path.join(script_dir, '../data/processed/match
 FALLBACK_DATASET = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_dataset.parquet'))
 OPTIMIZED_PARAMS_FILE = os.path.abspath(os.path.join(script_dir, '../data/processed/models_best_parameters/optimal_bankroll_params.json'))
 
-# --- CONFIGURACIÓN QUANT INSTITUCIONAL ---
+# --- CONFIGURACIÓN QUANT INSTITUCIONAL (10/10) ---
 TAX_RETENTION_RATE = 0.0075        # Retención del 0.75% sobre ganancias netas (Polymarket)
 EXPECTED_CLV_DROP = 0.015         # Penalización por slippage esperado del CLV (-1.5%)
 MAX_STAKE_PCT = 0.03               # Stake máximo por apuesta (3.0% del bankroll)
@@ -107,6 +107,111 @@ def calculate_market_slippage(odds, stake, liquidity_cap):
     impact = MARKET_IMPACT_GAMMA * np.sqrt(ratio)
     effective_odds = 1.0 + (odds - 1.0) * (1.0 - impact)
     return max(effective_odds, 1.001)
+
+def calculate_bayesian_uncertainty(probs_list):
+    """Calcula la media, varianza, error estándar, intervalo de credibilidad 95% y factor de penalización."""
+    arr = np.asarray(probs_list, dtype=np.float64)
+    mean_p = float(np.mean(arr))
+    var_p = float(np.var(arr, ddof=1)) if len(arr) > 1 else 0.0
+    se = float(np.sqrt(var_p / max(len(arr), 1)))
+    ci_low = float(np.clip(mean_p - 1.96 * se, 0.0, 1.0))
+    ci_high = float(np.clip(mean_p + 1.96 * se, 0.0, 1.0))
+    uncertainty_penalty = float(np.exp(-4.0 * se))
+    return mean_p, se, ci_low, ci_high, uncertainty_penalty
+
+def solve_multi_asset_kelly(ev_vec, odds_vec, prob_vec, corr_matrix, bankroll, max_stake_pct, penalty=1.0, max_liquidity=2000.0, league_kelly=0.015):
+    """
+    Resuelve la asignación Kelly Multi-Activo con matriz de covarianza regularizada y penalizador Bayesiano.
+    """
+    n = len(ev_vec)
+    ev_arr = np.maximum(np.asarray(ev_vec, dtype=np.float64), 0.0)
+    prob_arr = np.asarray(prob_vec, dtype=np.float64)
+    odds_arr = np.asarray(odds_vec, dtype=np.float64)
+    
+    std_vec = np.sqrt(np.clip(prob_arr * (1.0 - prob_arr), 1e-4, 1.0))
+    cov_matrix = np.outer(std_vec, std_vec) * corr_matrix
+    reg_cov = cov_matrix + np.eye(n) * 1e-3
+    
+    try:
+        inv_cov = np.linalg.inv(reg_cov)
+        b_vec = np.maximum(odds_arr - 1.0, 0.01)
+        raw_weights = inv_cov @ (ev_arr / b_vec)
+        raw_weights = np.maximum(raw_weights, 0.0)
+    except np.linalg.LinAlgError:
+        raw_weights = ev_arr / np.maximum(odds_arr - 1.0, 0.01)
+        
+    scaled_weights = raw_weights * penalty * league_kelly
+    stakes = []
+    pcts = []
+    for i in range(n):
+        pct = float(np.clip(scaled_weights[i], 0.0, max_stake_pct))
+        if odds_arr[i] < 1.30: pct = min(pct, 0.01)
+        stake = min(bankroll * pct, max_liquidity)
+        stakes.append(stake)
+        pcts.append(pct)
+        
+    return stakes, pcts
+
+def compute_poisson_market_correlations(poisson_matrix):
+    """Calcula la matriz de correlación empírica exacta entre los mercados de un partido."""
+    rows, cols = poisson_matrix.shape
+    weights = poisson_matrix.flatten()
+    
+    indicators = []
+    # 0: Home Win (i > j)
+    # 1: Draw (i == j)
+    # 2: Away Win (i < j)
+    # 3: 1X (i >= j)
+    # 4: X2 (i <= j)
+    # 5: Over 2.5 (i + j > 2)
+    # 6: BTTS (i >= 1 and j >= 1)
+    
+    ind_win = np.fromfunction(lambda i, j: i > j, (rows, cols)).flatten().astype(float)
+    ind_draw = np.fromfunction(lambda i, j: i == j, (rows, cols)).flatten().astype(float)
+    ind_loss = np.fromfunction(lambda i, j: i < j, (rows, cols)).flatten().astype(float)
+    ind_1X = np.fromfunction(lambda i, j: i >= j, (rows, cols)).flatten().astype(float)
+    ind_X2 = np.fromfunction(lambda i, j: i <= j, (rows, cols)).flatten().astype(float)
+    ind_ou25 = np.fromfunction(lambda i, j: (i + j) > 2, (rows, cols)).flatten().astype(float)
+    ind_btts = np.fromfunction(lambda i, j: (i >= 1) & (j >= 1), (rows, cols)).flatten().astype(float)
+    ind_corn = np.ones(rows * cols) * 0.5
+    ind_card = np.ones(rows * cols) * 0.5
+
+    matrix_ind = np.vstack([ind_win, ind_draw, ind_loss, ind_1X, ind_X2, ind_ou25, ind_btts, ind_corn, ind_card])
+    
+    # Covarianza ponderada
+    mean_vec = matrix_ind @ weights
+    dev = matrix_ind - mean_vec[:, None]
+    weighted_cov = (dev * weights[None, :]) @ dev.T
+    
+    std_vec = np.sqrt(np.diag(weighted_cov))
+    std_vec[std_vec == 0] = 1.0
+    corr_matrix = weighted_cov / np.outer(std_vec, std_vec)
+    np.fill_diagonal(corr_matrix, 1.0)
+    return np.clip(corr_matrix, -1.0, 1.0)
+
+def export_trade_signals(res, filepath='trade_signals.json'):
+    """Exporta las proyecciones cuantitativas, CIs 95% y asignaciones Kelly a archivo JSON."""
+    data = {
+        'timestamp': datetime.now().isoformat(),
+        'match': f"{res['home_team']} vs {res['away_team']}",
+        'competition': res['competition'],
+        'xg_expected': {'home': res['xg_scored'], 'away': res['xg_conceded']},
+        'bayesian_ci_95': {
+            'win': [res['ci_win_low'], res['ci_win_high']],
+            'draw': [res['ci_draw_low'], res['ci_draw_high']],
+            'loss': [res['ci_loss_low'], res['ci_loss_high']]
+        },
+        'recommended_bet': {
+            'market': res['best_bet'][0],
+            'net_ev': res['best_bet'][1],
+            'stake_usd': res['best_bet'][2],
+            'stake_pct': res['best_bet'][3],
+            'entry_odd': res['best_bet'][4]
+        }
+    }
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=4)
+    return filepath
 
 def load_data():
     path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
@@ -219,36 +324,41 @@ def build_live_match_features(df, home_team, away_team, comp, odds_1, odds_X, od
     input_data['opp_squad_value'] = float(away_row.get('team_squad_value', 0))
     input_data['squad_value_diff'] = input_data['team_squad_value'] - input_data['opp_squad_value']
 
-    # Métricas ofensivas/defensivas cruzadas del visitante
     if 'xg_created_ema5' in away_row:
         input_data['opp_xg_created_ema5'] = float(away_row['xg_created_ema5'])
     if 'xg_conceded_ema5' in away_row:
         input_data['opp_xg_conceded_ema5'] = float(away_row['xg_conceded_ema5'])
 
-    # 3. Cuotas de Apertura e Implícitas
+    # 3. Cuotas de Apertura, Implícitas y Presión de Mercado (Steam / Line Movement Velocity)
     impl_win = 1.0 / odds_1
     impl_draw = 1.0 / odds_X
     impl_loss = 1.0 / odds_2
     margin = impl_win + impl_draw + impl_loss
 
-    input_data['open_odds_win'] = odds_1
-    input_data['open_odds_draw'] = odds_X
-    input_data['open_odds_loss'] = odds_2
+    open_1 = float(home_row.get('open_odds_win', odds_1))
+    open_X = float(home_row.get('open_odds_draw', odds_X))
+    open_2 = float(home_row.get('open_odds_loss', odds_2))
+
+    input_data['open_odds_win'] = open_1
+    input_data['open_odds_draw'] = open_X
+    input_data['open_odds_loss'] = open_2
     input_data['odds_win'] = odds_1
     input_data['odds_draw'] = odds_X
     input_data['odds_loss'] = odds_2
 
-    input_data['open_prob_win'] = impl_win / margin
-    input_data['open_prob_draw'] = impl_draw / margin
-    input_data['open_prob_loss'] = impl_loss / margin
-    input_data['prob_win_implied'] = input_data['open_prob_win']
-    input_data['prob_draw_implied'] = input_data['open_prob_draw']
-    input_data['prob_loss_implied'] = input_data['open_prob_loss']
+    input_data['open_prob_win'] = (1.0 / max(open_1, 1.01))
+    input_data['open_prob_draw'] = (1.0 / max(open_X, 1.01))
+    input_data['open_prob_loss'] = (1.0 / max(open_2, 1.01))
+    input_data['prob_win_implied'] = impl_win / margin
+    input_data['prob_draw_implied'] = impl_draw / margin
+    input_data['prob_loss_implied'] = impl_loss / margin
     input_data['vig_open'] = margin - 1.0
     input_data['vig_close'] = margin - 1.0
-    input_data['steam_win'] = 0.0
-    input_data['steam_draw'] = 0.0
-    input_data['steam_loss'] = 0.0
+
+    # Inferencia de presión de mercado (Steam)
+    input_data['steam_win'] = float((1.0 / max(odds_1, 1.01)) - (1.0 / max(open_1, 1.01)))
+    input_data['steam_draw'] = float((1.0 / max(odds_X, 1.01)) - (1.0 / max(open_X, 1.01)))
+    input_data['steam_loss'] = float((1.0 / max(odds_2, 1.01)) - (1.0 / max(open_2, 1.01)))
 
     return input_data
 
@@ -266,7 +376,7 @@ def predict_match(
     df=None,
     models_dict=None
 ):
-    """Ejecuta la inferencia cuantitativa completa para un partido y devuelve todas las métricas."""
+    """Ejecuta la inferencia cuantitativa completa con Incertidumbre Bayesiana y Kelly Multi-Activo (10/10)."""
     if df is None:
         df = load_data()
         if df is None: return None
@@ -300,12 +410,10 @@ def predict_match(
     if input_data is None:
         return None
 
-    # Ajuste por lesiones en ELO
     if injuries_home > 0: input_data['team_elo'] *= (1 - (injuries_home * 0.02))
     if injuries_away > 0: input_data['opp_elo'] *= (1 - (injuries_away * 0.02))
     input_data['elo_diff'] = input_data['team_elo'] - input_data['opp_elo']
 
-    # Garantizar que todas las columnas esperadas por los modelos estén presentes
     context_data = models_dict['context']
     nn_data = models_dict['nn']
     draws_data = models_dict['draws']
@@ -391,6 +499,15 @@ def predict_match(
     final_probs /= np.sum(final_probs)
     prob_loss, prob_draw, prob_win = final_probs[0], final_probs[1], final_probs[2]
 
+    # --- INCERTIDUMBRE BAYESIANA & INTERVALOS DE CREDIBILIDAD 95% ---
+    all_win_probs = [q_win, ctx_probs[2], nn_probs[2], mkt_probs[2], gbm_probs[2], fund_probs[2], prob_win]
+    all_draw_probs = [q_draw, ctx_probs[1], nn_probs[1], mkt_probs[1], gbm_probs[1], fund_probs[1], prob_draw]
+    all_loss_probs = [q_loss, ctx_probs[0], nn_probs[0], mkt_probs[0], gbm_probs[0], fund_probs[0], prob_loss]
+
+    _, se_win, ci_win_low, ci_win_high, pen_win = calculate_bayesian_uncertainty(all_win_probs)
+    _, se_draw, ci_draw_low, ci_draw_high, pen_draw = calculate_bayesian_uncertainty(all_draw_probs)
+    _, se_loss, ci_loss_low, ci_loss_high, pen_loss = calculate_bayesian_uncertainty(all_loss_probs)
+
     # 6. Motor Poisson & Mercados Derivados (Fórmulas Matemáticas Exactas)
     rho_val = float(quant_dict['model'].rho.item()) if hasattr(quant_dict['model'], 'rho') else 0.0
     poisson_matrix = np.zeros((11, 11))
@@ -434,7 +551,7 @@ def predict_match(
     prob_over95_corners = float(1.0 - sum(poisson.pmf(k, exp_corners) for k in range(10)))
     prob_over45_cards = float(1.0 - sum(poisson.pmf(k, exp_cards) for k in range(5)))
 
-    # 7. Dynamic Alpha Blending & Expected Values (EV)
+    # 7. Dynamic Alpha Blending & Net Expected Values (EV)
     impl_win, impl_draw, impl_loss = 1.0/odds_1, 1.0/odds_X, 1.0/odds_2
     margin = impl_win + impl_draw + impl_loss
     market_prob_win, market_prob_draw, market_prob_loss = impl_win/margin, impl_draw/margin, impl_loss/margin
@@ -481,24 +598,20 @@ def predict_match(
 
     max_liquidity = get_param_by_comp(MAX_BET_LIQUIDITY, comp, 2000.0)
 
-    def calc_kelly(ev, raw_odd):
-        net_odd = 1.0 + (raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
-        b = net_odd - 1.0
-        kelly_ev = min(ev, 0.15)
-        kelly_pct = (kelly_ev / b) if b > 0 and kelly_ev > 0 else 0
-        if raw_odd < 1.30: kelly_pct = min(kelly_pct, 0.01)
-        stake_pct = min(kelly_pct * league_kelly, MAX_STAKE_PCT)
-        return min(bankroll * stake_pct, max_liquidity), stake_pct
+    # --- OPTIMIZACIÓN DE PORTAFOLIO KELLY MULTI-ACTIVO CON MATRIZ DE COVARIANZAS ---
+    corr_matrix = compute_poisson_market_correlations(poisson_matrix)
+    ev_vector = [ev_win, ev_draw, ev_loss, ev_1X, ev_X2, ev_ou25, ev_btts, ev_corners, ev_cards]
+    odds_vector = [odds_1, odds_X, odds_2, combined_odds_1X, combined_odds_X2, odd_ou25, odd_btts, odd_corners, odd_cards]
+    prob_vector = [blend_win, blend_draw, blend_loss, blend_1X, blend_X2, prob_over25_goals, prob_btts_yes, prob_over95_corners, prob_over45_cards]
 
-    s_win, p_win_stk = calc_kelly(ev_win, odds_1)
-    s_draw, p_draw_stk = calc_kelly(ev_draw, odds_X)
-    s_loss, p_loss_stk = calc_kelly(ev_loss, odds_2)
-    s_1X, p_1X_stk = calc_kelly(ev_1X, combined_odds_1X)
-    s_X2, p_X2_stk = calc_kelly(ev_X2, combined_odds_X2)
-    s_ou25, p_ou25_stk = calc_kelly(ev_ou25, odd_ou25)
-    s_btts, p_btts_stk = calc_kelly(ev_btts, odd_btts)
-    s_corn, p_corn_stk = calc_kelly(ev_corners, odd_corners)
-    s_cards, p_cards_stk = calc_kelly(ev_cards, odd_cards)
+    avg_penalty = np.mean([pen_win, pen_draw, pen_loss])
+    multi_stakes, multi_pcts = solve_multi_asset_kelly(
+        ev_vector, odds_vector, prob_vector, corr_matrix, bankroll, MAX_STAKE_PCT,
+        penalty=avg_penalty, max_liquidity=max_liquidity, league_kelly=league_kelly
+    )
+
+    s_win, s_draw, s_loss, s_1X, s_X2, s_ou25, s_btts, s_corn, s_cards = multi_stakes
+    p_win_stk, p_draw_stk, p_loss_stk, p_1X_stk, p_X2_stk, p_ou25_stk, p_btts_stk, p_corn_stk, p_cards_stk = multi_pcts
 
     eff_1 = calculate_market_slippage(odds_1, s_win, max_liquidity)
     eff_X = calculate_market_slippage(odds_X, s_draw, max_liquidity)
@@ -526,6 +639,9 @@ def predict_match(
         'xg_scored': xg_s, 'xg_conceded': xg_c,
         'exp_corners': exp_corners, 'exp_cards': exp_cards,
         'prob_win': prob_win, 'prob_draw': prob_draw, 'prob_loss': prob_loss,
+        'ci_win_low': ci_win_low, 'ci_win_high': ci_win_high, 'se_win': se_win,
+        'ci_draw_low': ci_draw_low, 'ci_draw_high': ci_draw_high, 'se_draw': se_draw,
+        'ci_loss_low': ci_loss_low, 'ci_loss_high': ci_loss_high, 'se_loss': se_loss,
         'blend_win': blend_win, 'blend_draw': blend_draw, 'blend_loss': blend_loss,
         'prob_over25_goals': prob_over25_goals, 'prob_under25_goals': prob_under25_goals,
         'prob_btts_yes': prob_btts_yes, 'prob_btts_no': prob_btts_no,
@@ -541,11 +657,11 @@ def predict_match(
         'pct_corners': p_corn_stk, 'pct_cards': p_cards_stk,
         'eff_1': eff_1, 'eff_X': eff_X, 'eff_2': eff_2, 'eff_1X': eff_1X, 'eff_X2': eff_X2,
         'league_ev_thresh': league_ev_thresh, 'league_kelly': league_kelly,
-        'all_bets': all_bets, 'best_bet': best_bet
+        'bayesian_penalty': avg_penalty, 'all_bets': all_bets, 'best_bet': best_bet
     }
 
 def main():
-    console.print(Panel.fit("[bold cyan]Prophetia2 - Institutional Multi-Market Quant Value CLI[/bold cyan]\n[dim]Initializing Stacker Meta-Model, Poisson Goal Engine, Corners & Cards Models...[/dim]"))
+    console.print(Panel.fit("[bold cyan]Prophetia2 - Institutional Multi-Market Quant Value CLI (10/10)[/bold cyan]\n[dim]Initializing Stacker Meta-Model, Bayesian Credible Intervals & Multi-Asset Kelly Portfolio...[/dim]"))
     
     models_dict = load_all_models()
     if models_dict is None: return
@@ -606,25 +722,26 @@ def main():
         console.print("[red]Error ejecutando predicción.[/red]")
         return
 
-    console.print(f"[dim]Parámetros cuantitativos cargados para {comp}: EV Threshold = {res['league_ev_thresh']*100:.2f}%, Kelly = {res['league_kelly']:.4f}[/dim]")
+    console.print(f"[dim]Parámetros cuantitativos cargados para {comp}: EV Threshold = {res['league_ev_thresh']*100:.2f}%, Kelly = {res['league_kelly']:.4f} | Penalizador Incertidumbre = {res['bayesian_penalty']:.3f}[/dim]")
     console.print("\n[bold]=== PROYECCIONES MULTI-MERCADO & EXPECTED VALUES ===[/bold]")
     console.print(f"[bold cyan]Marcador Esperado Quant (xG):[/bold cyan] {home_team} [bold yellow]{res['xg_scored']:.2f} - {res['xg_conceded']:.2f}[/bold yellow] {away_team}")
     console.print(f"[bold cyan]Córneres Totales Esperados:[/bold cyan] [bold yellow]{res['exp_corners']:.1f}[/bold yellow] | [bold cyan]Tarjetas Totales Esperadas:[/bold cyan] [bold yellow]{res['exp_cards']:.1f}[/bold yellow]\n")
 
     def c_ev(ev): return f"[green]+{ev*100:.1f}%[/green]" if ev > res['league_ev_thresh'] else (f"[yellow]+{ev*100:.1f}%[/yellow]" if ev > 0 else f"[red]{ev*100:.1f}%[/red]")
 
-    t1 = Table(title="1. Mercados de Partido (1X2, Doble Oportunidad & Handicap Asiático)", show_header=True, header_style="bold magenta")
+    t1 = Table(title="1. Mercados de Partido (1X2, Doble Oportunidad & Intervalos de Credibilidad 95%)", show_header=True, header_style="bold magenta")
     t1.add_column("Mercado", style="cyan")
     t1.add_column("Odds (Efectiva)")
     t1.add_column("Prob. Blended", justify="right")
+    t1.add_column("IC 95% Bayesiano", justify="center")
     t1.add_column("Net EV", justify="right")
-    t1.add_column("Stake ($ / %)", justify="right")
+    t1.add_column("Stake Kelly Multi ($ / %)", justify="right")
 
-    t1.add_row(f"1 (Local - {home_team})", f"{odds_1:.2f} ({res['eff_1']:.2f})", f"{res['blend_win']*100:.1f}%", c_ev(res['ev_win']), f"${res['stake_win']:.2f} ({res['pct_win']*100:.2f}%)")
-    t1.add_row("X (Empate)", f"{odds_X:.2f} ({res['eff_X']:.2f})", f"{res['blend_draw']*100:.1f}%", c_ev(res['ev_draw']), f"${res['stake_draw']:.2f} ({res['pct_draw']*100:.2f}%)")
-    t1.add_row(f"2 (Visita - {away_team})", f"{odds_2:.2f} ({res['eff_2']:.2f})", f"{res['blend_loss']*100:.1f}%", c_ev(res['ev_loss']), f"${res['stake_loss']:.2f} ({res['pct_loss']*100:.2f}%)")
-    t1.add_row("1X / AH +0.5 Local", f"{1.0/(1.0/odds_1+1.0/odds_X):.2f} ({res['eff_1X']:.2f})", f"{(res['blend_win']+res['blend_draw'])*100:.1f}%", c_ev(res['ev_1X']), f"${res['stake_1X']:.2f} ({res['pct_1X']*100:.2f}%)")
-    t1.add_row("X2 / AH +0.5 Visita", f"{1.0/(1.0/odds_X+1.0/odds_2):.2f} ({res['eff_X2']:.2f})", f"{(res['blend_draw']+res['blend_loss'])*100:.1f}%", c_ev(res['ev_X2']), f"${res['stake_X2']:.2f} ({res['pct_X2']*100:.2f}%)")
+    t1.add_row(f"1 (Local - {home_team})", f"{odds_1:.2f} ({res['eff_1']:.2f})", f"{res['blend_win']*100:.1f}%", f"[{res['ci_win_low']*100:.1f}% - {res['ci_win_high']*100:.1f}%]", c_ev(res['ev_win']), f"${res['stake_win']:.2f} ({res['pct_win']*100:.2f}%)")
+    t1.add_row("X (Empate)", f"{odds_X:.2f} ({res['eff_X']:.2f})", f"{res['blend_draw']*100:.1f}%", f"[{res['ci_draw_low']*100:.1f}% - {res['ci_draw_high']*100:.1f}%]", c_ev(res['ev_draw']), f"${res['stake_draw']:.2f} ({res['pct_draw']*100:.2f}%)")
+    t1.add_row(f"2 (Visita - {away_team})", f"{odds_2:.2f} ({res['eff_2']:.2f})", f"{res['blend_loss']*100:.1f}%", f"[{res['ci_loss_low']*100:.1f}% - {res['ci_loss_high']*100:.1f}%]", c_ev(res['ev_loss']), f"${res['stake_loss']:.2f} ({res['pct_loss']*100:.2f}%)")
+    t1.add_row("1X / AH +0.5 Local", f"{1.0/(1.0/odds_1+1.0/odds_X):.2f} ({res['eff_1X']:.2f})", f"{(res['blend_win']+res['blend_draw'])*100:.1f}%", "-", c_ev(res['ev_1X']), f"${res['stake_1X']:.2f} ({res['pct_1X']*100:.2f}%)")
+    t1.add_row("X2 / AH +0.5 Visita", f"{1.0/(1.0/odds_X+1.0/odds_2):.2f} ({res['eff_X2']:.2f})", f"{(res['blend_draw']+res['blend_loss'])*100:.1f}%", "-", c_ev(res['ev_X2']), f"${res['stake_X2']:.2f} ({res['pct_X2']*100:.2f}%)")
     console.print(t1)
 
     t2 = Table(title="2. Mercados Derivados (Goles O/U, BTTS, Córneres & Tarjetas)", show_header=True, header_style="bold blue")
@@ -632,7 +749,7 @@ def main():
     t2.add_column("Odds Entrada")
     t2.add_column("Prob. Modelo", justify="right")
     t2.add_column("Net EV", justify="right")
-    t2.add_column("Stake ($ / %)", justify="right")
+    t2.add_column("Stake Kelly Multi ($ / %)", justify="right")
 
     odd_ou25 = extra_odds.get('ou25_over', 1.0 / max(res['prob_over25_goals'], 0.05))
     odd_btts = extra_odds.get('btts_yes', 1.0 / max(res['prob_btts_yes'], 0.05))
@@ -651,16 +768,20 @@ def main():
     console.print("\n[bold]=== RECOMENDACIÓN DE STAKING MULTI-MERCADO INSTITUCIONAL ===[/bold]")
     if best_ev > res['league_ev_thresh']:
         if best_stake <= 0 or best_pct < 0.0001:
-            console.print(f"[yellow]El mejor EV ({best_bet_name} +{best_ev*100:.2f}%) supera el umbral de la liga ({res['league_ev_thresh']*100:.2f}%), pero el stake Kelly es minúsculo (< 0.01%).[/yellow] -> [bold]PASS / NO BET[/bold]")
+            console.print(f"[yellow]El mejor EV ({best_bet_name} +{best_ev*100:.2f}%) supera el umbral de la liga ({res['league_ev_thresh']*100:.2f}%), pero el stake Kelly Multi-Activo es minúsculo (< 0.01%).[/yellow] -> [bold]PASS / NO BET[/bold]")
         else:
             rec = Panel(
                 f"[bold green]MEJOR OPORTUNIDAD VALUE DETECTADA[/bold green]\n"
                 f"Mercado Seleccionado: [bold]{best_bet_name}[/bold] @ {best_raw_odd:.2f} (Efectiva: {best_eff_odd:.2f})\n"
                 f"Net EV Proyectado: [bold]+{best_ev*100:.2f}%[/bold] (Umbral Liga {comp}: {res['league_ev_thresh']*100:.2f}%)\n"
-                f"Stake Recomendado: [bold]${best_stake:.2f}[/bold] ({best_pct*100:.2f}% del bankroll)",
+                f"Stake Kelly Multi-Activo: [bold]${best_stake:.2f}[/bold] ({best_pct*100:.2f}% del bankroll)",
                 title="SISTEMA DE STAKING INSTITUCIONAL MULTI-MERCADO", border_style="green"
             )
             console.print(rec)
+            
+            # Exportar archivo de señales
+            exp_file = export_trade_signals(res)
+            console.print(f"[dim]Señal de trading exportada a: {exp_file}[/dim]")
     elif best_ev > 0:
         console.print(Panel(f"[yellow]EDGE INSUFICIENTE EN TODOS LOS MERCADOS.[/yellow]\nEl mejor EV proyectado fue en '{best_bet_name}' con +{best_ev*100:.2f}%. Umbral liga {comp}: {res['league_ev_thresh']*100:.2f}%. -> [bold]PASS / NO BET[/bold]", title="DECISIÓN SISTEMA", border_style="yellow"))
     else:
