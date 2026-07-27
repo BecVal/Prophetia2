@@ -7,9 +7,11 @@ import numpy as np
 from datetime import datetime
 from scipy.stats import entropy, poisson
 import questionary
+from questionary import Style, Choice
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.text import Text
 
 # Add core path for imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +22,9 @@ from models.train_quant_advanced import predict_from_model, KalmanDixonColesQuan
 from market_models.train_gbm_model import compute_gbm_features
 from models.train_nn import SklearnPyTorchWrapper10, PyTorchGatedResNet10, GatedContext, ResidualBlock
 from models.train_draws import HybridDrawsEnsemble
+from ingestion.live_odds_feed import LiveOddsFeedFetcher
+from ingestion.lineup_fetcher import LineupImpactFetcher
+from team_mapping import normalize_team_name
 
 import __main__
 __main__.SklearnPyTorchWrapper10 = SklearnPyTorchWrapper10
@@ -46,6 +51,185 @@ CARDS_PATH = os.path.join(MODEL_DIR, 'cards_total_xgboost_model.pkl')
 DATASET_PATH = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_odds.parquet'))
 FALLBACK_DATASET = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_dataset.parquet'))
 OPTIMIZED_PARAMS_FILE = os.path.abspath(os.path.join(script_dir, '../data/processed/models_best_parameters/optimal_bankroll_params.json'))
+
+# --- ESTILO DE COLORES PERSONALIZADO PARA QUESTIONARY CLI ---
+CUSTOM_QUESTIONARY_STYLE = Style([
+    ('qmark', 'fg:#00d2ff bold'),       # Signo de interrogación en cian eléctrico
+    ('question', 'fg:#ffffff bold'),    # Texto de la pregunta en blanco brillante
+    ('answer', 'fg:#00ff87 bold'),      # Respuesta seleccionada en verde neón
+    ('pointer', 'fg:#00d2ff bold'),     # Puntero de selección en cian
+    ('highlighted', 'fg:#00d2ff bold'), # Opción resaltada en cian
+    ('selected', 'fg:#00ff87 bold'),    # Opción elegida
+    ('separator', 'fg:#6c757d'),        # Separadores
+    ('instruction', 'fg:#6c757d'),      # Instrucciones
+    ('text', 'fg:#f8f9fa'),             # Texto plano
+    ('choice', 'fg:#38bdf8'),           # Texto de opciones en azul cielo
+])
+
+# --- DICCIONARIO DE NOMBRES Y BANDERAS OFICIALES DE LIGAS ---
+COMPETITION_DISPLAY_NAMES = {
+    # Inglaterra
+    'Premier League': '🇬🇧 Premier League (Inglaterra)',
+    'E0': '🇬🇧 Premier League (Inglaterra)',
+    'Championship': '🇬🇧 EFL Championship (Inglaterra)',
+    'E1': '🇬🇧 EFL Championship (Inglaterra)',
+    'League One': '🇬🇧 EFL League One (Inglaterra)',
+    'E2': '🇬🇧 EFL League One (Inglaterra)',
+    
+    # España
+    'La Liga': '🇪🇸 La Liga EA Sports (España)',
+    'SP1': '🇪🇸 La Liga EA Sports (España)',
+    'La Liga 2': '🇪🇸 La Liga Hypermotion (España)',
+    'SP2': '🇪🇸 La Liga Hypermotion (España)',
+    
+    # Alemania
+    '1. Bundesliga': '🇩🇪 1. Bundesliga (Alemania)',
+    'D1': '🇩🇪 1. Bundesliga (Alemania)',
+    '2. Bundesliga': '🇩🇪 2. Bundesliga (Alemania)',
+    'D2': '🇩🇪 2. Bundesliga (Alemania)',
+    
+    # Italia
+    'Serie A': '🇮🇹 Serie A Enilive (Italia)',
+    'I1': '🇮🇹 Serie A Enilive (Italia)',
+    'Serie B': '🇮🇹 Serie BKT (Italia)',
+    'I2': '🇮🇹 Serie BKT (Italia)',
+    
+    # Francia
+    'Ligue 1': '🇫🇷 Ligue 1 McDonald\'s (Francia)',
+    'F1': '🇫🇷 Ligue 1 McDonald\'s (Francia)',
+    'Ligue 2': '🇫🇷 Ligue 2 (Francia)',
+    'F2': '🇫🇷 Ligue 2 (Francia)',
+    
+    # Japón
+    'J1': '🇯🇵 Meiji Yasuda J1 League (Japón)',
+    'J-League 1': '🇯🇵 Meiji Yasuda J1 League (Japón)',
+    'JPN': '🇯🇵 Meiji Yasuda J1 League (Japón)',
+    
+    # Países Bajos, Bélgica, Portugal, Turquía, Grecia, Escocia
+    'Eredivisie': '🇳🇱 Eredivisie (Países Bajos)',
+    'N1': '🇳🇱 Eredivisie (Países Bajos)',
+    'Jupiler Pro League': '🇧🇪 Jupiler Pro League (Bélgica)',
+    'B1': '🇧🇪 Jupiler Pro League (Bélgica)',
+    'Primeira Liga': '🇵🇹 Liga Portugal Betclic (Portugal)',
+    'P1': '🇵🇹 Liga Portugal Betclic (Portugal)',
+    'Süper Lig': '🇹🇷 Trendyol Süper Lig (Turquía)',
+    'T1': '🇹🇷 Trendyol Süper Lig (Turquía)',
+    'Super League': '🇬🇷 Stoiximan Super League (Grecia)',
+    'G1': '🇬🇷 Stoiximan Super League (Grecia)',
+    'Scottish Premiership': '🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scottish Premiership (Escocia)',
+    'SC0': '🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scottish Premiership (Escocia)',
+    
+    # Suecia, Noruega, Dinamarca, Suiza, Austria
+    'Allsvenskan': '🇸🇪 Allsvenskan (Suecia)',
+    'SWE': '🇸🇪 Allsvenskan (Suecia)',
+    'Eliteserien': '🇳🇴 Eliteserien (Noruega)',
+    'NOR': '🇳🇴 Eliteserien (Noruega)',
+    'Superligaen': '🇩🇰 3F Superliga (Dinamarca)',
+    'DNK': '🇩🇰 3F Superliga (Dinamarca)',
+    'Swiss Super League': '🇨🇭 Credit Suisse Super League (Suiza)',
+    'SWZ': '🇨🇭 Credit Suisse Super League (Suiza)',
+    'Austrian Bundesliga': '🇦🇹 Admiral Bundesliga (Austria)',
+    'AUT': '🇦🇹 Admiral Bundesliga (Austria)',
+    
+    # América & Internacional
+    'Major League Soccer': '🇺🇸 Major League Soccer (EEUU)',
+    'MLS': '🇺🇸 Major League Soccer (EEUU)',
+    'Champions League': '🇪🇺 UEFA Champions League',
+    'CL': '🇪🇺 UEFA Champions League',
+    'Europa League': '🇪🇺 UEFA Europa League',
+    'EL': '🇪🇺 UEFA Europa League',
+    'FIFA World Cup': '🏆 FIFA World Cup (Mundial)',
+    'WC': '🏆 FIFA World Cup (Mundial)'
+}
+
+def get_formatted_comp_name(comp):
+    return COMPETITION_DISPLAY_NAMES.get(comp, f"🏳️ {comp}")
+
+# --- DICCIONARIO DE NOMBRES OFICIALES DE CASAS DE APUESTAS ---
+OFFICIAL_TEAM_DISPLAY_NAMES = {
+    # España (La Liga & La Liga 2)
+    'Bilbao': 'Athletic Club',
+    'Athletic Bilbao': 'Athletic Club',
+    'Ath Bilbao': 'Athletic Club',
+    'Ath Madrid': 'Atlético de Madrid',
+    'Atletico Madrid': 'Atlético de Madrid',
+    'Barcelona': 'FC Barcelona',
+    'Barca': 'FC Barcelona',
+    'Real Madrid': 'Real Madrid CF',
+    'Betis': 'Real Betis Balompié',
+    'Real Betis': 'Real Betis Balompié',
+    'Sociedad': 'Real Sociedad',
+    'Celta': 'RC Celta de Vigo',
+    'Celta Vigo': 'RC Celta de Vigo',
+    'Sevilla': 'Sevilla FC',
+    'Valencia': 'Valencia CF',
+    'Villarreal': 'Villarreal CF',
+    'Espanyol': 'RC D Espanyol',
+    'Mallorca': 'RCD Mallorca',
+    'Osasuna': 'CA Osasuna',
+    'Rayo Vallecano': 'Rayo Vallecano',
+    'Rayo': 'Rayo Vallecano',
+    'Getafe': 'Getafe CF',
+    'Girona': 'Girona FC',
+    'Alaves': 'Deportivo Alavés',
+    'Deportivo Alaves': 'Deportivo Alavés',
+    'Las Palmas': 'UD Las Palmas',
+    'Leganes': 'CD Leganés',
+    'Valladolid': 'Real Valladolid',
+    
+    # Inglaterra (Premier League & Championship)
+    'Man City': 'Manchester City',
+    'Man United': 'Manchester United',
+    'Spurs': 'Tottenham Hotspur',
+    'Tottenham': 'Tottenham Hotspur',
+    'Wolves': 'Wolverhampton Wanderers',
+    'Wolverhampton': 'Wolverhampton Wanderers',
+    'Newcastle': 'Newcastle United',
+    'West Ham': 'West Ham United',
+    'Leicester': 'Leicester City',
+    'Ipswich': 'Ipswich Town',
+    'Southampton': 'Southampton FC',
+    'Bournemouth': 'AFC Bournemouth',
+    'Nottingham': 'Nottingham Forest',
+    
+    # Italia (Serie A)
+    'Inter': 'Inter Milan',
+    'Internazionale': 'Inter Milan',
+    'Milan': 'AC Milan',
+    'Juve': 'Juventus FC',
+    'Juventus': 'Juventus FC',
+    'Fiorentina': 'ACF Fiorentina',
+    'Roma': 'AS Roma',
+    'Lazio': 'SS Lazio',
+    'Napoli': 'SSC Napoli',
+    'Atalanta': 'Atalanta BC',
+    
+    # Alemania (Bundesliga)
+    'Bayern Munich': 'Bayern München',
+    'Bayern': 'Bayern München',
+    'Dortmund': 'Borussia Dortmund',
+    'B. Dortmund': 'Borussia Dortmund',
+    'Leverkusen': 'Bayer 04 Leverkusen',
+    'Bayer Leverkusen': 'Bayer 04 Leverkusen',
+    'RB Leipzig': 'RB Leipzig',
+    'Gladbach': 'Borussia Mönchengladbach',
+    'Mönchengladbach': 'Borussia Mönchengladbach',
+    'Eintracht Frankfurt': 'Eintracht Frankfurt',
+    
+    # Francia (Ligue 1)
+    'PSG': 'Paris Saint-Germain',
+    'Paris SG': 'Paris Saint-Germain',
+    'Monaco': 'AS Monaco',
+    'Marseille': 'Olympique de Marseille',
+    'Lyon': 'Olympique Lyonnais',
+    'Lille': 'LOSC Lille'
+}
+
+def get_official_team_name(name):
+    if not name:
+        return ""
+    clean = str(name).strip()
+    return OFFICIAL_TEAM_DISPLAY_NAMES.get(clean, clean)
 
 # --- CONFIGURACIÓN QUANT INSTITUCIONAL (10/10) ---
 TAX_RETENTION_RATE = 0.0075        # Retención del 0.75% sobre ganancias netas (Polymarket)
@@ -109,7 +293,6 @@ def calculate_market_slippage(odds, stake, liquidity_cap):
     return max(effective_odds, 1.001)
 
 def calculate_bayesian_uncertainty(probs_list):
-    """Calcula la media, varianza, error estándar, intervalo de credibilidad 95% y factor de penalización."""
     arr = np.asarray(probs_list, dtype=np.float64)
     mean_p = float(np.mean(arr))
     var_p = float(np.var(arr, ddof=1)) if len(arr) > 1 else 0.0
@@ -120,9 +303,6 @@ def calculate_bayesian_uncertainty(probs_list):
     return mean_p, se, ci_low, ci_high, uncertainty_penalty
 
 def solve_multi_asset_kelly(ev_vec, odds_vec, prob_vec, corr_matrix, bankroll, max_stake_pct, penalty=1.0, max_liquidity=2000.0, league_kelly=0.015):
-    """
-    Resuelve la asignación Kelly Multi-Activo con matriz de covarianza regularizada y penalizador Bayesiano.
-    """
     n = len(ev_vec)
     ev_arr = np.maximum(np.asarray(ev_vec, dtype=np.float64), 0.0)
     prob_arr = np.asarray(prob_vec, dtype=np.float64)
@@ -153,18 +333,8 @@ def solve_multi_asset_kelly(ev_vec, odds_vec, prob_vec, corr_matrix, bankroll, m
     return stakes, pcts
 
 def compute_poisson_market_correlations(poisson_matrix):
-    """Calcula la matriz de correlación empírica exacta entre los mercados de un partido."""
     rows, cols = poisson_matrix.shape
     weights = poisson_matrix.flatten()
-    
-    indicators = []
-    # 0: Home Win (i > j)
-    # 1: Draw (i == j)
-    # 2: Away Win (i < j)
-    # 3: 1X (i >= j)
-    # 4: X2 (i <= j)
-    # 5: Over 2.5 (i + j > 2)
-    # 6: BTTS (i >= 1 and j >= 1)
     
     ind_win = np.fromfunction(lambda i, j: i > j, (rows, cols)).flatten().astype(float)
     ind_draw = np.fromfunction(lambda i, j: i == j, (rows, cols)).flatten().astype(float)
@@ -178,7 +348,6 @@ def compute_poisson_market_correlations(poisson_matrix):
 
     matrix_ind = np.vstack([ind_win, ind_draw, ind_loss, ind_1X, ind_X2, ind_ou25, ind_btts, ind_corn, ind_card])
     
-    # Covarianza ponderada
     mean_vec = matrix_ind @ weights
     dev = matrix_ind - mean_vec[:, None]
     weighted_cov = (dev * weights[None, :]) @ dev.T
@@ -190,10 +359,9 @@ def compute_poisson_market_correlations(poisson_matrix):
     return np.clip(corr_matrix, -1.0, 1.0)
 
 def export_trade_signals(res, filepath='trade_signals.json'):
-    """Exporta las proyecciones cuantitativas, CIs 95% y asignaciones Kelly a archivo JSON."""
     data = {
         'timestamp': datetime.now().isoformat(),
-        'match': f"{res['home_team']} vs {res['away_team']}",
+        'match': f"{res['home_official']} vs {res['away_official']}",
         'competition': res['competition'],
         'xg_expected': {'home': res['xg_scored'], 'away': res['xg_conceded']},
         'bayesian_ci_95': {
@@ -221,7 +389,6 @@ def load_data():
     return pd.read_parquet(path)
 
 def load_all_models():
-    """Carga y empaqueta todos los modelos entrenados guardados."""
     models_dict = {}
     required = [QUANT_PATH, CONTEXT_PATH, NN_PATH, DRAWS_PATH, MARKET_PATH, GBM_PATH, FUNDAMENTAL_PATH, FINAL_PATH]
     if not all(os.path.exists(p) for p in required):
@@ -253,13 +420,48 @@ def load_all_models():
     return models_dict
 
 def get_latest_team_row(df, team_name):
-    """Obtiene la última fila histórica de un equipo."""
-    team_df = df[(df['team'] == team_name)].sort_values('match_date')
+    if not team_name:
+        return None
+    norm = normalize_team_name(team_name)
+    
+    # 1. Búsqueda exacta por nombre o normalizado
+    team_df = df[(df['team'] == team_name) | (df['team'] == norm)].sort_values('match_date')
     if not team_df.empty:
         return team_df.iloc[-1]
-    opp_df = df[(df['opponent'] == team_name)].sort_values('match_date')
+        
+    opp_df = df[(df['opponent'] == team_name) | (df['opponent'] == norm)].sort_values('match_date')
     if not opp_df.empty:
         return opp_df.iloc[-1]
+        
+    # 2. Búsqueda flexible por alias / minúsculas
+    raw_lower = str(team_name).lower().replace(' ', '').replace('cf', '').replace('fc', '')
+    norm_lower = str(norm).lower().replace(' ', '').replace('cf', '').replace('fc', '')
+    
+    all_teams = set(df['team'].dropna().unique()).union(set(df['opponent'].dropna().unique()))
+    matched_name = None
+    for t in all_teams:
+        t_norm = normalize_team_name(t)
+        t_lower = str(t).lower().replace(' ', '').replace('cf', '').replace('fc', '')
+        t_norm_lower = str(t_norm).lower().replace(' ', '').replace('cf', '').replace('fc', '')
+        if raw_lower in [t_lower, t_norm_lower] or norm_lower in [t_lower, t_norm_lower]:
+            matched_name = t
+            break
+            
+    if not matched_name:
+        for t in all_teams:
+            t_lower = str(t).lower()
+            if norm_lower in t_lower or t_lower in norm_lower:
+                matched_name = t
+                break
+
+    if matched_name:
+        team_df = df[(df['team'] == matched_name)].sort_values('match_date')
+        if not team_df.empty:
+            return team_df.iloc[-1]
+        opp_df = df[(df['opponent'] == matched_name)].sort_values('match_date')
+        if not opp_df.empty:
+            return opp_df.iloc[-1]
+
     return None
 
 def compute_meta_features_live(df_base, open_odds_win, open_odds_draw, open_odds_loss, comp_id=0):
@@ -292,8 +494,10 @@ def compute_meta_features_live(df_base, open_odds_win, open_odds_draw, open_odds
     
     return pd.concat([df_base, meta], axis=1)
 
-def build_live_match_features(df, home_team, away_team, comp, odds_1, odds_X, odds_2):
-    """Construye un vector de características completo e insesgado para la predicción en vivo."""
+def build_live_match_features(
+    df, home_team, away_team, comp, odds_1, odds_X, odds_2,
+    open_odds_win=None, open_odds_draw=None, open_odds_loss=None
+):
     home_row = get_latest_team_row(df, home_team)
     away_row = get_latest_team_row(df, away_team)
     
@@ -302,12 +506,10 @@ def build_live_match_features(df, home_team, away_team, comp, odds_1, odds_X, od
 
     input_data = {}
     
-    # 1. Copiar métricas históricas de rendimiento del local
     for col in home_row.index:
         if isinstance(home_row[col], (int, float, np.number)):
             input_data[col] = float(home_row[col])
 
-    # 2. Reemplazar métricas del rival con el equipo visitante real
     input_data['is_home'] = 1
     input_data['team'] = home_team
     input_data['opponent'] = away_team
@@ -329,15 +531,14 @@ def build_live_match_features(df, home_team, away_team, comp, odds_1, odds_X, od
     if 'xg_conceded_ema5' in away_row:
         input_data['opp_xg_conceded_ema5'] = float(away_row['xg_conceded_ema5'])
 
-    # 3. Cuotas de Apertura, Implícitas y Presión de Mercado (Steam / Line Movement Velocity)
     impl_win = 1.0 / odds_1
     impl_draw = 1.0 / odds_X
     impl_loss = 1.0 / odds_2
     margin = impl_win + impl_draw + impl_loss
 
-    open_1 = float(home_row.get('open_odds_win', odds_1))
-    open_X = float(home_row.get('open_odds_draw', odds_X))
-    open_2 = float(home_row.get('open_odds_loss', odds_2))
+    open_1 = float(open_odds_win if open_odds_win is not None else odds_1)
+    open_X = float(open_odds_draw if open_odds_draw is not None else odds_X)
+    open_2 = float(open_odds_loss if open_odds_loss is not None else odds_2)
 
     input_data['open_odds_win'] = open_1
     input_data['open_odds_draw'] = open_X
@@ -355,7 +556,6 @@ def build_live_match_features(df, home_team, away_team, comp, odds_1, odds_X, od
     input_data['vig_open'] = margin - 1.0
     input_data['vig_close'] = margin - 1.0
 
-    # Inferencia de presión de mercado (Steam)
     input_data['steam_win'] = float((1.0 / max(odds_1, 1.01)) - (1.0 / max(open_1, 1.01)))
     input_data['steam_draw'] = float((1.0 / max(odds_X, 1.01)) - (1.0 / max(open_X, 1.01)))
     input_data['steam_loss'] = float((1.0 / max(odds_2, 1.01)) - (1.0 / max(open_2, 1.01)))
@@ -369,6 +569,9 @@ def predict_match(
     odds_1,
     odds_X,
     odds_2,
+    open_odds_win=None,
+    open_odds_draw=None,
+    open_odds_loss=None,
     extra_odds=None,
     bankroll=1000.0,
     injuries_home=0,
@@ -376,7 +579,6 @@ def predict_match(
     df=None,
     models_dict=None
 ):
-    """Ejecuta la inferencia cuantitativa completa con Incertidumbre Bayesiana y Kelly Multi-Activo (10/10)."""
     if df is None:
         df = load_data()
         if df is None: return None
@@ -387,7 +589,6 @@ def predict_match(
 
     extra_odds = extra_odds or {}
     
-    # 1. Cargar parámetros cuantitativos por liga
     kelly_fractions, ev_thresholds = {}, {}
     alpha_div_low_dict, alpha_div_med_dict, alpha_div_high_dict = {}, {}, {}
     if os.path.exists(OPTIMIZED_PARAMS_FILE):
@@ -405,8 +606,10 @@ def predict_match(
     league_alpha_med = get_param_by_comp(alpha_div_med_dict, comp, 0.70)
     league_alpha_high = get_param_by_comp(alpha_div_high_dict, comp, 0.50)
 
-    # 2. Construir vector de características
-    input_data = build_live_match_features(df, home_team, away_team, comp, odds_1, odds_X, odds_2)
+    input_data = build_live_match_features(
+        df, home_team, away_team, comp, odds_1, odds_X, odds_2,
+        open_odds_win=open_odds_win, open_odds_draw=open_odds_draw, open_odds_loss=open_odds_loss
+    )
     if input_data is None:
         return None
 
@@ -430,7 +633,6 @@ def predict_match(
 
     df_input_full = pd.DataFrame([input_data])
 
-    # 3. Características GBM (Bypass si ya están precalculadas)
     has_all_gbm = all(col in input_data for col in gbm_data['features'])
     if not has_all_gbm:
         import logging
@@ -453,15 +655,13 @@ def predict_match(
 
     df_input_full = pd.DataFrame([input_data])
 
-    # 4. Predicciones Modelo Quant ZINB Kalman Dixon-Coles
     w_q, d_q, l_q, mu_h_np, mu_a_np = predict_from_model(quant_dict['model'], quant_dict['team_mapping'], df_input_full)
     q_win, q_draw, q_loss = w_q[0], d_q[0], l_q[0]
     xg_s, xg_c = float(mu_h_np[0]), float(mu_a_np[0])
 
-    if injuries_home > 0: xg_s *= (1 - injuries_home * 0.02); xg_c *= (1 + injuries_home * 0.02)
-    if injuries_away > 0: xg_c *= (1 - injuries_away * 0.02); xg_s *= (1 + injuries_away * 0.02)
+    lineup_fetcher = LineupImpactFetcher()
+    xg_s, xg_c = lineup_fetcher.calculate_lineup_xg_impact(xg_s, xg_c, missing_home_starters=injuries_home, missing_away_starters=injuries_away)
 
-    # 5. Inferencia Submodelos
     df_ctx = df_input_full[context_data['features']].copy()
     if 'competition_id' in df_ctx.columns: df_ctx['competition_id'] = df_ctx['competition_id'].astype('category')
     ctx_probs = context_data['model'].predict_proba(df_ctx)[0]
@@ -471,7 +671,6 @@ def predict_match(
     mkt_probs = market_data['model'].predict_proba(df_input_full[market_data['features']])[0]
     gbm_probs = gbm_data['model'].predict_proba(df_input_full[gbm_data['features']])[0]
 
-    # Stacker Fundamental
     df_fund_input = pd.DataFrame({
         'predicted_xg_scored_quant': [xg_s], 'predicted_xg_conceded_quant': [xg_c],
         'quant_win_prob': [q_win], 'quant_draw_prob': [q_draw], 'quant_loss_prob': [q_loss],
@@ -481,7 +680,6 @@ def predict_match(
     })[fund_data['features']]
     fund_probs = fund_data['model'].predict_proba(df_fund_input)[0]
 
-    # Stacker Final (Nivel 2)
     df_fund_out = pd.DataFrame({'fund_prob_loss': [fund_probs[0]], 'fund_prob_draw': [fund_probs[1]], 'fund_prob_win': [fund_probs[2]]})
     df_mkt = pd.DataFrame({'prob_loss_mkt': [mkt_probs[0]], 'prob_draw_mkt': [mkt_probs[1]], 'prob_win_mkt': [mkt_probs[2]],
                            'prob_loss_gbm': [gbm_probs[0]], 'prob_draw_gbm': [gbm_probs[1]], 'prob_win_gbm': [gbm_probs[2]]})
@@ -499,7 +697,6 @@ def predict_match(
     final_probs /= np.sum(final_probs)
     prob_loss, prob_draw, prob_win = final_probs[0], final_probs[1], final_probs[2]
 
-    # --- INCERTIDUMBRE BAYESIANA & INTERVALOS DE CREDIBILIDAD 95% ---
     all_win_probs = [q_win, ctx_probs[2], nn_probs[2], mkt_probs[2], gbm_probs[2], fund_probs[2], prob_win]
     all_draw_probs = [q_draw, ctx_probs[1], nn_probs[1], mkt_probs[1], gbm_probs[1], fund_probs[1], prob_draw]
     all_loss_probs = [q_loss, ctx_probs[0], nn_probs[0], mkt_probs[0], gbm_probs[0], fund_probs[0], prob_loss]
@@ -508,7 +705,6 @@ def predict_match(
     _, se_draw, ci_draw_low, ci_draw_high, pen_draw = calculate_bayesian_uncertainty(all_draw_probs)
     _, se_loss, ci_loss_low, ci_loss_high, pen_loss = calculate_bayesian_uncertainty(all_loss_probs)
 
-    # 6. Motor Poisson & Mercados Derivados (Fórmulas Matemáticas Exactas)
     rho_val = float(quant_dict['model'].rho.item()) if hasattr(quant_dict['model'], 'rho') else 0.0
     poisson_matrix = np.zeros((11, 11))
     for i in range(11):
@@ -551,7 +747,6 @@ def predict_match(
     prob_over95_corners = float(1.0 - sum(poisson.pmf(k, exp_corners) for k in range(10)))
     prob_over45_cards = float(1.0 - sum(poisson.pmf(k, exp_cards) for k in range(5)))
 
-    # 7. Dynamic Alpha Blending & Net Expected Values (EV)
     impl_win, impl_draw, impl_loss = 1.0/odds_1, 1.0/odds_X, 1.0/odds_2
     margin = impl_win + impl_draw + impl_loss
     market_prob_win, market_prob_draw, market_prob_loss = impl_win/margin, impl_draw/margin, impl_loss/margin
@@ -572,7 +767,6 @@ def predict_match(
     ev_draw = (blend_draw * net_odds_X) - 1.0 - EXPECTED_CLV_DROP
     ev_loss = (blend_loss * net_odds_2) - 1.0 - EXPECTED_CLV_DROP
 
-    # Dutching 1X & X2
     combined_odds_1X = 1.0 / (impl_win + impl_draw)
     net_combined_1X = 1.0 + (combined_odds_1X - 1.0) * (1.0 - TAX_RETENTION_RATE)
     blend_1X = blend_win + blend_draw
@@ -583,9 +777,13 @@ def predict_match(
     blend_X2 = blend_draw + blend_loss
     ev_X2 = (blend_X2 * net_combined_X2) - 1.0 - EXPECTED_CLV_DROP
 
-    # Mercados Derivados
     odd_ou25 = extra_odds.get('ou25_over', 1.0 / max(prob_over25_goals, 0.05))
     ev_ou25 = (prob_over25_goals * (1.0 + (odd_ou25 - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
+
+    implied_over = 1.0 / max(odd_ou25, 1.01)
+    implied_under_est = max(1.0 - implied_over, 0.05)
+    odd_ou25_under = extra_odds.get('ou25_under', 1.0 / implied_under_est)
+    ev_ou25_under = (prob_under25_goals * (1.0 + (odd_ou25_under - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
 
     odd_btts = extra_odds.get('btts_yes', 1.0 / max(prob_btts_yes, 0.05))
     ev_btts = (prob_btts_yes * (1.0 + (odd_btts - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
@@ -598,7 +796,6 @@ def predict_match(
 
     max_liquidity = get_param_by_comp(MAX_BET_LIQUIDITY, comp, 2000.0)
 
-    # --- OPTIMIZACIÓN DE PORTAFOLIO KELLY MULTI-ACTIVO CON MATRIZ DE COVARIANZAS ---
     corr_matrix = compute_poisson_market_correlations(poisson_matrix)
     ev_vector = [ev_win, ev_draw, ev_loss, ev_1X, ev_X2, ev_ou25, ev_btts, ev_corners, ev_cards]
     odds_vector = [odds_1, odds_X, odds_2, combined_odds_1X, combined_odds_X2, odd_ou25, odd_btts, odd_corners, odd_cards]
@@ -619,10 +816,13 @@ def predict_match(
     eff_1X = calculate_market_slippage(combined_odds_1X, s_1X, max_liquidity)
     eff_X2 = calculate_market_slippage(combined_odds_X2, s_X2, max_liquidity)
 
+    home_official = get_official_team_name(home_team)
+    away_official = get_official_team_name(away_team)
+
     all_bets = [
-        ("1 (Local)", ev_win, s_win, p_win_stk, odds_1, eff_1, blend_win),
+        (f"1 ({home_official})", ev_win, s_win, p_win_stk, odds_1, eff_1, blend_win),
         ("X (Empate)", ev_draw, s_draw, p_draw_stk, odds_X, eff_X, blend_draw),
-        ("2 (Visitante)", ev_loss, s_loss, p_loss_stk, odds_2, eff_2, blend_loss),
+        (f"2 ({away_official})", ev_loss, s_loss, p_loss_stk, odds_2, eff_2, blend_loss),
         ("Doble Oportunidad 1X", ev_1X, s_1X, p_1X_stk, combined_odds_1X, eff_1X, blend_1X),
         ("Doble Oportunidad X2", ev_X2, s_X2, p_X2_stk, combined_odds_X2, eff_X2, blend_X2),
         ("Over 2.5 Goles", ev_ou25, s_ou25, p_ou25_stk, odd_ou25, odd_ou25, prob_over25_goals),
@@ -636,6 +836,7 @@ def predict_match(
 
     return {
         'home_team': home_team, 'away_team': away_team, 'competition': comp,
+        'home_official': home_official, 'away_official': away_official,
         'xg_scored': xg_s, 'xg_conceded': xg_c,
         'exp_corners': exp_corners, 'exp_cards': exp_cards,
         'prob_win': prob_win, 'prob_draw': prob_draw, 'prob_loss': prob_loss,
@@ -647,7 +848,8 @@ def predict_match(
         'prob_btts_yes': prob_btts_yes, 'prob_btts_no': prob_btts_no,
         'prob_over95_corners': prob_over95_corners, 'prob_over45_cards': prob_over45_cards,
         'ev_win': ev_win, 'ev_draw': ev_draw, 'ev_loss': ev_loss,
-        'ev_1X': ev_1X, 'ev_X2': ev_X2, 'ev_ou25': ev_ou25, 'ev_btts': ev_btts,
+        'ev_1X': ev_1X, 'ev_X2': ev_X2, 'ev_ou25': ev_ou25, 'ev_ou25_under': ev_ou25_under, 'ev_btts': ev_btts,
+        'odd_ou25_under': odd_ou25_under,
         'ev_corners': ev_corners, 'ev_cards': ev_cards,
         'stake_win': s_win, 'stake_draw': s_draw, 'stake_loss': s_loss,
         'stake_1X': s_1X, 'stake_X2': s_X2, 'stake_ou25': s_ou25, 'stake_btts': s_btts,
@@ -660,8 +862,22 @@ def predict_match(
         'bayesian_penalty': avg_penalty, 'all_bets': all_bets, 'best_bet': best_bet
     }
 
+def format_match_datetime(date_str):
+    if not date_str: return ""
+    try:
+        if 'T' in str(date_str):
+            dt = datetime.fromisoformat(str(date_str).replace('Z', '+00:00'))
+            return dt.strftime('%d/%m/%Y a las %H:%M UTC')
+        return str(date_str)
+    except Exception:
+        return str(date_str)
+
 def main():
-    console.print(Panel.fit("[bold cyan]Prophetia2 - Institutional Multi-Market Quant Value CLI (10/10)[/bold cyan]\n[dim]Initializing Stacker Meta-Model, Bayesian Credible Intervals & Multi-Asset Kelly Portfolio...[/dim]"))
+    console.print(Panel.fit(
+        "[bold bright_cyan]⚡ PROPHETIA2 QUANT[/bold bright_cyan] • [bold bright_yellow]INSTITUTIONAL VALUE ENGINE 10/10[/bold bright_yellow]\n"
+        "[dim white]Live Pinnacle Odds Feed • 95% Bayesian Credible Intervals • Multi-Asset Kelly Portfolio[/dim white]",
+        border_style="bright_blue"
+    ))
     
     models_dict = load_all_models()
     if models_dict is None: return
@@ -670,49 +886,126 @@ def main():
     if df is None: return
 
     competitions = df['competition'].dropna().unique().tolist()
-    comp = questionary.select("Selecciona la Liga:", choices=sorted(competitions)).ask()
+    comp_choices = [
+        Choice(title=get_formatted_comp_name(c), value=c)
+        for c in sorted(competitions)
+    ]
+
+    comp = questionary.select(
+        "🏆 Selecciona la Competición / Liga:",
+        choices=comp_choices,
+        style=CUSTOM_QUESTIONARY_STYLE
+    ).ask()
+
     if not comp: return
-    
-    teams_in_comp = df[df['competition'] == comp]['team'].dropna().unique().tolist()
-    home_team = questionary.select("Equipo Local:", choices=sorted(teams_in_comp)).ask()
-    away_team = questionary.select("Equipo Visitante:", choices=sorted(teams_in_comp)).ask()
-    
-    if not home_team or not away_team:
-        console.print("[red]Debes seleccionar ambos equipos.[/red]")
-        return
-        
-    try:
-        odds_1 = float(questionary.text("Cuota de Apertura Local [1]:").ask())
-        odds_X = float(questionary.text("Cuota de Apertura Empate [X]:").ask())
-        odds_2 = float(questionary.text("Cuota de Apertura Visitante [2]:").ask())
-    except (ValueError, TypeError):
-        console.print("[red]Cuotas inválidas.[/red]")
-        return
-        
-    want_extra_odds = questionary.confirm("¿Deseas ingresar cuotas para mercados derivados (Goles O/U 2.5, BTTS, Handicap, Córneres, Tarjetas)?", default=False).ask()
 
+    # --- INGESTA OBLIGATORIA DE CUOTAS EN VIVO (Pinnacle / The-Odds-API / Football-Data / ESPN API) ---
+    console.print(f"[cyan]📥 Descargando partidos y cuotas en tiempo real para {get_formatted_comp_name(comp)}...[/cyan]")
+    live_fetcher = LiveOddsFeedFetcher()
+    live_matches = live_fetcher.get_live_league_fixtures(comp)
+
+    home_team, away_team = None, None
+    odds_1, odds_X, odds_2 = None, None, None
+    open_odds_win, open_odds_draw, open_odds_loss = None, None, None
+    selected_match_date = ""
     extra_odds = {}
-    if want_extra_odds:
+    
+    if live_matches:
+        match_choices = []
+        for i, m in enumerate(live_matches):
+            dt_str = format_match_datetime(m.get('date', ''))
+            date_part = f"📅 {dt_str} | " if dt_str else ""
+            source_str = m.get('source', 'Live Feed')
+            if m.get('has_live_odds', True):
+                op_w = m.get('open_odds_win', m['odds_1'])
+                op_x = m.get('open_odds_draw', m['odds_X'])
+                op_l = m.get('open_odds_loss', m['odds_2'])
+                title_str = (
+                    f"{date_part}{get_official_team_name(m['home_team'])} vs {get_official_team_name(m['away_team'])} | "
+                    f"Cuotas: [1] {m['odds_1']:.2f} | [X] {m['odds_X']:.2f} | [2] {m['odds_2']:.2f} "
+                    f"(Apertura: {op_w:.2f}/{op_x:.2f}/{op_l:.2f}) [{source_str}]"
+                )
+            else:
+                title_str = (
+                    f"{date_part}{get_official_team_name(m['home_team'])} vs {get_official_team_name(m['away_team'])} | "
+                    f"[{source_str}]"
+                )
+            match_choices.append(Choice(title=title_str, value=i))
+            
+        match_choices.append(Choice(title="--> ⚙️ Ingresar partido y cuotas manualmente", value=-1))
+        
+        selected_idx = questionary.select(
+            "⚽ Selecciona un Partido Próximo en Vivo:",
+            choices=match_choices,
+            style=CUSTOM_QUESTIONARY_STYLE
+        ).ask()
+        
+        if selected_idx is not None and selected_idx >= 0:
+            selected_match = live_matches[selected_idx]
+            home_team = selected_match['home_team']
+            away_team = selected_match['away_team']
+            odds_1 = selected_match['odds_1']
+            odds_X = selected_match['odds_X']
+            odds_2 = selected_match['odds_2']
+            open_odds_win = selected_match.get('open_odds_win', odds_1)
+            open_odds_draw = selected_match.get('open_odds_draw', odds_X)
+            open_odds_loss = selected_match.get('open_odds_loss', odds_2)
+            selected_match_date = selected_match.get('date', '')
+            extra_odds = selected_match.get('extra_odds', {})
+
+            if not selected_match.get('has_live_odds', True):
+                console.print("\n[bold yellow]⚠️ Atención: Las casas de apuestas aún no han publicado cuotas oficiales para este partido de fecha futura.[/bold yellow]")
+                change_odds = questionary.confirm(
+                    "¿Deseas ingresar las cuotas de tu casa de apuestas manualmente para este partido?",
+                    default=False,
+                    style=CUSTOM_QUESTIONARY_STYLE
+                ).ask()
+                
+                if change_odds:
+                    try:
+                        odds_1 = float(questionary.text("Cuota Local [1]:", default="2.10", style=CUSTOM_QUESTIONARY_STYLE).ask())
+                        odds_X = float(questionary.text("Cuota Empate [X]:", default="3.30", style=CUSTOM_QUESTIONARY_STYLE).ask())
+                        odds_2 = float(questionary.text("Cuota Visitante [2]:", default="3.40", style=CUSTOM_QUESTIONARY_STYLE).ask())
+                        open_odds_win, open_odds_draw, open_odds_loss = odds_1, odds_X, odds_2
+                    except (ValueError, TypeError):
+                        console.print("[yellow]Usando cuotas baseline estimadas.[/yellow]")
+                else:
+                    console.print("[dim white]Continuando con estimación baseline del modelo.[/dim white]")
+            else:
+                console.print(f"[bold green]✔ Cuotas en vivo cargadas correctamente para [bold bright_cyan]{get_official_team_name(home_team)}[/bold bright_cyan] vs [bold bright_magenta]{get_official_team_name(away_team)}[/bold bright_magenta]![/bold green]")
+
+    if not home_team or not away_team:
+        teams_in_comp = df[df['competition'] == comp]['team'].dropna().unique().tolist()
+        team_choices = [
+            Choice(title=get_official_team_name(t), value=t)
+            for t in sorted(teams_in_comp)
+        ]
+        
+        home_team = questionary.select("🏠 Equipo Local:", choices=team_choices, style=CUSTOM_QUESTIONARY_STYLE).ask()
+        away_team = questionary.select("✈️ Equipo Visitante:", choices=team_choices, style=CUSTOM_QUESTIONARY_STYLE).ask()
+        
+        if not home_team or not away_team:
+            console.print("[red]Debes seleccionar ambos equipos.[/red]")
+            return
+            
         try:
-            extra_odds['ou25_over'] = float(questionary.text("Cuota Over 2.5 Goles:", default="1.95").ask())
-            extra_odds['ou25_under'] = float(questionary.text("Cuota Under 2.5 Goles:", default="1.95").ask())
-            extra_odds['btts_yes'] = float(questionary.text("Cuota Both Teams to Score (BTTS Yes):", default="1.85").ask())
-            extra_odds['ah_minus05_home'] = float(questionary.text(f"Cuota Handicap Asiático -0.5 {home_team}:", default=str(odds_1)).ask())
-            extra_odds['corners_over95'] = float(questionary.text("Cuota Over 9.5 Córneres Totales:", default="1.90").ask())
-            extra_odds['cards_over45'] = float(questionary.text("Cuota Over 4.5 Tarjetas Totales:", default="1.90").ask())
+            odds_1 = float(questionary.text("Cuota Local [1]:", style=CUSTOM_QUESTIONARY_STYLE).ask())
+            odds_X = float(questionary.text("Cuota Empate [X]:", style=CUSTOM_QUESTIONARY_STYLE).ask())
+            odds_2 = float(questionary.text("Cuota Visitante [2]:", style=CUSTOM_QUESTIONARY_STYLE).ask())
         except (ValueError, TypeError):
-            console.print("[yellow]Cuotas adicionales inválidas, usando estimaciones por modelo.[/yellow]")
-            extra_odds = {}
+            console.print("[red]Cuotas inválidas.[/red]")
+            return
 
     try:
-        injuries_home = int(questionary.text("Lesiones clave Local [0-5]:", default="0").ask())
-        injuries_away = int(questionary.text("Lesiones clave Visitante [0-5]:", default="0").ask())
-        bankroll = float(questionary.text("Bankroll actual ($):", default="1000").ask())
+        injuries_home = int(questionary.text("📋 Titulares clave ausentes en Local [0-5]:", default="0", style=CUSTOM_QUESTIONARY_STYLE).ask())
+        injuries_away = int(questionary.text("📋 Titulares clave ausentes en Visitante [0-5]:", default="0", style=CUSTOM_QUESTIONARY_STYLE).ask())
+        bankroll = float(questionary.text("💰 Bankroll actual ($):", default="1000", style=CUSTOM_QUESTIONARY_STYLE).ask())
     except (ValueError, TypeError):
         injuries_home, injuries_away, bankroll = 0, 0, 1000.0
 
     res = predict_match(
         home_team, away_team, comp, odds_1, odds_X, odds_2,
+        open_odds_win=open_odds_win, open_odds_draw=open_odds_draw, open_odds_loss=open_odds_loss,
         extra_odds=extra_odds, bankroll=bankroll,
         injuries_home=injuries_home, injuries_away=injuries_away,
         df=df, models_dict=models_dict
@@ -722,45 +1015,83 @@ def main():
         console.print("[red]Error ejecutando predicción.[/red]")
         return
 
-    console.print(f"[dim]Parámetros cuantitativos cargados para {comp}: EV Threshold = {res['league_ev_thresh']*100:.2f}%, Kelly = {res['league_kelly']:.4f} | Penalizador Incertidumbre = {res['bayesian_penalty']:.3f}[/dim]")
-    console.print("\n[bold]=== PROYECCIONES MULTI-MERCADO & EXPECTED VALUES ===[/bold]")
-    console.print(f"[bold cyan]Marcador Esperado Quant (xG):[/bold cyan] {home_team} [bold yellow]{res['xg_scored']:.2f} - {res['xg_conceded']:.2f}[/bold yellow] {away_team}")
-    console.print(f"[bold cyan]Córneres Totales Esperados:[/bold cyan] [bold yellow]{res['exp_corners']:.1f}[/bold yellow] | [bold cyan]Tarjetas Totales Esperadas:[/bold cyan] [bold yellow]{res['exp_cards']:.1f}[/bold yellow]\n")
+    home_off = res['home_official']
+    away_off = res['away_official']
 
-    def c_ev(ev): return f"[green]+{ev*100:.1f}%[/green]" if ev > res['league_ev_thresh'] else (f"[yellow]+{ev*100:.1f}%[/yellow]" if ev > 0 else f"[red]{ev*100:.1f}%[/red]")
+    console.print(f"[dim white]Parámetros Liga {comp}: EV Umbral = {res['league_ev_thresh']*100:.2f}% | Kelly Frac = {res['league_kelly']:.4f} | Penalizador Incertidumbre = {res['bayesian_penalty']:.3f}[/dim white]")
+    
+    # Header del Partido
+    dt_formatted = format_match_datetime(selected_match_date)
+    dt_header = f"[bold yellow]📅 Fecha & Hora del Partido:[/bold yellow] [bold bright_cyan]{dt_formatted}[/bold bright_cyan]\n" if dt_formatted else ""
 
-    t1 = Table(title="1. Mercados de Partido (1X2, Doble Oportunidad & Intervalos de Credibilidad 95%)", show_header=True, header_style="bold magenta")
-    t1.add_column("Mercado", style="cyan")
-    t1.add_column("Odds (Efectiva)")
+    op_win_disp = open_odds_win if open_odds_win else odds_1
+    op_draw_disp = open_odds_draw if open_odds_draw else odds_X
+    op_loss_disp = open_odds_loss if open_odds_loss else odds_2
+
+    has_live_odds = selected_match.get('has_live_odds', True) if selected_match else True
+    if has_live_odds:
+        odds_footer = f"[dim white]Cuotas Mercado Live: [1] {odds_1:.2f} | [X] {odds_X:.2f} | [2] {odds_2:.2f} (Apertura: [1] {op_win_disp:.2f} | [X] {op_draw_disp:.2f} | [2] {op_loss_disp:.2f})[/dim white]"
+    else:
+        odds_footer = f"[dim yellow]⚠️ Cuotas en vivo no publicadas en casas de apuestas aún. (Cuotas evaluadas: [1] {odds_1:.2f} | [X] {odds_X:.2f} | [2] {odds_2:.2f})[/dim yellow]"
+
+    console.print(Panel(
+        f"{dt_header}"
+        f"[bold bright_cyan]🏠 LOCAL: {home_off}[/bold bright_cyan]\n"
+        f"[bold bright_magenta]✈️ VISITANTE: {away_off}[/bold bright_magenta]\n\n"
+        f"[bold cyan]Marcador Esperado Quant (xG):[/bold cyan] [bold bright_cyan]{home_off}[/bold bright_cyan] [bold bright_yellow]{res['xg_scored']:.2f} - {res['xg_conceded']:.2f}[/bold bright_yellow] [bold bright_magenta]{away_off}[/bold bright_magenta]\n"
+        f"[bold cyan]Córneres Esperados:[/bold cyan] [bold bright_yellow]{res['exp_corners']:.1f}[/bold bright_yellow] | [bold cyan]Tarjetas Esperadas:[/bold cyan] [bold bright_yellow]{res['exp_cards']:.1f}[/bold bright_yellow]\n"
+        f"{odds_footer}",
+        title=f"[bold bright_yellow]⚽ PROYECCIONES QUANT - {get_formatted_comp_name(comp)}[/bold bright_yellow]", border_style="bright_blue"
+    ))
+
+    def c_ev(ev):
+        if ev > res['league_ev_thresh']:
+            return f"[bold bright_green]+{ev*100:.1f}%[/bold bright_green]"
+        elif ev > 0:
+            return f"[bold yellow]+{ev*100:.1f}%[/bold yellow]"
+        else:
+            return f"[bold bright_red]{ev*100:.1f}%[/bold bright_red]"
+
+    def c_stake(stk, pct):
+        if stk > 0:
+            return f"[bold bright_yellow]${stk:,.2f}[/bold bright_yellow] [dim]({pct*100:.2f}%)[/dim]"
+        return "$0.00 [dim](0.00%)[/dim]"
+
+    # Tabla 1: Mercados de Partido (1X2 & Doble Oportunidad)
+    t1 = Table(title="1. Mercados de Partido (1X2, Doble Oportunidad & Intervalos IC 95%)", show_header=True, header_style="bold white on blue", border_style="cyan")
+    t1.add_column("Mercado", style="bold white")
+    t1.add_column("Odds (Efectiva)", justify="center")
     t1.add_column("Prob. Blended", justify="right")
-    t1.add_column("IC 95% Bayesiano", justify="center")
+    t1.add_column("IC 95% Bayesiano", justify="center", style="dim cyan")
     t1.add_column("Net EV", justify="right")
     t1.add_column("Stake Kelly Multi ($ / %)", justify="right")
 
-    t1.add_row(f"1 (Local - {home_team})", f"{odds_1:.2f} ({res['eff_1']:.2f})", f"{res['blend_win']*100:.1f}%", f"[{res['ci_win_low']*100:.1f}% - {res['ci_win_high']*100:.1f}%]", c_ev(res['ev_win']), f"${res['stake_win']:.2f} ({res['pct_win']*100:.2f}%)")
-    t1.add_row("X (Empate)", f"{odds_X:.2f} ({res['eff_X']:.2f})", f"{res['blend_draw']*100:.1f}%", f"[{res['ci_draw_low']*100:.1f}% - {res['ci_draw_high']*100:.1f}%]", c_ev(res['ev_draw']), f"${res['stake_draw']:.2f} ({res['pct_draw']*100:.2f}%)")
-    t1.add_row(f"2 (Visita - {away_team})", f"{odds_2:.2f} ({res['eff_2']:.2f})", f"{res['blend_loss']*100:.1f}%", f"[{res['ci_loss_low']*100:.1f}% - {res['ci_loss_high']*100:.1f}%]", c_ev(res['ev_loss']), f"${res['stake_loss']:.2f} ({res['pct_loss']*100:.2f}%)")
-    t1.add_row("1X / AH +0.5 Local", f"{1.0/(1.0/odds_1+1.0/odds_X):.2f} ({res['eff_1X']:.2f})", f"{(res['blend_win']+res['blend_draw'])*100:.1f}%", "-", c_ev(res['ev_1X']), f"${res['stake_1X']:.2f} ({res['pct_1X']*100:.2f}%)")
-    t1.add_row("X2 / AH +0.5 Visita", f"{1.0/(1.0/odds_X+1.0/odds_2):.2f} ({res['eff_X2']:.2f})", f"{(res['blend_draw']+res['blend_loss'])*100:.1f}%", "-", c_ev(res['ev_X2']), f"${res['stake_X2']:.2f} ({res['pct_X2']*100:.2f}%)")
+    t1.add_row(f"1 ([bold bright_cyan]{home_off}[/bold bright_cyan])", f"{odds_1:.2f} ({res['eff_1']:.2f})", f"{res['blend_win']*100:.1f}%", f"[{res['ci_win_low']*100:.1f}% - {res['ci_win_high']*100:.1f}%]", c_ev(res['ev_win']), c_stake(res['stake_win'], res['pct_win']))
+    t1.add_row("X ([bold yellow]Empate[/bold yellow])", f"{odds_X:.2f} ({res['eff_X']:.2f})", f"{res['blend_draw']*100:.1f}%", f"[{res['ci_draw_low']*100:.1f}% - {res['ci_draw_high']*100:.1f}%]", c_ev(res['ev_draw']), c_stake(res['stake_draw'], res['pct_draw']))
+    t1.add_row(f"2 ([bold bright_magenta]{away_off}[/bold bright_magenta])", f"{odds_2:.2f} ({res['eff_2']:.2f})", f"{res['blend_loss']*100:.1f}%", f"[{res['ci_loss_low']*100:.1f}% - {res['ci_loss_high']*100:.1f}%]", c_ev(res['ev_loss']), c_stake(res['stake_loss'], res['pct_loss']))
+    t1.add_row("1X / AH +0.5 Local", f"{1.0/(1.0/odds_1+1.0/odds_X):.2f} ({res['eff_1X']:.2f})", f"{(res['blend_win']+res['blend_draw'])*100:.1f}%", "-", c_ev(res['ev_1X']), c_stake(res['stake_1X'], res['pct_1X']))
+    t1.add_row("X2 / AH +0.5 Visita", f"{1.0/(1.0/odds_X+1.0/odds_2):.2f} ({res['eff_X2']:.2f})", f"{(res['blend_draw']+res['blend_loss'])*100:.1f}%", "-", c_ev(res['ev_X2']), c_stake(res['stake_X2'], res['pct_X2']))
     console.print(t1)
 
-    t2 = Table(title="2. Mercados Derivados (Goles O/U, BTTS, Córneres & Tarjetas)", show_header=True, header_style="bold blue")
-    t2.add_column("Mercado Derivado / Prop", style="cyan")
-    t2.add_column("Odds Entrada")
+    # Tabla 2: Mercados Derivados (Goles O/U, BTTS, Córneres & Tarjetas)
+    t2 = Table(title="2. Mercados Derivados (Goles O/U, BTTS, Córneres & Tarjetas)", show_header=True, header_style="bold white on magenta", border_style="magenta")
+    t2.add_column("Mercado Derivado / Prop", style="bold white")
+    t2.add_column("Odds Entrada", justify="center")
     t2.add_column("Prob. Modelo", justify="right")
     t2.add_column("Net EV", justify="right")
     t2.add_column("Stake Kelly Multi ($ / %)", justify="right")
 
     odd_ou25 = extra_odds.get('ou25_over', 1.0 / max(res['prob_over25_goals'], 0.05))
+    odd_ou25_under = res.get('odd_ou25_under', 1.0 / max(res['prob_under25_goals'], 0.05))
     odd_btts = extra_odds.get('btts_yes', 1.0 / max(res['prob_btts_yes'], 0.05))
     odd_corn = extra_odds.get('corners_over95', 1.0 / max(res['prob_over95_corners'], 0.05))
     odd_card = extra_odds.get('cards_over45', 1.0 / max(res['prob_over45_cards'], 0.05))
 
-    t2.add_row("Over 2.5 Goles Totales", f"{odd_ou25:.2f}", f"{res['prob_over25_goals']*100:.1f}%", c_ev(res['ev_ou25']), f"${res['stake_ou25']:.2f} ({res['pct_ou25']*100:.2f}%)")
-    t2.add_row("Under 2.5 Goles Totales", f"{1.0/max(res['prob_under25_goals'], 0.01):.2f}", f"{res['prob_under25_goals']*100:.1f}%", "[dim]Model Fair[/dim]", "$0.00 (0.00%)")
-    t2.add_row("Both Teams to Score (BTTS Yes)", f"{odd_btts:.2f}", f"{res['prob_btts_yes']*100:.1f}%", c_ev(res['ev_btts']), f"${res['stake_btts']:.2f} ({res['pct_btts']*100:.2f}%)")
-    t2.add_row("Over 9.5 Córneres Totales", f"{odd_corn:.2f}", f"{res['prob_over95_corners']*100:.1f}%", c_ev(res['ev_corners']), f"${res['stake_corners']:.2f} ({res['pct_corners']*100:.2f}%)")
-    t2.add_row("Over 4.5 Tarjetas Totales", f"{odd_card:.2f}", f"{res['prob_over45_cards']*100:.1f}%", c_ev(res['ev_cards']), f"${res['stake_cards']:.2f} ({res['pct_cards']*100:.2f}%)")
+    t2.add_row("Over 2.5 Goles Totales", f"{odd_ou25:.2f}", f"{res['prob_over25_goals']*100:.1f}%", c_ev(res['ev_ou25']), c_stake(res['stake_ou25'], res['pct_ou25']))
+    t2.add_row("Under 2.5 Goles Totales", f"{odd_ou25_under:.2f}", f"{res['prob_under25_goals']*100:.1f}%", c_ev(res['ev_ou25_under']), "$0.00 [dim](0.00%)[/dim]")
+    t2.add_row("Both Teams to Score (BTTS Yes)", f"{odd_btts:.2f}", f"{res['prob_btts_yes']*100:.1f}%", c_ev(res['ev_btts']), c_stake(res['stake_btts'], res['pct_btts']))
+    t2.add_row("Over 9.5 Córneres Totales", f"{odd_corn:.2f}", f"{res['prob_over95_corners']*100:.1f}%", c_ev(res['ev_corners']), c_stake(res['stake_corners'], res['pct_corners']))
+    t2.add_row("Over 4.5 Tarjetas Totales", f"{odd_card:.2f}", f"{res['prob_over45_cards']*100:.1f}%", c_ev(res['ev_cards']), c_stake(res['stake_cards'], res['pct_cards']))
     console.print(t2)
 
     best_bet_name, best_ev, best_stake, best_pct, best_raw_odd, best_eff_odd, _ = res['best_bet']
@@ -771,19 +1102,18 @@ def main():
             console.print(f"[yellow]El mejor EV ({best_bet_name} +{best_ev*100:.2f}%) supera el umbral de la liga ({res['league_ev_thresh']*100:.2f}%), pero el stake Kelly Multi-Activo es minúsculo (< 0.01%).[/yellow] -> [bold]PASS / NO BET[/bold]")
         else:
             rec = Panel(
-                f"[bold green]MEJOR OPORTUNIDAD VALUE DETECTADA[/bold green]\n"
-                f"Mercado Seleccionado: [bold]{best_bet_name}[/bold] @ {best_raw_odd:.2f} (Efectiva: {best_eff_odd:.2f})\n"
-                f"Net EV Proyectado: [bold]+{best_ev*100:.2f}%[/bold] (Umbral Liga {comp}: {res['league_ev_thresh']*100:.2f}%)\n"
-                f"Stake Kelly Multi-Activo: [bold]${best_stake:.2f}[/bold] ({best_pct*100:.2f}% del bankroll)",
-                title="SISTEMA DE STAKING INSTITUCIONAL MULTI-MERCADO", border_style="green"
+                f"[bold bright_green]🚀 MEJOR OPORTUNIDAD VALUE DETECTADA[/bold bright_green]\n\n"
+                f"Mercado Seleccionado: [bold white]{best_bet_name}[/bold white] @ [bold bright_yellow]{best_raw_odd:.2f}[/bold bright_yellow] (Efectiva: {best_eff_odd:.2f})\n"
+                f"Net EV Proyectado: [bold bright_green]+{best_ev*100:.2f}%[/bold bright_green] (Umbral Liga {get_formatted_comp_name(comp)}: {res['league_ev_thresh']*100:.2f}%)\n"
+                f"Stake Kelly Multi-Activo: [bold bright_yellow]${best_stake:,.2f}[/bold bright_yellow] ([bold white]{best_pct*100:.2f}%[/bold white] del bankroll)",
+                title="SISTEMA DE STAKING INSTITUCIONAL MULTI-MERCADO", border_style="bright_green"
             )
             console.print(rec)
             
-            # Exportar archivo de señales
             exp_file = export_trade_signals(res)
-            console.print(f"[dim]Señal de trading exportada a: {exp_file}[/dim]")
+            console.print(f"[dim white]✔ Señal de trading exportada exitosamente a: [bold yellow]{exp_file}[/bold yellow][/dim white]")
     elif best_ev > 0:
-        console.print(Panel(f"[yellow]EDGE INSUFICIENTE EN TODOS LOS MERCADOS.[/yellow]\nEl mejor EV proyectado fue en '{best_bet_name}' con +{best_ev*100:.2f}%. Umbral liga {comp}: {res['league_ev_thresh']*100:.2f}%. -> [bold]PASS / NO BET[/bold]", title="DECISIÓN SISTEMA", border_style="yellow"))
+        console.print(Panel(f"[yellow]EDGE INSUFICIENTE EN TODOS LOS MERCADOS.[/yellow]\nEl mejor EV proyectado fue en '{best_bet_name}' con +{best_ev*100:.2f}%. Umbral liga {get_formatted_comp_name(comp)}: {res['league_ev_thresh']*100:.2f}%. -> [bold]PASS / NO BET[/bold]", title="DECISIÓN SISTEMA", border_style="yellow"))
     else:
         console.print(Panel("[bold red]NO HAY VALUE EN NINGÚN MERCADO EN ESTE PARTIDO.[/bold red]\nLas cuotas del mercado son más eficientes que las proyecciones cuantitativas.", title="DECISIÓN SISTEMA", border_style="red"))
 

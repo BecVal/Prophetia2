@@ -100,20 +100,29 @@ def run_cli_backtest_test():
             total_goals = goals_home + goals_away
             
             is_win = False
-            if best_bet_name.startswith("1 (Local)") and actual_outcome == 2:
-                is_win = True
-            elif best_bet_name.startswith("X (Empate)") and actual_outcome == 1:
-                is_win = True
-            elif best_bet_name.startswith("2 (Visitante)") and actual_outcome == 0:
-                is_win = True
-            elif best_bet_name.startswith("Doble Oportunidad 1X") and actual_outcome in [1, 2]:
-                is_win = True
-            elif best_bet_name.startswith("Doble Oportunidad X2") and actual_outcome in [0, 1]:
-                is_win = True
-            elif best_bet_name.startswith("Over 2.5 Goles") and total_goals > 2.5:
-                is_win = True
-            elif best_bet_name.startswith("BTTS") and goals_home > 0 and goals_away > 0:
-                is_win = True
+            mkt_category = best_bet_name
+            
+            if best_bet_name.startswith("1 ") or best_bet_name.startswith("1 (Local"):
+                mkt_category = "1 (Local)"
+                if actual_outcome == 2: is_win = True
+            elif best_bet_name.startswith("X ") or best_bet_name.startswith("X (Empate"):
+                mkt_category = "X (Empate)"
+                if actual_outcome == 1: is_win = True
+            elif best_bet_name.startswith("2 ") or best_bet_name.startswith("2 (Visitante"):
+                mkt_category = "2 (Visitante)"
+                if actual_outcome == 0: is_win = True
+            elif best_bet_name.startswith("Doble Oportunidad 1X"):
+                mkt_category = "Doble Oportunidad 1X"
+                if actual_outcome in [1, 2]: is_win = True
+            elif best_bet_name.startswith("Doble Oportunidad X2"):
+                mkt_category = "Doble Oportunidad X2"
+                if actual_outcome in [0, 1]: is_win = True
+            elif best_bet_name.startswith("Over 2.5 Goles"):
+                mkt_category = "Over 2.5 Goles"
+                if total_goals > 2.5: is_win = True
+            elif best_bet_name.startswith("BTTS"):
+                mkt_category = "BTTS (Ambos Anotan)"
+                if goals_home > 0 and goals_away > 0: is_win = True
 
             net_odd = 1.0 + (best_raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
             
@@ -129,13 +138,13 @@ def run_cli_backtest_test():
                 total_profit += profit
                 bankroll += profit
 
-            if best_bet_name not in market_stats:
-                market_stats[best_bet_name] = {'bets': 0, 'wins': 0, 'staked': 0.0, 'profit': 0.0}
+            if mkt_category not in market_stats:
+                market_stats[mkt_category] = {'bets': 0, 'wins': 0, 'staked': 0.0, 'profit': 0.0}
             
-            market_stats[best_bet_name]['bets'] += 1
-            market_stats[best_bet_name]['wins'] += 1 if is_win else 0
-            market_stats[best_bet_name]['staked'] += best_stake
-            market_stats[best_bet_name]['profit'] += profit
+            market_stats[mkt_category]['bets'] += 1
+            market_stats[mkt_category]['wins'] += 1 if is_win else 0
+            market_stats[mkt_category]['staked'] += best_stake
+            market_stats[mkt_category]['profit'] += profit
 
     winrate = (wins / total_bets * 100.0) if total_bets > 0 else 0.0
     roi = (total_profit / total_staked * 100.0) if total_staked > 0 else 0.0
