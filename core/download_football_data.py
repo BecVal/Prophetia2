@@ -13,7 +13,7 @@ logger = get_logger(__name__, 'download_football_data')
 # Configuración de ligas y temporadas a descargar
 
 LEAGUES = ['E0', 'E1', 'SP1', 'SP2', 'I1', 'I2', 'D1', 'D2', 'F1', 'F2', 'N1', 'B1', 'P1', 'T1', 'G1', 'SC0', 'E2']
-EXTRA_LEAGUES = ['USA', 'JPN', 'SWE', 'NOR', 'DNK', 'SWZ', 'AUT']
+EXTRA_LEAGUES = ['USA', 'JPN', 'SWE', 'NOR', 'DNK', 'SWZ', 'AUT', 'MEX']
 SEASONS = ['1415', '1516', '1617', '1718', '1819', '1920', '2021', '2122', '2223', '2324', '2425', '2526']
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281/{season}/{league}.csv"

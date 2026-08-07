@@ -328,7 +328,8 @@ def build_intermediate_from_footballdata():
                     'NOR': 'Eliteserien',
                     'DNK': 'Superligaen',
                     'SWZ': 'Swiss Super League',
-                    'AUT': 'Austrian Bundesliga'
+                    'AUT': 'Austrian Bundesliga',
+                    'MEX': 'Liga MX'
                 }
                 
                 if file_code in EXTRA_LEAGUES_MAP:

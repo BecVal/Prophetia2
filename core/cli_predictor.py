@@ -20,11 +20,13 @@ if script_dir not in sys.path:
 
 from models.train_quant_advanced import predict_from_model, KalmanDixonColesQuantModel
 from market_models.train_gbm_model import compute_gbm_features
+from market_models.train_market import compute_shin_probs, compute_power_probs
 from models.train_nn import SklearnPyTorchWrapper10, PyTorchGatedResNet10, GatedContext, ResidualBlock
 from models.train_draws import HybridDrawsEnsemble
 from ingestion.live_odds_feed import LiveOddsFeedFetcher
 from ingestion.lineup_fetcher import LineupImpactFetcher
 from team_mapping import normalize_team_name
+from markowitz_optimizer import MarkowitzPortfolioOptimizer
 
 import __main__
 __main__.SklearnPyTorchWrapper10 = SklearnPyTorchWrapper10
@@ -134,6 +136,9 @@ COMPETITION_DISPLAY_NAMES = {
     # América & Internacional
     'Major League Soccer': '🇺🇸 Major League Soccer (EEUU)',
     'MLS': '🇺🇸 Major League Soccer (EEUU)',
+    'Liga MX': '🇲🇽 Liga MX (México)',
+    'MEX': '🇲🇽 Liga MX (México)',
+    'MEX1': '🇲🇽 Liga MX (México)',
     'Champions League': '🇪🇺 UEFA Champions League',
     'CL': '🇪🇺 UEFA Champions League',
     'Europa League': '🇪🇺 UEFA Europa League',
@@ -276,13 +281,12 @@ def get_param_by_comp(param_dict, comp, default_val=0.015):
     return param_dict.get('DEFAULT', default_val)
 
 def calculate_dynamic_alpha(p_model, p_market, alpha_low, alpha_med, alpha_high):
+    """ Función continua (smooth decay) para blending de probabilidades """
     divergence = abs(p_model - p_market)
-    if divergence < 0.05:
-        return alpha_low
-    elif divergence < 0.12:
-        return alpha_med
-    else:
-        return alpha_high
+    alpha_max = max(alpha_low, alpha_med, alpha_high)
+    alpha_min = min(alpha_low, alpha_med, alpha_high)
+    decay = np.exp(-25.0 * (divergence ** 2))
+    return alpha_min + (alpha_max - alpha_min) * decay
 
 def calculate_market_slippage(odds, stake, liquidity_cap):
     if stake <= 0 or liquidity_cap <= 0:
@@ -303,33 +307,35 @@ def calculate_bayesian_uncertainty(probs_list):
     return mean_p, se, ci_low, ci_high, uncertainty_penalty
 
 def solve_multi_asset_kelly(ev_vec, odds_vec, prob_vec, corr_matrix, bankroll, max_stake_pct, penalty=1.0, max_liquidity=2000.0, league_kelly=0.015):
+    """
+    Asignación de portafolio multi-activo basada en la Teoría de Portafolio de Harry Markowitz (1952) (Mean-Variance Optimization).
+    """
     n = len(ev_vec)
-    ev_arr = np.maximum(np.asarray(ev_vec, dtype=np.float64), 0.0)
-    prob_arr = np.asarray(prob_vec, dtype=np.float64)
-    odds_arr = np.asarray(odds_vec, dtype=np.float64)
+    if n == 0:
+        return [], []
     
-    std_vec = np.sqrt(np.clip(prob_arr * (1.0 - prob_arr), 1e-4, 1.0))
-    cov_matrix = np.outer(std_vec, std_vec) * corr_matrix
-    reg_cov = cov_matrix + np.eye(n) * 1e-3
-    
-    try:
-        inv_cov = np.linalg.inv(reg_cov)
-        b_vec = np.maximum(odds_arr - 1.0, 0.01)
-        raw_weights = inv_cov @ (ev_arr / b_vec)
-        raw_weights = np.maximum(raw_weights, 0.0)
-    except np.linalg.LinAlgError:
-        raw_weights = ev_arr / np.maximum(odds_arr - 1.0, 0.01)
-        
-    scaled_weights = raw_weights * penalty * league_kelly
-    stakes = []
-    pcts = []
-    for i in range(n):
-        pct = float(np.clip(scaled_weights[i], 0.0, max_stake_pct))
-        if odds_arr[i] < 1.30: pct = min(pct, 0.01)
-        stake = min(bankroll * pct, max_liquidity)
-        stakes.append(stake)
-        pcts.append(pct)
-        
+    scale = float(penalty * (league_kelly / 0.015))
+    penalties = [scale] * n
+    liquidity_caps = [max_liquidity] * n
+
+    optimizer = MarkowitzPortfolioOptimizer(
+        risk_aversion=2.0,
+        max_stake_pct=max_stake_pct,
+        max_daily_portfolio_pct=0.15
+    )
+
+    res = optimizer.optimize_mean_variance(
+        ev_vec=ev_vec,
+        odds_vec=odds_vec,
+        prob_vec=prob_vec,
+        corr_matrix=corr_matrix,
+        bankroll=bankroll,
+        uncertainty_penalties=penalties,
+        liquidity_caps=liquidity_caps
+    )
+
+    stakes = [float(s) for s in res['stakes']]
+    pcts = [float(p) for p in res['weights']]
     return stakes, pcts
 
 def compute_poisson_market_correlations(poisson_matrix):
@@ -501,8 +507,10 @@ def build_live_match_features(
     home_row = get_latest_team_row(df, home_team)
     away_row = get_latest_team_row(df, away_team)
     
-    if home_row is None or away_row is None:
-        return None
+    if home_row is None:
+        home_row = pd.Series({'team_elo': 1500.0, 'team_squad_value': 0.0})
+    if away_row is None:
+        away_row = pd.Series({'team_elo': 1500.0, 'team_squad_value': 0.0})
 
     input_data = {}
     
@@ -559,6 +567,36 @@ def build_live_match_features(
     input_data['steam_win'] = float((1.0 / max(odds_1, 1.01)) - (1.0 / max(open_1, 1.01)))
     input_data['steam_draw'] = float((1.0 / max(odds_X, 1.01)) - (1.0 / max(open_X, 1.01)))
     input_data['steam_loss'] = float((1.0 / max(odds_2, 1.01)) - (1.0 / max(open_2, 1.01)))
+
+    sw, sd, sl, sz = compute_shin_probs([odds_1], [odds_X], [odds_2])
+    input_data['shin_prob_win'] = float(sw[0])
+    input_data['shin_prob_draw'] = float(sd[0])
+    input_data['shin_prob_loss'] = float(sl[0])
+    input_data['shin_z_param'] = float(sz.item() if hasattr(sz, 'item') else sz)
+
+    pw_pow, pd_pow, pl_pow = compute_power_probs([odds_1], [odds_X], [odds_2])
+    input_data['power_prob_win'] = float(pw_pow[0])
+    input_data['power_prob_draw'] = float(pd_pow[0])
+    input_data['power_prob_loss'] = float(pl_pow[0])
+
+    input_data['log_steam_win'] = float(np.log(max(input_data['prob_win_implied'], 1e-4) / max(input_data['open_prob_win'], 1e-4)))
+    input_data['log_steam_draw'] = float(np.log(max(input_data['prob_draw_implied'], 1e-4) / max(input_data['open_prob_draw'], 1e-4)))
+    input_data['log_steam_loss'] = float(np.log(max(input_data['prob_loss_implied'], 1e-4) / max(input_data['open_prob_loss'], 1e-4)))
+
+    input_data['rel_steam_win'] = float(input_data['steam_win'] / max(input_data['open_prob_win'], 1e-4))
+    input_data['rel_steam_draw'] = float(input_data['steam_draw'] / max(input_data['open_prob_draw'], 1e-4))
+    input_data['rel_steam_loss'] = float(input_data['steam_loss'] / max(input_data['open_prob_loss'], 1e-4))
+
+    p_close = np.array([input_data['prob_win_implied'], input_data['prob_draw_implied'], input_data['prob_loss_implied']])
+    p_open = np.array([input_data['open_prob_win'], input_data['open_prob_draw'], input_data['open_prob_loss']])
+
+    input_data['market_entropy'] = float(-np.sum(p_close * np.log(np.maximum(p_close, 1e-9))))
+    input_data['open_market_entropy'] = float(-np.sum(p_open * np.log(np.maximum(p_open, 1e-9))))
+    input_data['entropy_change'] = float(input_data['market_entropy'] - input_data['open_market_entropy'])
+
+    sorted_p = np.sort(p_close)
+    input_data['fav_prob_gap'] = float(sorted_p[2] - sorted_p[1])
+    input_data['overround_drop'] = float(input_data['vig_open'] - input_data['vig_close'])
 
     return input_data
 
@@ -626,7 +664,10 @@ def predict_match(
     final_data = models_dict['final']
     quant_dict = models_dict['quant']
 
-    all_req_features = set(context_data['features'] + nn_data['features'] + draws_data['features'])
+    all_req_features = set()
+    for m_key in ['context', 'nn', 'draws', 'gbm', 'market', 'fundamental', 'final']:
+        if m_key in models_dict and isinstance(models_dict[m_key], dict) and 'features' in models_dict[m_key]:
+            all_req_features.update(models_dict[m_key]['features'])
     for f in all_req_features:
         if f not in input_data:
             input_data[f] = 0.0
@@ -831,8 +872,15 @@ def predict_match(
         ("Over 4.5 Tarjetas", ev_cards, s_cards, p_cards_stk, odd_cards, odd_cards, prob_over45_cards)
     ]
     
-    all_bets.sort(key=lambda x: x[1], reverse=True)
-    best_bet = all_bets[0]
+    # Criterio de Selección de Apostado Cuantitativo (Simulador Bankroll)
+    # Si tanto Local como Empate tienen EV+, o Visita y Empate tienen EV+, priorizar Doble Oportunidad / Dutching
+    if ev_win > league_ev_thresh and ev_draw > league_ev_thresh:
+        best_bet = (("Doble Oportunidad 1X", ev_1X, s_1X, p_1X_stk, combined_odds_1X, eff_1X, blend_1X))
+    elif ev_loss > league_ev_thresh and ev_draw > league_ev_thresh:
+        best_bet = (("Doble Oportunidad X2", ev_X2, s_X2, p_X2_stk, combined_odds_X2, eff_X2, blend_X2))
+    else:
+        sorted_bets = sorted(all_bets, key=lambda x: x[1], reverse=True)
+        best_bet = sorted_bets[0]
 
     return {
         'home_team': home_team, 'away_team': away_team, 'competition': comp,
@@ -904,6 +952,7 @@ def main():
     live_fetcher = LiveOddsFeedFetcher()
     live_matches = live_fetcher.get_live_league_fixtures(comp)
 
+    selected_match = None
     home_team, away_team = None, None
     odds_1, odds_X, odds_2 = None, None, None
     open_odds_win, open_odds_draw, open_odds_loss = None, None, None

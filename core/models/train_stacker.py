@@ -29,7 +29,7 @@ from core.logger_config import get_logger
 # ==============================================================================
 # Cambia RUN_OPTUNA a True si deseas volver a buscar los mejores hiperparámetros.
 # De lo contrario (False), cargará los mejores guardados en el archivo JSON.
-RUN_OPTUNA = False
+RUN_OPTUNA = True
 OPTUNA_TRIALS = 40
 # ==============================================================================
 

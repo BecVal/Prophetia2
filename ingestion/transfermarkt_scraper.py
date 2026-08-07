@@ -45,6 +45,7 @@ TRANSFERMARKT_LEAGUES = {
     'DNK': ('superligaen', 'DK1'),
     'SWZ': ('super-league', 'C1'),
     'AUT': ('bundesliga', 'A1'),
+    'MEX': ('liga-mx-apertura', 'MEX1'),
 }
 
 # The years in transfermarkt map to the start of the season (e.g. 2014 for 1415 season)

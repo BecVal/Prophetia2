@@ -15,9 +15,16 @@ from core.logger_config import get_logger
 
 logger = get_logger(__name__, 'simulate_bankroll')
 
-# --- CONFIGURACIÓN QUANT DE NIVEL INSTITUCIONAL (10/10) ---
 FILTER_BY_WHITELIST = False  # True: ignora partidos fuera de Whitelist en la simulación financiera
-WHITELIST_LEAGUES = ['F1', 'F2', 'SP1', 'G1', 'B1', 'P1', 'SP2', 'SC0', 'D1', 'D2', 'E1', 'MLS', 'J1', 'E2']
+
+from core.league_mapping import CANONICAL_LEAGUES, COMPETITION_MAPPING, WHITELIST_LEAGUES, normalize_league
+from core.markowitz_optimizer import MarkowitzPortfolioOptimizer
+
+def is_in_whitelist(comp):
+    if not FILTER_BY_WHITELIST:
+        return True
+    return normalize_league(comp) in WHITELIST_LEAGUES
+
 
 # Límites de Exposición y Gestión de Riesgo de Portafolio
 MAX_STAKE_PCT = 0.03               # Stake máximo por apuesta (3.0% del bankroll)
@@ -32,58 +39,27 @@ MARKET_IMPACT_GAMMA = 0.05        # Coeficiente de impacto de mercado (Square-ro
 MAX_BET_LIQUIDITY = {             # Límites de liquidez absolutos por competición (USD)
     'D1': 2000.0, 'SP1': 2000.0, 'I1': 2000.0, 'G1': 2000.0, 'F1': 2000.0,
     'D2': 2000.0, 'F2': 2000.0, 'T1': 2000.0, 'MLS': 1500.0, 'J1': 1500.0,
+    'MEX': 1500.0,
     'DEFAULT': 2000.0
 }
 
 # CONFIGURACIÓN DE OPTIMIZACIÓN
-OPTIMIZATION_MODE = 'NONE'  # 'NONE', 'ALL', 'WHITELIST', o liga específica
-OPTUNA_TRIALS = 1000
+OPTIMIZATION_MODE = 'MEX'  # 'NONE', 'ALL', 'WHITELIST', o liga específica
+OPTUNA_TRIALS = 10000
 OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
 
 # Diccionarios de riesgo por defecto
-KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'DEFAULT': 0.015}
-EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 'D1': 0.015, 'T1': 0.01, 'F1': 0.015, 'E1': 0.015, 'N1': 0.02, 'SP2': 0.02, 'P1': 0.02, 'DEFAULT': 0.015}
+KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'MEX': 0.02, 'DEFAULT': 0.015}
+EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 'D1': 0.015, 'T1': 0.01, 'F1': 0.015, 'E1': 0.015, 'N1': 0.02, 'SP2': 0.02, 'P1': 0.02, 'MEX': 0.015, 'DEFAULT': 0.015}
 
 ALPHA_DIV_LOW = {'DEFAULT': 0.85}
 ALPHA_DIV_MED = {'DEFAULT': 0.70}
 ALPHA_DIV_HIGH = {'DEFAULT': 0.50}
 
-# MAPEO ANTI-CORRUPCIÓN: Europa, EE.UU. (MLS), Japón (J1) e Internacionales UEFA/FIFA
-COMPETITION_MAPPING = {
-    # Ligas Europeas Principales
-    'E0': 'Premier League', 'Premier League': 'E0',
-    'SP1': 'La Liga', 'La Liga': 'SP1',
-    'D1': '1. Bundesliga', '1. Bundesliga': 'D1',
-    'I1': 'Serie A', 'Serie A': 'I1',
-    'F1': 'Ligue 1', 'Ligue 1': 'F1',
-    'E1': 'Championship', 'Championship': 'E1',
-    'SP2': 'La Liga 2', 'La Liga 2': 'SP2',
-    'D2': '2. Bundesliga', '2. Bundesliga': 'D2',
-    'F2': 'Ligue 2', 'Ligue 2': 'F2',
-    'I2': 'Serie B', 'Serie B': 'I2',
-    'B1': 'Jupiler Pro League', 'Jupiler Pro League': 'B1',
-    'N1': 'Eredivisie', 'Eredivisie': 'N1',
-    'P1': 'Primeira Liga', 'Primeira Liga': 'P1',
-    'SC0': 'Scottish Premiership', 'Scottish Premiership': 'SC0',
-    'T1': 'Süper Lig', 'Süper Lig': 'T1',
-    'E2': 'League One', 'League One': 'E2',
-    # EE.UU. y Japón (Bajo índice de corrupción)
-    'MLS': 'Major League Soccer', 'Major League Soccer': 'MLS',
-    'J1': 'J-League 1', 'J-League 1': 'J1',
-    # Torneos Internacionales UEFA / FIFA
-    'CL': 'Champions League', 'Champions League': 'CL',
-    'EL': 'Europa League', 'Europa League': 'EL',
-    'WC': 'FIFA World Cup', 'FIFA World Cup': 'WC'
-}
-
 def get_param_by_comp(param_dict, comp, default_val=0.015):
-    """ Busca un parámetro intentando el código corto y el nombre largo """
-    if comp in param_dict:
-        return param_dict[comp]
-    alt_name = COMPETITION_MAPPING.get(comp)
-    if alt_name and alt_name in param_dict:
-        return param_dict[alt_name]
-    return param_dict.get('DEFAULT', default_val)
+    """ Busca un parámetro usando el nombre canónico de la competición """
+    canonical = normalize_league(comp)
+    return param_dict.get(canonical, param_dict.get('DEFAULT', default_val))
 
 def load_optimized_params():
     global KELLY_FRACTIONS, EV_THRESHOLDS, ALPHA_DIV_LOW, ALPHA_DIV_MED, ALPHA_DIV_HIGH
@@ -195,7 +171,7 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
         # 1. EVALUACIÓN Y SELECCIÓN DE OPORTUNIDADES EV+
         for i in day_indices:
             comp = competitions[i]
-            if FILTER_BY_WHITELIST and comp not in WHITELIST_LEAGUES:
+            if not is_in_whitelist(comp):
                 continue
 
             p_loss, p_draw, p_win = y_prob[i]
@@ -281,12 +257,16 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
 
         candidate_bets.sort(key=lambda x: x['best_ev'], reverse=True)
 
-        # 2. CÁLCULO DE STAKES Y GESTIÓN DE RIESGO DE PORTAFOLIO SIMULTÁNEO
+        # 2. CÁLCULO DE STAKES Y GESTIÓN DE RIESGO DE PORTAFOLIO SIMULTÁNEO (HARRY MARKOWITZ 1952)
         current_dd = (historical_peak - start_of_day_bankroll) / historical_peak if historical_peak > 0 else 0
         reactive_risk_factor = max(0.25, 1.0 - (current_dd / MAX_DRAWDOWN_TARGET))
 
-        unscaled_bets = []
-        total_daily_unscaled_stake = 0.0
+        ev_vec = []
+        odds_vec = []
+        prob_vec = []
+        penalties = []
+        liquidity_caps = []
+        bet_metadata = []
 
         for bet in candidate_bets:
             best_choice = bet['best_choice']
@@ -303,29 +283,46 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
             if bet_type == 'single':
                 raw_odd = odds[best_choice]
                 net_odd = 1.0 + (raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                b = net_odd - 1.0
-                kelly_ev = min(best_ev, 0.15)
-                kelly_pct = kelly_ev / b if b > 0 else 0
-                if raw_odd < 1.30: kelly_pct = min(kelly_pct, 0.01)
-
-                stake_pct = min(kelly_pct * adj_kelly_fraction, MAX_STAKE_PCT)
-                if stake_pct < 0.0001: continue
-
-                target_stake = min(start_of_day_bankroll * stake_pct, max_liquidity)
+                prob_est = (1.0 + best_ev) / net_odd if net_odd > 0 else 0.5
+                ev_val = best_ev
+                odd_val = net_odd
             else: # dutching
                 total_implied = (1.0 / odds[best_choice]) + (1.0 / odds[secondary_choice])
                 combined_odds = 1.0 / total_implied
                 net_combined_odds = 1.0 + (combined_odds - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                b = net_combined_odds - 1.0
-                kelly_ev = min(best_ev, 0.15)
-                kelly_pct = kelly_ev / b if b > 0 else 0
-                if combined_odds < 1.30: kelly_pct = min(kelly_pct, 0.01)
+                prob_est = (1.0 + best_ev) / net_combined_odds if net_combined_odds > 0 else 0.5
+                ev_val = best_ev
+                odd_val = net_combined_odds
 
-                stake_pct = min(kelly_pct * adj_kelly_fraction, MAX_STAKE_PCT)
-                if stake_pct < 0.001: continue
+            ev_vec.append(ev_val)
+            odds_vec.append(odd_val)
+            prob_vec.append(prob_est)
+            penalties.append(adj_kelly_fraction / 0.015)
+            liquidity_caps.append(max_liquidity)
+            bet_metadata.append(bet)
 
-                target_stake = min(start_of_day_bankroll * stake_pct, max_liquidity)
+        markowitz = MarkowitzPortfolioOptimizer(
+            risk_aversion=2.0,
+            max_stake_pct=MAX_STAKE_PCT,
+            max_daily_portfolio_pct=MAX_DAILY_PORTFOLIO_PCT
+        )
 
+        m_res = markowitz.optimize_mean_variance(
+            ev_vec=ev_vec,
+            odds_vec=odds_vec,
+            prob_vec=prob_vec,
+            bankroll=start_of_day_bankroll,
+            uncertainty_penalties=penalties,
+            liquidity_caps=liquidity_caps
+        )
+
+        unscaled_bets = []
+        total_daily_unscaled_stake = 0.0
+
+        for i, bet in enumerate(bet_metadata):
+            target_stake = float(m_res['stakes'][i]) if i < len(m_res['stakes']) else 0.0
+            if target_stake < 0.1:
+                continue
             unscaled_bets.append((bet, target_stake))
             total_daily_unscaled_stake += target_stake
 
@@ -370,6 +367,7 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
 
+                true_clv = np.nan
                 if has_closing_odds:
                     idx = bet['index']
                     c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
@@ -397,14 +395,20 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     league_stats[comp]['profit'] -= stake
                     gross_loss_sum += stake
 
+                outcome_labels = {0: 'Away (2)', 1: 'Draw (X)', 2: 'Home (1)'}
                 placed_bets_history.append({
+                    'date': str(current_date),
+                    'comp': comp,
+                    'bet_type': 'single',
+                    'chosen_label': outcome_labels.get(best_choice, str(best_choice)),
                     'ev': best_ev,
                     'prob': bet['blended_probs'][best_choice],
                     'odds': eff_odds,
                     'stake': stake,
                     'stake_pct': stake / start_of_day_bankroll if start_of_day_bankroll > 0 else 0,
                     'is_win': int(real_outcome == best_choice),
-                    'net_profit': net_profit_record
+                    'net_profit': net_profit_record,
+                    'clv': true_clv
                 })
 
             elif bet_type == 'dutching':
@@ -422,6 +426,7 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
 
+                true_clv = np.nan
                 if has_closing_odds:
                     idx = bet['index']
                     c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
@@ -451,14 +456,20 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     league_stats[comp]['profit'] -= stake
                     gross_loss_sum += stake
 
+                dutch_labels = {(2, 1): 'Home or Draw (1X)', (0, 1): 'Away or Draw (X2)'}
                 placed_bets_history.append({
+                    'date': str(current_date),
+                    'comp': comp,
+                    'bet_type': 'dutching',
+                    'chosen_label': dutch_labels.get((best_choice, secondary_choice), 'Dutching'),
                     'ev': best_ev,
                     'prob': bet['blended_probs'][best_choice] + bet['blended_probs'][secondary_choice],
                     'odds': eff_combined_odds,
                     'stake': stake,
                     'stake_pct': stake / start_of_day_bankroll if start_of_day_bankroll > 0 else 0,
                     'is_win': int(real_outcome in [best_choice, secondary_choice]),
-                    'net_profit': net_profit_record
+                    'net_profit': net_profit_record,
+                    'clv': true_clv
                 })
 
         liquid_bankroll += day_profit
@@ -560,7 +571,7 @@ def run_simulation():
             df_train_opt = pd.read_parquet(TRAIN_PREDS_PATH, engine='fastparquet')
             leagues = df_train_opt['competition'].unique() if OPTIMIZATION_MODE == 'ALL' else [OPTIMIZATION_MODE]
             for comp in leagues:
-                if FILTER_BY_WHITELIST and comp not in WHITELIST_LEAGUES: continue
+                if not is_in_whitelist(comp): continue
                 best_params = optimize_league(df_train_opt, comp)
                 if best_params:
                     EV_THRESHOLDS[comp] = best_params['ev_thresh']
@@ -575,7 +586,7 @@ def run_simulation():
     logger.info("=== EVALUACIÓN FINANCIERA INSTITUCIONAL (Bankroll Simulation 10/10) ===")
 
     # CALIBRACIÓN GLOBAL
-    df_eval = df[df['competition'].isin(WHITELIST_LEAGUES)].copy() if FILTER_BY_WHITELIST else df.copy()
+    df_eval = df[df['competition'].apply(is_in_whitelist)].copy() if FILTER_BY_WHITELIST else df.copy()
     if not df_eval.empty:
         y_prob_eval = df_eval[['prob_loss', 'prob_draw', 'prob_win']].values
         y_true_eval = df_eval['outcome'].values
@@ -724,15 +735,95 @@ def run_simulation():
         logger.info(f"Yield Real: {yield_pct:.2f}% | xYield Mediano (Sim): {np.median(synthetic_yields):.2f}% | Percentil Yield: {percentile_yield:.1f}%")
         logger.info(f"MDD Real: {historical_mdd*100:.2f}% | xMDD Mediano (Sim): {np.median(synthetic_mdds):.2f}% | Percentil MDD: {percentile_mdd:.1f}%")
 
-        # GENERACIÓN Y EXPORTACIÓN DE GRÁFICAS DE EXECUTIVE DASHBOARD
+        # GENERACIÓN Y EXPORTACIÓN AUTOMÁTICA DE REPORTES Y DASHBOARDS (PNG + CSV)
         log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
-        os.makedirs(log_dir, exist_ok=True)
+        plot_dir = os.path.join(log_dir, 'plots')
+        csv_dir = os.path.join(log_dir, 'plots', 'csv')
+        os.makedirs(plot_dir, exist_ok=True)
+        os.makedirs(csv_dir, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # 1. CALIBRATION DATA & RELIABILITY DIAGRAM (CSV + PNG)
         try:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+            bins = np.linspace(0.0, 1.0, 11)
+            df_bets['prob_bin'] = pd.cut(df_bets['prob'], bins=bins, include_lowest=True)
             
-            # Subplot 1: Equity Curve
+            calib_records = []
+            for bin_interval, group in df_bets.groupby('prob_bin', observed=False):
+                count = len(group)
+                if count > 0:
+                    pred_mean = group['prob'].mean()
+                    win_rate = group['is_win'].mean()
+                    staked = group['stake'].sum()
+                    profit = group['net_profit'].sum()
+                    brier = np.mean((group['prob'] - group['is_win']) ** 2)
+                else:
+                    pred_mean = bin_interval.mid
+                    win_rate = np.nan
+                    staked = 0.0
+                    profit = 0.0
+                    brier = np.nan
+                
+                calib_records.append({
+                    'bin_lower': bin_interval.left,
+                    'bin_upper': bin_interval.right,
+                    'bin_midpoint': bin_interval.mid,
+                    'predicted_prob_mean': pred_mean,
+                    'actual_win_rate': win_rate,
+                    'sample_count': count,
+                    'total_staked': staked,
+                    'total_profit': profit,
+                    'brier_score': brier
+                })
+            
+            calib_df = pd.DataFrame(calib_records)
+            calib_csv_path = os.path.join(csv_dir, f'calibration_data_{timestamp_str}.csv')
+            calib_df.to_csv(calib_csv_path, index=False)
+            logger.info(f"Datos de calibración exportados exitosamente en: {calib_csv_path}")
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [3, 1]})
+            valid_calib = calib_df.dropna(subset=['actual_win_rate'])
+            
+            ax1.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration (y = x)', alpha=0.7)
+            ax1.plot(valid_calib['predicted_prob_mean'], valid_calib['actual_win_rate'], 's-', color='#2ca02c', linewidth=2.0, markersize=7, label='Empirical Win Rate')
+            ax1.set_title(f'Prophetia2 - Model Calibration & Reliability Curve ({timestamp_str})', fontsize=12, fontweight='bold')
+            ax1.set_xlabel('Predicted Probability')
+            ax1.set_ylabel('Empirical Win Rate')
+            ax1.set_xlim([0, 1])
+            ax1.set_ylim([0, 1])
+            ax1.legend(loc='upper left')
+            ax1.grid(True, alpha=0.3)
+
+            ax2.bar(valid_calib['bin_midpoint'], valid_calib['sample_count'], width=0.07, color='#1f77b4', alpha=0.7)
+            ax2.set_xlabel('Predicted Probability Bin')
+            ax2.set_ylabel('Bet Count')
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            calib_plot_path = os.path.join(plot_dir, f'calibration_plot_{timestamp_str}.png')
+            plt.savefig(calib_plot_path, dpi=150)
+            plt.close()
+            logger.info(f"Gráfica de calibración guardada en: {calib_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar exportación de calibración: {e}")
+
+        # 2. EQUITY & DRAWDOWN (CSV + PNG)
+        try:
+            bh_arr = np.array(bankroll_history)
+            peaks_arr = np.maximum.accumulate(bh_arr)
+            dd_arr = (peaks_arr - bh_arr) / peaks_arr * 100.0
+
+            eq_df = pd.DataFrame({
+                'sequence_index': np.arange(len(bh_arr)),
+                'bankroll': bh_arr,
+                'peak_bankroll': peaks_arr,
+                'drawdown_pct': dd_arr
+            })
+            eq_csv_path = os.path.join(csv_dir, f'equity_drawdown_data_{timestamp_str}.csv')
+            eq_df.to_csv(eq_csv_path, index=False)
+            logger.info(f"Datos de curva de equidad exportados en: {eq_csv_path}")
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
             ax1.plot(bankroll_history, color='#1f77b4', linewidth=1.8, label='Liquid Bankroll ($)')
             ax1.axhline(1000.0, color='gray', linestyle='--', alpha=0.6, label='Initial Capital ($1000)')
             ax1.set_title('Prophetia2 Quant Simulator - Equity Curve & Drawdown Waterfall', fontsize=12, fontweight='bold')
@@ -740,10 +831,6 @@ def run_simulation():
             ax1.legend(loc='upper left')
             ax1.grid(True, alpha=0.3)
 
-            # Subplot 2: Drawdown Curve
-            bh_arr = np.array(bankroll_history)
-            peaks_arr = np.maximum.accumulate(bh_arr)
-            dd_arr = (peaks_arr - bh_arr) / peaks_arr * 100.0
             ax2.fill_between(range(len(dd_arr)), 0, -dd_arr, color='#d62728', alpha=0.4, label='Drawdown (%)')
             ax2.plot(-dd_arr, color='#d62728', linewidth=1.0)
             ax2.set_xlabel('Bets Placed (Sequence)')
@@ -753,12 +840,333 @@ def run_simulation():
             ax2.grid(True, alpha=0.3)
 
             plt.tight_layout()
-            dash_plot_path = os.path.join(log_dir, f'equity_drawdown_plot_{timestamp_str}.png')
+            dash_plot_path = os.path.join(plot_dir, f'equity_drawdown_plot_{timestamp_str}.png')
             plt.savefig(dash_plot_path, dpi=150)
             plt.close()
             logger.info(f"Dashboard de Equity & Drawdown generado en: {dash_plot_path}")
         except Exception as e:
-            logger.error(f"Error al generar gráfica de dashboard: {e}")
+            logger.error(f"Error al generar dashboard de equity & drawdown: {e}")
+
+        # 3. MONTE CARLO DISTRIBUTION (CSV + PNG)
+        try:
+            mc_df = pd.DataFrame({
+                'sim_id': np.arange(n_sims),
+                'final_bankroll': final_capitals,
+                'yield_pct': synthetic_yields,
+                'max_drawdown_pct': synthetic_mdds
+            })
+            mc_csv_path = os.path.join(csv_dir, f'monte_carlo_data_{timestamp_str}.csv')
+            mc_df.to_csv(mc_csv_path, index=False)
+            logger.info(f"Datos de Monte Carlo exportados en: {mc_csv_path}")
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            ax1.hist(final_capitals, bins=50, color='#1f77b4', edgecolor='black', alpha=0.7)
+            ax1.axvline(np.median(final_capitals), color='red', linestyle='--', linewidth=1.5, label=f'Median (${np.median(final_capitals):.2f})')
+            ax1.axvline(np.percentile(final_capitals, 5), color='orange', linestyle=':', linewidth=1.5, label=f'P5 (${np.percentile(final_capitals, 5):.2f})')
+            ax1.set_title('Monte Carlo Final Bankroll Distribution', fontsize=11, fontweight='bold')
+            ax1.set_xlabel('Final Bankroll ($)')
+            ax1.set_ylabel('Frequency')
+            ax1.legend(loc='upper right')
+            ax1.grid(True, alpha=0.3)
+
+            ax2.hist(synthetic_mdds, bins=50, color='#d62728', edgecolor='black', alpha=0.7)
+            ax2.axvline(np.median(synthetic_mdds), color='black', linestyle='--', linewidth=1.5, label=f'Median MDD ({np.median(synthetic_mdds):.2f}%)')
+            ax2.axvline(np.percentile(synthetic_mdds, 95), color='darkred', linestyle=':', linewidth=1.5, label=f'P95 Tail Risk ({np.percentile(synthetic_mdds, 95):.2f}%)')
+            ax2.set_title('Monte Carlo Max Drawdown Distribution', fontsize=11, fontweight='bold')
+            ax2.set_xlabel('Max Drawdown (%)')
+            ax2.set_ylabel('Frequency')
+            ax2.legend(loc='upper right')
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            mc_plot_path = os.path.join(plot_dir, f'monte_carlo_distribution_plot_{timestamp_str}.png')
+            plt.savefig(mc_plot_path, dpi=150)
+            plt.close()
+            logger.info(f"Gráfica de distribución de Monte Carlo guardada en: {mc_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar distribución de Monte Carlo: {e}")
+
+        # 4. LEAGUE PERFORMANCE BREAKDOWN (CSV + PNG)
+        try:
+            league_records = []
+            for comp, stats in league_stats.items():
+                b_cnt = stats['bets']
+                if b_cnt == 0: continue
+                w_rate = (stats['won'] / b_cnt) * 100.0
+                r_yield = (stats['profit'] / stats['staked'] * 100.0) if stats['staked'] > 0 else 0.0
+                w_b = b_cnt / (b_cnt + 30.0)
+                bayes_y = float(w_b * r_yield + (1.0 - w_b) * yield_pct)
+                avg_clv = float(np.mean(stats['clv_list']) * 100.0) if stats['clv_list'] else 0.0
+                k_val = float(get_param_by_comp(KELLY_FRACTIONS, comp, 0.015))
+                
+                league_records.append({
+                    'competition': comp,
+                    'bets_placed': b_cnt,
+                    'win_rate_pct': w_rate,
+                    'raw_yield_pct': r_yield,
+                    'bayes_yield_pct': bayes_y,
+                    'net_profit_usd': stats['profit'],
+                    'kelly_fraction': k_val,
+                    'avg_clv_pct': avg_clv
+                })
+            
+            league_df = pd.DataFrame(league_records).sort_values(by='net_profit_usd', ascending=False)
+            league_csv_path = os.path.join(csv_dir, f'league_performance_data_{timestamp_str}.csv')
+            league_df.to_csv(league_csv_path, index=False)
+            logger.info(f"Datos de rendimiento por liga exportados en: {league_csv_path}")
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.barh(league_df['competition'], league_df['net_profit_usd'], color=np.where(league_df['net_profit_usd'] >= 0, '#2ca02c', '#d62728'))
+            ax.set_title('Net Profit ($) by Competition / League', fontsize=12, fontweight='bold')
+            ax.set_xlabel('Net Profit ($)')
+            ax.set_ylabel('League')
+            ax.invert_yaxis()
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            league_plot_path = os.path.join(plot_dir, f'league_performance_plot_{timestamp_str}.png')
+            plt.savefig(league_plot_path, dpi=150)
+            plt.close()
+            logger.info(f"Gráfica de rendimiento por liga guardada en: {league_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar rendimiento por liga: {e}")
+
+        # 5. EV BUCKETING REPORT (CSV + PNG)
+        try:
+            ev_bins = [-np.inf, 0.02, 0.05, 0.10, 0.15, np.inf]
+            ev_labels = ['0 - 2%', '2 - 5%', '5 - 10%', '10 - 15%', '15%+']
+            df_bets['ev_bucket'] = pd.cut(df_bets['ev'], bins=ev_bins, labels=ev_labels, right=False)
+
+            ev_records = []
+            for label in ev_labels:
+                group = df_bets[df_bets['ev_bucket'] == label]
+                cnt = len(group)
+                if cnt > 0:
+                    w_rate = group['is_win'].mean() * 100.0
+                    staked = group['stake'].sum()
+                    profit = group['net_profit'].sum()
+                    yield_val = (profit / staked * 100.0) if staked > 0 else 0.0
+                    avg_clv_val = group['clv'].mean() * 100.0 if 'clv' in group and group['clv'].notna().any() else 0.0
+                else:
+                    w_rate, staked, profit, yield_val, avg_clv_val = 0.0, 0.0, 0.0, 0.0, 0.0
+                
+                ev_records.append({
+                    'ev_range': label,
+                    'bets_placed': cnt,
+                    'win_rate_pct': w_rate,
+                    'total_staked_usd': staked,
+                    'net_profit_usd': profit,
+                    'yield_pct': yield_val,
+                    'avg_clv_pct': avg_clv_val
+                })
+
+            ev_df = pd.DataFrame(ev_records)
+            ev_csv_path = os.path.join(csv_dir, f'ev_bucketing_data_{timestamp_str}.csv')
+            ev_df.to_csv(ev_csv_path, index=False)
+            logger.info(f"Datos de rangos de EV exportados en: {ev_csv_path}")
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            ax1.bar(ev_df['ev_range'], ev_df['net_profit_usd'], color=np.where(ev_df['net_profit_usd'] >= 0, '#2ca02c', '#d62728'), alpha=0.8)
+            ax1.set_title('Net Profit ($) by EV Range', fontsize=11, fontweight='bold')
+            ax1.set_xlabel('EV Range')
+            ax1.set_ylabel('Net Profit ($)')
+            ax1.grid(True, alpha=0.3)
+
+            ax2.bar(ev_df['ev_range'], ev_df['yield_pct'], color='#1f77b4', alpha=0.8)
+            ax2.set_title('Yield (%) by EV Range', fontsize=11, fontweight='bold')
+            ax2.set_xlabel('EV Range')
+            ax2.set_ylabel('Yield (%)')
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            ev_plot_path = os.path.join(plot_dir, f'ev_bucketing_plot_{timestamp_str}.png')
+            plt.savefig(ev_plot_path, dpi=150)
+            plt.close()
+            logger.info(f"Gráfica de rangos de EV guardada en: {ev_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar reporte de rangos de EV: {e}")
+
+        # 6. ODDS BUCKETING REPORT (CSV + PNG)
+        try:
+            odds_bins = [1.0, 1.5, 2.0, 3.0, 5.0, np.inf]
+            odds_labels = [
+                'Favoritos Fuertes (1.00 - 1.50)',
+                'Favoritos Moderados (1.50 - 2.00)',
+                'Underdogs Moderados (2.00 - 3.00)',
+                'Underdogs Altos (3.00 - 5.00)',
+                'Sorpresas / Longshots (5.00+)'
+            ]
+            df_bets['odds_bucket'] = pd.cut(df_bets['odds'], bins=odds_bins, labels=odds_labels, right=False)
+
+            odds_records = []
+            for label in odds_labels:
+                group = df_bets[df_bets['odds_bucket'] == label]
+                cnt = len(group)
+                if cnt > 0:
+                    w_rate = group['is_win'].mean() * 100.0
+                    staked = group['stake'].sum()
+                    profit = group['net_profit'].sum()
+                    yield_val = (profit / staked * 100.0) if staked > 0 else 0.0
+                    avg_clv_val = group['clv'].mean() * 100.0 if 'clv' in group and group['clv'].notna().any() else 0.0
+                else:
+                    w_rate, staked, profit, yield_val, avg_clv_val = 0.0, 0.0, 0.0, 0.0, 0.0
+
+                odds_records.append({
+                    'odds_range': label,
+                    'bets_placed': cnt,
+                    'win_rate_pct': w_rate,
+                    'total_staked_usd': staked,
+                    'net_profit_usd': profit,
+                    'yield_pct': yield_val,
+                    'avg_clv_pct': avg_clv_val
+                })
+
+            odds_df = pd.DataFrame(odds_records)
+            odds_csv_path = os.path.join(csv_dir, f'odds_bucketing_data_{timestamp_str}.csv')
+            odds_df.to_csv(odds_csv_path, index=False)
+            logger.info(f"Datos de rangos de cuotas exportados en: {odds_csv_path}")
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            ax1.barh(odds_df['odds_range'], odds_df['net_profit_usd'], color=np.where(odds_df['net_profit_usd'] >= 0, '#2ca02c', '#d62728'), alpha=0.8)
+            ax1.set_title('Net Profit ($) by Odds Range', fontsize=11, fontweight='bold')
+            ax1.set_xlabel('Net Profit ($)')
+            ax1.set_ylabel('Odds Range')
+            ax1.invert_yaxis()
+            ax1.grid(True, alpha=0.3)
+
+            ax2.barh(odds_df['odds_range'], odds_df['yield_pct'], color='#1f77b4', alpha=0.8)
+            ax2.set_title('Yield (%) by Odds Range', fontsize=11, fontweight='bold')
+            ax2.set_xlabel('Yield (%)')
+            ax2.set_ylabel('Odds Range')
+            ax2.invert_yaxis()
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            odds_plot_path = os.path.join(plot_dir, f'odds_bucketing_plot_{timestamp_str}.png')
+            plt.savefig(odds_plot_path, dpi=150)
+            plt.close()
+            logger.info(f"Gráfica de rangos de cuotas guardada en: {odds_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar reporte de rangos de cuotas: {e}")
+
+        # 7. BET TYPES & STRATEGIES REPORT (CSV + PNG)
+        try:
+            type_records = []
+            for b_type in ['single', 'dutching']:
+                group = df_bets[df_bets['bet_type'] == b_type]
+                cnt = len(group)
+                if cnt > 0:
+                    w_rate = group['is_win'].mean() * 100.0
+                    staked = group['stake'].sum()
+                    profit = group['net_profit'].sum()
+                    yield_val = (profit / staked * 100.0) if staked > 0 else 0.0
+                    avg_clv_val = group['clv'].mean() * 100.0 if 'clv' in group and group['clv'].notna().any() else 0.0
+                else:
+                    w_rate, staked, profit, yield_val, avg_clv_val = 0.0, 0.0, 0.0, 0.0, 0.0
+
+                label_name = 'Single Bet (1X2)' if b_type == 'single' else 'Dutching (1X / X2)'
+                type_records.append({
+                    'bet_type': label_name,
+                    'bets_placed': cnt,
+                    'win_rate_pct': w_rate,
+                    'total_staked_usd': staked,
+                    'net_profit_usd': profit,
+                    'yield_pct': yield_val,
+                    'avg_clv_pct': avg_clv_val
+                })
+
+            type_df = pd.DataFrame(type_records)
+            type_csv_path = os.path.join(csv_dir, f'bet_types_data_{timestamp_str}.csv')
+            type_df.to_csv(type_csv_path, index=False)
+            logger.info(f"Datos de tipos de apuesta exportados en: {type_csv_path}")
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+            ax1.bar(type_df['bet_type'], type_df['net_profit_usd'], color=['#1f77b4', '#ff7f0e'], alpha=0.8)
+            ax1.set_title('Net Profit ($) by Bet Type', fontsize=11, fontweight='bold')
+            ax1.set_ylabel('Net Profit ($)')
+            ax1.grid(True, alpha=0.3)
+
+            ax2.bar(type_df['bet_type'], type_df['yield_pct'], color=['#1f77b4', '#ff7f0e'], alpha=0.8)
+            ax2.set_title('Yield (%) by Bet Type', fontsize=11, fontweight='bold')
+            ax2.set_ylabel('Yield (%)')
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            type_plot_path = os.path.join(plot_dir, f'bet_types_plot_{timestamp_str}.png')
+            plt.savefig(type_plot_path, dpi=150)
+            plt.close()
+            logger.info(f"Gráfica de tipos de apuesta guardada en: {type_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar reporte de tipos de apuesta: {e}")
+
+        # 8. TRADES EXECUTION LEDGER (CSV)
+        try:
+            ledger_records = []
+            for idx_row, row in df_bets.iterrows():
+                ledger_records.append({
+                    'bet_index': idx_row + 1,
+                    'date': row.get('date', ''),
+                    'competition': row.get('comp', ''),
+                    'bet_type': row.get('bet_type', ''),
+                    'chosen_label': row.get('chosen_label', ''),
+                    'odds': row['odds'],
+                    'expected_value_ev': row['ev'],
+                    'predicted_prob': row['prob'],
+                    'stake_usd': row['stake'],
+                    'stake_pct_bankroll': row['stake_pct'] * 100.0,
+                    'is_win': row['is_win'],
+                    'net_profit_usd': row['net_profit'],
+                    'clv_pct': (row['clv'] * 100.0) if pd.notna(row.get('clv')) else np.nan
+                })
+
+            ledger_df = pd.DataFrame(ledger_records)
+            ledger_csv_path = os.path.join(csv_dir, f'trades_ledger_data_{timestamp_str}.csv')
+            ledger_df.to_csv(ledger_csv_path, index=False)
+            logger.info(f"Libro de operaciones (Trades Ledger) exportado exitosamente en: {ledger_csv_path}")
+        except Exception as e:
+            logger.error(f"Error al exportar libro de operaciones: {e}")
+
+        # 9. MONTHLY PERFORMANCE ANALYSIS (CSV + PNG)
+        try:
+            if 'date' in df_bets.columns and df_bets['date'].notna().any():
+                df_bets['month'] = pd.to_datetime(df_bets['date']).dt.to_period('M')
+                monthly_records = []
+                for m_period, group in df_bets.groupby('month'):
+                    cnt = len(group)
+                    staked = group['stake'].sum()
+                    profit = group['net_profit'].sum()
+                    w_rate = group['is_win'].mean() * 100.0
+                    yield_val = (profit / staked * 100.0) if staked > 0 else 0.0
+                    
+                    monthly_records.append({
+                        'month': str(m_period),
+                        'bets_placed': cnt,
+                        'win_rate_pct': w_rate,
+                        'total_staked_usd': staked,
+                        'net_profit_usd': profit,
+                        'yield_pct': yield_val
+                    })
+                
+                monthly_df = pd.DataFrame(monthly_records)
+                monthly_csv_path = os.path.join(csv_dir, f'monthly_performance_data_{timestamp_str}.csv')
+                monthly_df.to_csv(monthly_csv_path, index=False)
+                logger.info(f"Datos de rendimiento mensual exportados en: {monthly_csv_path}")
+
+                fig, ax = plt.subplots(figsize=(10, 5))
+                ax.bar(monthly_df['month'], monthly_df['net_profit_usd'], color=np.where(monthly_df['net_profit_usd'] >= 0, '#2ca02c', '#d62728'), alpha=0.8)
+                ax.set_title('Monthly Net Profit ($)', fontsize=11, fontweight='bold')
+                ax.set_xlabel('Month')
+                ax.set_ylabel('Net Profit ($)')
+                plt.xticks(rotation=45)
+                ax.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                monthly_plot_path = os.path.join(plot_dir, f'monthly_performance_plot_{timestamp_str}.png')
+                plt.savefig(monthly_plot_path, dpi=150)
+                plt.close()
+                logger.info(f"Gráfica de rendimiento mensual guardada en: {monthly_plot_path}")
+        except Exception as e:
+            logger.error(f"Error al generar reporte de rendimiento mensual: {e}")
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))

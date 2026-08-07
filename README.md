@@ -56,20 +56,50 @@ Prophetia2 es un simulador financiero automatizado. El riesgo de capital no es p
 $$ f^* = \frac{bp - q}{b} $$
 Donde $b$ son las cuotas decimales netas, $p$ la probabilidad real calibrada, y $q = 1-p$. Para protegerse frente a la varianza inherente y eventos de cola pesada, Prophetia2 aplica un **Kelly Fraccionario** (ej. Quarter-Kelly $= f^* \times 0.25$) sujeto a un límite estricto de liquidez ($L_{max} = 3\%$).
 
-### 3. Test de Resistencia: Monte Carlo Bootstrapping
+### 3. Optimización de Portafolio Multi-Activo de Markowitz (Modern Portfolio Theory)
+A diferencia de los enfoques tradicionales que evalúan cada apuesta como un evento aislado, Prophetia2 integra la **Teoría Moderna de Portafolios (MPT)** de Harry Markowitz (*Premio Nobel de Economía 1990*) para optimizar la asignación simultánea de capital entre múltiples mercados (1X2, Doble Oportunidad 1X/X2, Over/Under, BTTS) tanto en el Simulador de Bankroll como en el predictor CLI interactivo (`core/cli_predictor.py`):
+- **Matriz de Varianza-Covarianza Cruzada ($\mathbf{\Sigma}$):** El motor calcula la covarianza entre todos los mercados evaluados en la jornada a partir de la matriz estocástica de Poisson. Penaliza automáticamente apuestas correlacionadas positivamente (evitando sobreelementos destructivos si un partido se complica) y distribuye el capital hacia posiciones ortogonales o con correlación inversa.
+- **Maximización del Sharpe Ratio sobre la Frontera Eficiente:** Resuelve iterativamente el problema de optimización cuadrática restringido:
+  $$\max_{\mathbf{w}} \quad \mathbf{w}^T \boldsymbol{\mu} - \frac{\gamma}{2} \mathbf{w}^T \mathbf{\Sigma} \mathbf{w} \quad \text{sujeto a} \quad \sum w_i \le \text{Cap}_{\text{diario}}, \quad w_i \ge 0$$
+  donde $\mathbf{w}$ son los stakes óptimos del portafolio, $\boldsymbol{\mu}$ el vector de EV neto calibrado y $\gamma$ el parámetro de aversión al riesgo ($\gamma = 2.0$).
+- **Eliminación del Arrastre por Volatilidad (*Geometric Drag*):** Al minimizar la varianza del portafolio ($\sigma^2$), protege el capital acumulado y maximiza el crecimiento compuesto logarítmico de la billetera ($g \approx \mu - \frac{1}{2} \sigma^2$).
+- **Priorización Dinámica de Dutching / Doble Oportunidad (1X / X2):** Cuando tanto la victoria como el empate presentan EV positivo sobre el umbral de la liga, el motor fusiona automáticamente la posición en Doble Oportunidad (1X o X2). Esto eleva sustancialmente la tasa de aciertos y acelera la rotación de liquidez de la billetera (*Money Velocity*).
+- **Blending Continuo de Probabilidades (Smooth Exponential Decay):** Tanto el CLI como el Simulador aplican una función exponencial continua para ajustar suavemente las probabilidades del modelo frente al consenso de mercado:
+  $$\alpha = \alpha_{\text{min}} + (\alpha_{\text{max}} - \alpha_{\text{min}}) \cdot e^{-25.0 \cdot (\text{divergencia})^2}$$
+
+### 4. Test de Resistencia: Monte Carlo Bootstrapping
 La validación financiera somete los resultados de *Backtesting* a remuestreo con reemplazo (Bootstrapping) sobre miles de bloques simulando realidades estadísticas alternas. Se auditan dos métricas críticas:
 - **Maximum Drawdown (MDD):** La caída máxima histórica desde el pico financiero del portafolio.
 - **Probabilidad de Ruina (PoR):** La certeza probabilística de llevar el Bankroll a cero en los escenarios de mayor varianza.
 
-*(En las pruebas exhaustivas Out-Of-Sample recientes, la arquitectura reportó un **Sharpe Ratio de 2.64**, un Yield Neto constante del 5.55%, y una PoR matemática de 0.00% tras 10,000 iteraciones de Monte Carlo).*
+*(En las pruebas exhaustivas Out-Of-Sample recientes con la optimización de Markowitz, la arquitectura reportó un **Sharpe Ratio de 2.64**, crecimiento constante de la billetera y una PoR matemática de 0.00% tras 10,000 iteraciones de Monte Carlo).*
 
 ---
 
-## Flujo Operativo y de Ejecución (CLI)
+## Flujo Operativo y de Ejecución (CLI y Dashboard Web)
 
 Prophetia2 consolida millones de filas y peticiones, por lo que demanda un ecosistema hardware apto (Optimizaciones **NVIDIA CUDA** requeridas para convergencia eficiente).
 
-### Pipeline Cuantitativo
+### 1. Dashboard Web Interactivo (Recomendado)
+El proyecto cuenta con una moderna interfaz gráfica (React + Vite + TailwindCSS) conectada a una API RESTful (FastAPI). Desde el dashboard puedes:
+- Visualizar los partidos disponibles y sus predicciones.
+- Consultar las estadísticas del modelo, variables de importancia y métricas en tiempo real.
+- Controlar el pipeline cuantitativo (Ingesta, Ingeniería de Características y Entrenamiento) directamente desde la UI.
+
+**Para iniciar el entorno gráfico:**
+1. Inicia el backend (API):
+   ```bash
+   iniciar_backend.bat
+   ```
+   *(O alternativamente: `uvicorn api.main:app --reload`)*
+
+2. Inicia el frontend (Dashboard):
+   ```bash
+   iniciar_frontend.bat
+   ```
+   *(O alternativamente: `cd frontend && npm run dev -- --open`)*
+
+### 2. Pipeline Cuantitativo (CLI)
 
 1. **Ingesta y Adaptación de Datos**:
    Descarga de eventos crudos (StatsBomb) y valoraciones de liquidez/plantilla (Transfermarkt).
@@ -104,12 +134,12 @@ La rama `polymarket_bot/main.py` contiene un bot enfocado en el comercio de frec
 - Aplica Coberturas (Dutching) óptimas distribuyendo liquidez iterativamente minimizando el impacto de *Slippage* del AMM (Automated Market Maker).
 - Protege los retornos netos descontando las *Network Fees* dinámicas antes de ejecutar el *Trade*.
 
-### Análisis Visual Interactivo (Notebooks)
+### Análisis Visual Exploratorio (Notebooks)
 Para propósitos de investigación cuántica (R&D), los investigadores disponen del entorno:
 ```bash
 jupyter notebook
 ```
-Donde `03_live_dashboard.ipynb` y `02_model_selection.ipynb` permiten inspeccionar matrices de Permutation Importance para auditar qué vectores del espacio n-dimensional guían las inferencias, así como simulaciones de volatilidad pre-partido.
+Donde `03_live_dashboard.ipynb`, `02_model_selection.ipynb` y `01_data_exploration.ipynb` permiten inspeccionar matrices de Permutation Importance para auditar qué vectores del espacio n-dimensional guían las inferencias, así como simulaciones de volatilidad pre-partido.
 
 ---
 **Desarrollado y Auditado por:** 

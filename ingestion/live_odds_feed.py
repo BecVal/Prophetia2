@@ -42,6 +42,7 @@ COMP_TO_ODDS_API_SPORT = {
     'SWZ': 'soccer_switzerland_superleague', 'Swiss Super League': 'soccer_switzerland_superleague',
     'AUT': 'soccer_austria_bundesliga', 'Austrian Bundesliga': 'soccer_austria_bundesliga',
     'MLS': 'soccer_usa_mls', 'Major League Soccer': 'soccer_usa_mls',
+    'MEX': 'soccer_mexico_ligamx', 'MEX1': 'soccer_mexico_ligamx', 'Liga MX': 'soccer_mexico_ligamx',
     'CL': 'soccer_uefa_champs_league', 'Champions League': 'soccer_uefa_champs_league',
     'EL': 'soccer_uefa_europa_league', 'Europa League': 'soccer_uefa_europa_league'
 }
@@ -71,6 +72,7 @@ COMP_TO_ESPN_SPORT = {
     'SWZ': 'sui.1', 'Swiss Super League': 'sui.1',
     'AUT': 'aut.1', 'Austrian Bundesliga': 'aut.1',
     'MLS': 'usa.1', 'Major League Soccer': 'usa.1',
+    'MEX': 'mex.1', 'MEX1': 'mex.1', 'Liga MX': 'mex.1',
     'CL': 'uefa.champions', 'Champions League': 'uefa.champions',
     'EL': 'uefa.europa', 'Europa League': 'uefa.europa'
 }
@@ -81,7 +83,7 @@ COMP_MAPPING_REVERSE = {
     'Jupiler Pro League': 'B1', 'Eredivisie': 'N1', 'Primeira Liga': 'P1', 'Süper Lig': 'T1',
     'J1': 'JPN', 'J-League 1': 'JPN', 'Super League': 'G1', 'Scottish Premiership': 'SC0',
     'Allsvenskan': 'SWE', 'Eliteserien': 'NOR', 'Superligaen': 'DNK', 'Swiss Super League': 'SWZ',
-    'Austrian Bundesliga': 'AUT', 'Major League Soccer': 'MLS', 'Champions League': 'CL', 'Europa League': 'EL'
+    'Austrian Bundesliga': 'AUT', 'Major League Soccer': 'MLS', 'Liga MX': 'MEX', 'Champions League': 'CL', 'Europa League': 'EL'
 }
 
 def american_to_decimal(ml):

@@ -15,7 +15,7 @@ logger = get_logger(__name__, 'statsbomb_ingestion')
 
 
 RAW_DATA_DIR = '../data/raw/statsbomb/events/'
-COMPETITIONS = ['La Liga', 'Premier League', 'Ligue 1', '1. Bundesliga', 'Champions League', 'FIFA World Cup']
+COMPETITIONS = ['La Liga', 'Premier League', 'Ligue 1', '1. Bundesliga', 'Champions League', 'FIFA World Cup', 'Liga MX']
 
 def create_directory_if_not_exists(path):
     if not os.path.exists(path):

@@ -15,7 +15,7 @@ import optuna
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
 # ==============================================================================
 RUN_OPTUNA = True
-OPTUNA_TRIALS = 30
+OPTUNA_TRIALS = 100
 # ==============================================================================
 
 # Asegurar import de modulos

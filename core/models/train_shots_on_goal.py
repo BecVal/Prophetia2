@@ -30,7 +30,7 @@ from core.logger_config import get_logger
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
 # ==============================================================================
 RUN_OPTUNA = True
-OPTUNA_TRIALS = 30
+OPTUNA_TRIALS = 100
 # ==============================================================================
 
 logger = get_logger(__name__, 'train_shots_on_goal')
