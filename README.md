@@ -76,30 +76,23 @@ La validación financiera somete los resultados de *Backtesting* a remuestreo co
 
 ---
 
-## Flujo Operativo y de Ejecución (CLI y Dashboard Web)
+## Flujo Operativo y de Ejecución Cuantitativo (CLI & API)
 
-Prophetia2 consolida millones de filas y peticiones, por lo que demanda un ecosistema hardware apto (Optimizaciones **NVIDIA CUDA** requeridas para convergencia eficiente).
+Prophetia2 consolida millones de filas y peticiones, por lo que demanda un ecosistema hardware apto (Optimizaciones **NVIDIA CUDA** recomendadas para aceleración de meta-modelos y redes neuronales).
 
-### 1. Dashboard Web Interactivo (Recomendado)
-El proyecto cuenta con una moderna interfaz gráfica (React + Vite + TailwindCSS) conectada a una API RESTful (FastAPI). Desde el dashboard puedes:
-- Visualizar los partidos disponibles y sus predicciones.
-- Consultar las estadísticas del modelo, variables de importancia y métricas en tiempo real.
-- Controlar el pipeline cuantitativo (Ingesta, Ingeniería de Características y Entrenamiento) directamente desde la UI.
+### 1. Predictor Cuantitativo Interactivo (CLI)
+Para ejecutar inferencias en tiempo real sobre los próximos partidos con asignación de portafolio de Markowitz:
+```bash
+python core/cli_predictor.py
+```
 
-**Para iniciar el entorno gráfico:**
-1. Inicia el backend (API):
-   ```bash
-   iniciar_backend.bat
-   ```
-   *(O alternativamente: `uvicorn api.main:app --reload`)*
+### 2. Servidor de Inferencia API (FastAPI)
+Para exponer el motor cuantitativo y consultar predicciones vía REST API:
+```bash
+uvicorn api.main:app --reload
+```
 
-2. Inicia el frontend (Dashboard):
-   ```bash
-   iniciar_frontend.bat
-   ```
-   *(O alternativamente: `cd frontend && npm run dev -- --open`)*
-
-### 2. Pipeline Cuantitativo (CLI)
+### 3. Pipeline Cuantitativo Completo
 
 1. **Ingesta y Adaptación de Datos**:
    Descarga de eventos crudos (StatsBomb) y valoraciones de liquidez/plantilla (Transfermarkt).
@@ -109,19 +102,21 @@ El proyecto cuenta con una moderna interfaz gráfica (React + Vite + TailwindCSS
    python core/data_adapter.py
    ```
 2. **Ingeniería de Características y Dinámica de Cuotas**:
-   Generación de medias móviles temporales, cruce con Cuotas Institucionales asiáticas sin Vig y extracción de métricas de disciplina arbitral.
+   Generación de medias móviles temporales, extracción jerárquica de cuotas de apertura/cierre y métricas de disciplina arbitral.
    ```bash
    python core/feature_engineering.py
    python ingestion/fetch_odds.py
    python ingestion/fetch_referees.py
    ```
-3. **Entrenamiento de Arquitectura Meta-Stacker**:
-   Ejecución controlada y orquestada para los 9 modelos, con garantías de propagación OOF libre de fugas de datos.
+3. **Entrenamiento de Modelos y Meta-Stacker**:
+   Entrenamiento del modelo cuantitativo GBM con Método de Shin (1993), modelos base y Meta-Stacker final (Nivel 2 con XGBoost GPU) libre de fugas de datos (*Data Leakage*).
    ```bash
+   python core/market_models/train_gbm_model.py
    python core/run_pipeline.py
+   python core/market_models/train_clv_model.py
    ```
-4. **Validación Financiera**:
-   Simulador de la curva de capital y métricas de portafolio (Sharpe, Sortino, CLV Promedio, MDD).
+4. **Validación Financiera y Simulación de Bankroll**:
+   Simulador de la curva de capital, optimización multivariable por liga con Optuna y métricas de portafolio (Sharpe, Sortino, CLV Promedio, MDD, Monte Carlo).
    ```bash
    python core/simulate_bankroll.py
    ```
