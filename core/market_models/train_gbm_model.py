@@ -349,6 +349,11 @@ def train_gbm_model():
     oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_gbm_train.parquet'), engine='fastparquet')
     oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_gbm_test.parquet'), engine='fastparquet')
     
+    # Exportar el dataset enriquecido con las caracteristicas GBM
+    df_gbm_path = os.path.join(PROCESSED_DIR, 'matches_with_gbm_features.parquet')
+    df_gbm.to_parquet(df_gbm_path, engine='fastparquet')
+    logger.info(f"Dataset enriquecido con GBM guardado en: {df_gbm_path}")
+    
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)
         

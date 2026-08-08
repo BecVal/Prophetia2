@@ -248,37 +248,7 @@ MAX_BET_LIQUIDITY = {             # Límites de liquidez absolutos por competici
     'DEFAULT': 2000.0
 }
 
-COMPETITION_MAPPING = {
-    'E0': 'Premier League', 'Premier League': 'E0',
-    'SP1': 'La Liga', 'La Liga': 'SP1',
-    'D1': '1. Bundesliga', '1. Bundesliga': 'D1',
-    'I1': 'Serie A', 'Serie A': 'I1',
-    'F1': 'Ligue 1', 'Ligue 1': 'F1',
-    'E1': 'Championship', 'Championship': 'E1',
-    'SP2': 'La Liga 2', 'La Liga 2': 'SP2',
-    'D2': '2. Bundesliga', '2. Bundesliga': 'D2',
-    'F2': 'Ligue 2', 'Ligue 2': 'F2',
-    'I2': 'Serie B', 'Serie B': 'I2',
-    'B1': 'Jupiler Pro League', 'Jupiler Pro League': 'B1',
-    'N1': 'Eredivisie', 'Eredivisie': 'N1',
-    'P1': 'Primeira Liga', 'Primeira Liga': 'P1',
-    'SC0': 'Scottish Premiership', 'Scottish Premiership': 'SC0',
-    'T1': 'Süper Lig', 'Süper Lig': 'T1',
-    'E2': 'League One', 'League One': 'E2',
-    'MLS': 'Major League Soccer', 'Major League Soccer': 'MLS',
-    'J1': 'J-League 1', 'J-League 1': 'J1',
-    'CL': 'Champions League', 'Champions League': 'CL',
-    'EL': 'Europa League', 'Europa League': 'EL',
-    'WC': 'FIFA World Cup', 'FIFA World Cup': 'WC'
-}
-
-def get_param_by_comp(param_dict, comp, default_val=0.015):
-    if comp in param_dict:
-        return param_dict[comp]
-    alt_name = COMPETITION_MAPPING.get(comp)
-    if alt_name and alt_name in param_dict:
-        return param_dict[alt_name]
-    return param_dict.get('DEFAULT', default_val)
+from league_mapping import CANONICAL_LEAGUES, COMPETITION_MAPPING, normalize_league, get_param_by_comp
 
 def calculate_dynamic_alpha(p_model, p_market, alpha_low, alpha_med, alpha_high):
     """ Función continua (smooth decay) para blending de probabilidades """
@@ -388,7 +358,12 @@ def export_trade_signals(res, filepath='trade_signals.json'):
     return filepath
 
 def load_data():
-    path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
+    gbm_dataset_path = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_gbm_features.parquet'))
+    if os.path.exists(gbm_dataset_path):
+        path = gbm_dataset_path
+    else:
+        path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
+        
     if not os.path.exists(path):
         console.print(f"[red]Error: Dataset no encontrado en {path}[/red]")
         return None
@@ -425,17 +400,24 @@ def load_all_models():
 
     return models_dict
 
-def get_latest_team_row(df, team_name):
+def get_latest_team_row(df, team_name, as_of_date=None):
     if not team_name:
         return None
     norm = normalize_team_name(team_name)
     
+    search_df = df
+    if as_of_date is not None and 'match_date' in df.columns:
+        as_of_str = str(as_of_date)
+        search_df = df[df['match_date'].astype(str) < as_of_str]
+        if search_df.empty:
+            search_df = df
+    
     # 1. Búsqueda exacta por nombre o normalizado
-    team_df = df[(df['team'] == team_name) | (df['team'] == norm)].sort_values('match_date')
+    team_df = search_df[(search_df['team'] == team_name) | (search_df['team'] == norm)].sort_values('match_date')
     if not team_df.empty:
         return team_df.iloc[-1]
         
-    opp_df = df[(df['opponent'] == team_name) | (df['opponent'] == norm)].sort_values('match_date')
+    opp_df = search_df[(search_df['opponent'] == team_name) | (search_df['opponent'] == norm)].sort_values('match_date')
     if not opp_df.empty:
         return opp_df.iloc[-1]
         
@@ -443,7 +425,7 @@ def get_latest_team_row(df, team_name):
     raw_lower = str(team_name).lower().replace(' ', '').replace('cf', '').replace('fc', '')
     norm_lower = str(norm).lower().replace(' ', '').replace('cf', '').replace('fc', '')
     
-    all_teams = set(df['team'].dropna().unique()).union(set(df['opponent'].dropna().unique()))
+    all_teams = set(search_df['team'].dropna().unique()).union(set(search_df['opponent'].dropna().unique()))
     matched_name = None
     for t in all_teams:
         t_norm = normalize_team_name(t)
@@ -461,10 +443,10 @@ def get_latest_team_row(df, team_name):
                 break
 
     if matched_name:
-        team_df = df[(df['team'] == matched_name)].sort_values('match_date')
+        team_df = search_df[(search_df['team'] == matched_name)].sort_values('match_date')
         if not team_df.empty:
             return team_df.iloc[-1]
-        opp_df = df[(df['opponent'] == matched_name)].sort_values('match_date')
+        opp_df = search_df[(search_df['opponent'] == matched_name)].sort_values('match_date')
         if not opp_df.empty:
             return opp_df.iloc[-1]
 
@@ -502,10 +484,11 @@ def compute_meta_features_live(df_base, open_odds_win, open_odds_draw, open_odds
 
 def build_live_match_features(
     df, home_team, away_team, comp, odds_1, odds_X, odds_2,
-    open_odds_win=None, open_odds_draw=None, open_odds_loss=None
+    open_odds_win=None, open_odds_draw=None, open_odds_loss=None,
+    as_of_date=None
 ):
-    home_row = get_latest_team_row(df, home_team)
-    away_row = get_latest_team_row(df, away_team)
+    home_row = get_latest_team_row(df, home_team, as_of_date=as_of_date)
+    away_row = get_latest_team_row(df, away_team, as_of_date=as_of_date)
     
     if home_row is None:
         home_row = pd.Series({'team_elo': 1500.0, 'team_squad_value': 0.0})
@@ -590,6 +573,25 @@ def build_live_match_features(
     p_close = np.array([input_data['prob_win_implied'], input_data['prob_draw_implied'], input_data['prob_loss_implied']])
     p_open = np.array([input_data['open_prob_win'], input_data['open_prob_draw'], input_data['open_prob_loss']])
 
+    input_data['shin_base_prob_win'] = float(sw[0])
+    input_data['shin_base_prob_draw'] = float(sd[0])
+    input_data['shin_base_prob_loss'] = float(sl[0])
+    input_data['shin_insider_close'] = float(input_data['shin_z_param'])
+    input_data['shin_insider_open'] = float(input_data['shin_z_param'])
+    input_data['shin_insider_drift'] = float(input_data['steam_win'])
+    input_data['gbm_mu_win'] = float(input_data['log_steam_win'])
+    input_data['gbm_mu_draw'] = float(input_data['log_steam_draw'])
+    input_data['gbm_mu_loss'] = float(input_data['log_steam_loss'])
+    input_data['gbm_sigma_win'] = 0.05
+    input_data['gbm_sigma_draw'] = 0.05
+    input_data['gbm_sigma_loss'] = 0.05
+    input_data['gbm_mean_win'] = float(input_data['log_steam_win'])
+    input_data['gbm_mean_draw'] = float(input_data['log_steam_draw'])
+    input_data['gbm_mean_loss'] = float(input_data['log_steam_loss'])
+    input_data['gbm_ewma_mu_win'] = float(input_data['log_steam_win'])
+    input_data['gbm_ewma_mu_draw'] = float(input_data['log_steam_draw'])
+    input_data['gbm_ewma_mu_loss'] = float(input_data['log_steam_loss'])
+
     input_data['market_entropy'] = float(-np.sum(p_close * np.log(np.maximum(p_close, 1e-9))))
     input_data['open_market_entropy'] = float(-np.sum(p_open * np.log(np.maximum(p_open, 1e-9))))
     input_data['entropy_change'] = float(input_data['market_entropy'] - input_data['open_market_entropy'])
@@ -615,7 +617,8 @@ def predict_match(
     injuries_home=0,
     injuries_away=0,
     df=None,
-    models_dict=None
+    models_dict=None,
+    as_of_date=None
 ):
     if df is None:
         df = load_data()
@@ -646,7 +649,8 @@ def predict_match(
 
     input_data = build_live_match_features(
         df, home_team, away_team, comp, odds_1, odds_X, odds_2,
-        open_odds_win=open_odds_win, open_odds_draw=open_odds_draw, open_odds_loss=open_odds_loss
+        open_odds_win=open_odds_win, open_odds_draw=open_odds_draw, open_odds_loss=open_odds_loss,
+        as_of_date=as_of_date
     )
     if input_data is None:
         return None

@@ -93,9 +93,9 @@ def compute_meta_features(X_base, df_orig, prefix=""):
     
     # 3. Cuotas Implícitas (Contexto de Mercado)
     if 'open_odds_win' in df_orig.columns:
-        meta['implied_open_loss'] = (1 / df_orig['open_odds_loss'].clip(lower=1.01)).fillna(0)
-        meta['implied_open_draw'] = (1 / df_orig['open_odds_draw'].clip(lower=1.01)).fillna(0)
-        meta['implied_open_win'] = (1 / df_orig['open_odds_win'].clip(lower=1.01)).fillna(0)
+        meta['implied_open_loss'] = (1 / df_orig['open_odds_loss'].fillna(df_orig['odds_loss']).clip(lower=1.01)).fillna(0)
+        meta['implied_open_draw'] = (1 / df_orig['open_odds_draw'].fillna(df_orig['odds_draw']).clip(lower=1.01)).fillna(0)
+        meta['implied_open_win'] = (1 / df_orig['open_odds_win'].fillna(df_orig['odds_win']).clip(lower=1.01)).fillna(0)
     
     # 4. ID de Competición (Numérico para compatibilidad total)
     if 'competition' in df_orig.columns:
@@ -406,9 +406,9 @@ def train_stacker():
         'prob_draw': y_prob_train[:, 1],
         'prob_win': y_prob_train[:, 2],
         'outcome': y_train.values,
-        'odds_win': df_train_orig['open_odds_win'].values if 'open_odds_win' in df.columns else df_train_orig['odds_win'].values,
-        'odds_draw': df_train_orig['open_odds_draw'].values if 'open_odds_draw' in df.columns else df_train_orig['odds_draw'].values,
-        'odds_loss': df_train_orig['open_odds_loss'].values if 'open_odds_loss' in df.columns else df_train_orig['odds_loss'].values,
+        'odds_win': df_train_orig['open_odds_win'].fillna(df_train_orig['odds_win']).values if 'open_odds_win' in df.columns else df_train_orig['odds_win'].values,
+        'odds_draw': df_train_orig['open_odds_draw'].fillna(df_train_orig['odds_draw']).values if 'open_odds_draw' in df.columns else df_train_orig['odds_draw'].values,
+        'odds_loss': df_train_orig['open_odds_loss'].fillna(df_train_orig['odds_loss']).values if 'open_odds_loss' in df.columns else df_train_orig['odds_loss'].values,
         'closing_odds_win': df_train_orig['odds_win'].values,
         'closing_odds_draw': df_train_orig['odds_draw'].values,
         'closing_odds_loss': df_train_orig['odds_loss'].values
@@ -426,9 +426,9 @@ def train_stacker():
             'prob_draw': y_prob_test[:, 1],
             'prob_win': y_prob_test[:, 2],
             'outcome': y_test.values,
-            'odds_win': df_test_orig['open_odds_win'].values if 'open_odds_win' in df.columns else df_test_orig['odds_win'].values,
-            'odds_draw': df_test_orig['open_odds_draw'].values if 'open_odds_draw' in df.columns else df_test_orig['odds_draw'].values,
-            'odds_loss': df_test_orig['open_odds_loss'].values if 'open_odds_loss' in df.columns else df_test_orig['odds_loss'].values,
+            'odds_win': df_test_orig['open_odds_win'].fillna(df_test_orig['odds_win']).values if 'open_odds_win' in df.columns else df_test_orig['odds_win'].values,
+            'odds_draw': df_test_orig['open_odds_draw'].fillna(df_test_orig['odds_draw']).values if 'open_odds_draw' in df.columns else df_test_orig['odds_draw'].values,
+            'odds_loss': df_test_orig['open_odds_loss'].fillna(df_test_orig['odds_loss']).values if 'open_odds_loss' in df.columns else df_test_orig['odds_loss'].values,
             'closing_odds_win': df_test_orig['odds_win'].values,
             'closing_odds_draw': df_test_orig['odds_draw'].values,
             'closing_odds_loss': df_test_orig['odds_loss'].values

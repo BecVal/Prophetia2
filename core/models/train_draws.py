@@ -51,7 +51,9 @@ def compute_competition_draw_rate(df):
     if 'competition' in df.columns and 'outcome' in df.columns:
         df_copy = df[['competition', 'outcome']].copy()
         df_copy['is_draw_tmp'] = (df_copy['outcome'] == 0).astype(float)
-        comp_rates = df_copy.groupby('competition')['is_draw_tmp'].transform('mean')
+        comp_rates = df_copy.groupby('competition')['is_draw_tmp'].transform(
+            lambda x: x.shift(1).expanding(min_periods=5).mean()
+        )
         return comp_rates.fillna(0.26)
     return pd.Series(0.26, index=df.index)
 

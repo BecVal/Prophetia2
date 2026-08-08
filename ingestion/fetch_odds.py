@@ -52,15 +52,16 @@ def fetch_and_merge_odds():
                 return None
                 
             cols_to_keep = ['Date', 'HomeTeam', 'AwayTeam']
-            
-            b365_cols = ['B365H', 'B365D', 'B365A']
-            if all(c in df_odds.columns for c in b365_cols): cols_to_keep.extend(b365_cols)
-                
-            pin_cols = ['PSH', 'PSD', 'PSA']
-            if all(c in df_odds.columns for c in pin_cols): cols_to_keep.extend(pin_cols)
-                
-            pin_ch_cols = ['PSCH', 'PSCD', 'PSCA']
-            if all(c in df_odds.columns for c in pin_ch_cols): cols_to_keep.extend(pin_ch_cols)
+            potential_odds_cols = [
+                'PSH', 'PSD', 'PSA', 'PSCH', 'PSCD', 'PSCA',
+                'B365H', 'B365D', 'B365A', 'B365CH', 'B365CD', 'B365CA',
+                'AvgH', 'AvgD', 'AvgA', 'AvgCH', 'AvgCD', 'AvgCA',
+                'MaxH', 'MaxD', 'MaxA', 'MaxCH', 'MaxCD', 'MaxCA',
+                'WHH', 'WHD', 'WHA', 'IWH', 'IWD', 'IWA', 'BWH', 'BWD', 'BWA'
+            ]
+            for c in potential_odds_cols:
+                if c in df_odds.columns:
+                    cols_to_keep.append(c)
                 
             df_odds = df_odds[cols_to_keep].copy()
             df_odds['HomeTeam'] = df_odds['HomeTeam'].apply(normalize_team_name)
@@ -92,24 +93,33 @@ def fetch_and_merge_odds():
     df_odds_master = df_odds_master.dropna(subset=['HomeTeam', 'AwayTeam'])
     logger.info(f"Descargados {len(df_odds_master)} partidos con cuotas.")
     
-    # Procesar lógica de cuotas en odds_master
-    # Prioridad: Pinnacle (PS) -> B365
-    open_win = df_odds_master['PSH'] if 'PSH' in df_odds_master.columns else df_odds_master.get('B365H', pd.Series(np.nan, index=df_odds_master.index))
-    if 'B365H' in df_odds_master.columns and 'PSH' in df_odds_master.columns:
-        open_win = open_win.fillna(df_odds_master['B365H'])
-        
-    open_draw = df_odds_master['PSD'] if 'PSD' in df_odds_master.columns else df_odds_master.get('B365D', pd.Series(np.nan, index=df_odds_master.index))
-    if 'B365D' in df_odds_master.columns and 'PSD' in df_odds_master.columns:
-        open_draw = open_draw.fillna(df_odds_master['B365D'])
-        
-    open_loss = df_odds_master['PSA'] if 'PSA' in df_odds_master.columns else df_odds_master.get('B365A', pd.Series(np.nan, index=df_odds_master.index))
-    if 'B365A' in df_odds_master.columns and 'PSA' in df_odds_master.columns:
-        open_loss = open_loss.fillna(df_odds_master['B365A'])
+    # 1. Extracción jerárquica de Cuotas de Cierre (Closing Odds)
+    # Prioridad: Pinnacle Closing (PSCH) -> Bet365 Closing (B365CH) -> Avg Closing (AvgCH) -> Max Closing (MaxCH)
+    def extract_composite_odds(df, priority_cols):
+        res = pd.Series(np.nan, index=df.index)
+        for col in priority_cols:
+            if col in df.columns:
+                res = res.fillna(pd.to_numeric(df[col], errors='coerce'))
+        return res
 
-    # Close odds (Pinnacle Closing -> Open Odds)
-    close_win = df_odds_master['PSCH'].fillna(open_win) if 'PSCH' in df_odds_master.columns else open_win
-    close_draw = df_odds_master['PSCD'].fillna(open_draw) if 'PSCD' in df_odds_master.columns else open_draw
-    close_loss = df_odds_master['PSCA'].fillna(open_loss) if 'PSCA' in df_odds_master.columns else open_loss
+    close_win = extract_composite_odds(df_odds_master, ['PSCH', 'B365CH', 'AvgCH', 'MaxCH', 'PSH', 'B365H', 'AvgH', 'MaxH'])
+    close_draw = extract_composite_odds(df_odds_master, ['PSCD', 'B365CD', 'AvgCD', 'MaxCD', 'PSD', 'B365D', 'AvgD', 'MaxD'])
+    close_loss = extract_composite_odds(df_odds_master, ['PSCA', 'B365CA', 'AvgCA', 'MaxCA', 'PSA', 'B365A', 'AvgA', 'MaxA'])
+
+    # 2. Extracción jerárquica de Cuotas de Apertura (Opening Odds)
+    # Prioridad: Pinnacle Open (PSH) -> Bet365 Open (B365H) -> Avg Open (AvgH) -> Max Open (MaxH) -> WHH/BWH/IWH -> Fallback a Closing
+    open_win = extract_composite_odds(df_odds_master, ['PSH', 'B365H', 'AvgH', 'MaxH', 'WHH', 'BWH', 'IWH', 'PSCH', 'B365CH', 'AvgCH', 'MaxCH'])
+    open_draw = extract_composite_odds(df_odds_master, ['PSD', 'B365D', 'AvgD', 'MaxD', 'WHD', 'BWD', 'IWD', 'PSCD', 'B365CD', 'AvgCD', 'MaxCD'])
+    open_loss = extract_composite_odds(df_odds_master, ['PSA', 'B365A', 'AvgA', 'MaxA', 'WHA', 'BWA', 'IWA', 'PSCA', 'B365CA', 'AvgCA', 'MaxCA'])
+
+    # Fallback bidireccional estricto (Open <-> Close)
+    open_win = open_win.fillna(close_win)
+    open_draw = open_draw.fillna(close_draw)
+    open_loss = open_loss.fillna(close_loss)
+
+    close_win = close_win.fillna(open_win)
+    close_draw = close_draw.fillna(open_draw)
+    close_loss = close_loss.fillna(open_loss)
 
     df_odds_master['open_w_home'] = open_win
     df_odds_master['open_d'] = open_draw

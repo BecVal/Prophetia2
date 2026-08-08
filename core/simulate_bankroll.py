@@ -17,14 +17,26 @@ logger = get_logger(__name__, 'simulate_bankroll')
 
 FILTER_BY_WHITELIST = False  # True: ignora partidos fuera de Whitelist en la simulación financiera
 
-from core.league_mapping import CANONICAL_LEAGUES, COMPETITION_MAPPING, WHITELIST_LEAGUES, normalize_league
+# === MODO DE SIMULACIÓN ===
+# USE_LIVE_MODELS = True
+# BENEFICIOS: Utiliza el motor en tiempo real (`cli_predictor`) con los pesos más recientes,
+# blending dinámico de 8 submódulos y Poisson. Es una réplica exacta de lo que hará el bot en producción.
+# NOTA SOBRE RENDIMIENTO: Si el dataset es muy grande y no tiene las variables precalculadas,
+# procesar en vivo tomará mucho tiempo. Además, al probar una muestra pequeña (ej. 500 partidos),
+# es común observar un "Yield" (ganancia) altísimo debido a la varianza a corto plazo. 
+# USE_LIVE_MODELS = False
+# BENEFICIOS: Usa las predicciones estáticas pre-calculadas (`test_predictions.parquet`).
+# Es ideal para probar cambios en la gestión de capital (Markowitz/Kelly) sobre 20,000+ partidos al instante.
+USE_LIVE_MODELS = False
+LIVE_MODEL_MATCH_LIMIT = 1000 # Cantidad máxima de partidos a analizar si USE_LIVE_MODELS = True
+
+from core.league_mapping import CANONICAL_LEAGUES, COMPETITION_MAPPING, WHITELIST_LEAGUES, normalize_league, get_param_by_comp
 from core.markowitz_optimizer import MarkowitzPortfolioOptimizer
 
 def is_in_whitelist(comp):
     if not FILTER_BY_WHITELIST:
         return True
     return normalize_league(comp) in WHITELIST_LEAGUES
-
 
 # Límites de Exposición y Gestión de Riesgo de Portafolio
 MAX_STAKE_PCT = 0.03               # Stake máximo por apuesta (3.0% del bankroll)
@@ -39,13 +51,13 @@ MARKET_IMPACT_GAMMA = 0.05        # Coeficiente de impacto de mercado (Square-ro
 MAX_BET_LIQUIDITY = {             # Límites de liquidez absolutos por competición (USD)
     'D1': 2000.0, 'SP1': 2000.0, 'I1': 2000.0, 'G1': 2000.0, 'F1': 2000.0,
     'D2': 2000.0, 'F2': 2000.0, 'T1': 2000.0, 'MLS': 1500.0, 'J1': 1500.0,
-    'MEX': 1500.0,
+    'MEX': 2000.0,
     'DEFAULT': 2000.0
 }
 
 # CONFIGURACIÓN DE OPTIMIZACIÓN
-OPTIMIZATION_MODE = 'MEX'  # 'NONE', 'ALL', 'WHITELIST', o liga específica
-OPTUNA_TRIALS = 10000
+OPTIMIZATION_MODE = 'ALL'  # 'NONE', 'ALL', 'WHITELIST', o liga específica
+OPTUNA_TRIALS = 100
 OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
 
 # Diccionarios de riesgo por defecto
@@ -55,11 +67,6 @@ EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 
 ALPHA_DIV_LOW = {'DEFAULT': 0.85}
 ALPHA_DIV_MED = {'DEFAULT': 0.70}
 ALPHA_DIV_HIGH = {'DEFAULT': 0.50}
-
-def get_param_by_comp(param_dict, comp, default_val=0.015):
-    """ Busca un parámetro usando el nombre canónico de la competición """
-    canonical = normalize_league(comp)
-    return param_dict.get(canonical, param_dict.get('DEFAULT', default_val))
 
 def load_optimized_params():
     global KELLY_FRACTIONS, EV_THRESHOLDS, ALPHA_DIV_LOW, ALPHA_DIV_MED, ALPHA_DIV_HIGH
@@ -125,9 +132,9 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
     alpha_med_dict = custom_alpha_med if custom_alpha_med is not None else ALPHA_DIV_MED
     alpha_high_dict = custom_alpha_high if custom_alpha_high is not None else ALPHA_DIV_HIGH
 
-    odds_win = df['odds_win'].values
-    odds_draw = df['odds_draw'].values
-    odds_loss = df['odds_loss'].values
+    odds_win = df['odds_win'].fillna(df['closing_odds_win']).values if 'closing_odds_win' in df.columns else df['odds_win'].values
+    odds_draw = df['odds_draw'].fillna(df['closing_odds_draw']).values if 'closing_odds_draw' in df.columns else df['odds_draw'].values
+    odds_loss = df['odds_loss'].fillna(df['closing_odds_loss']).values if 'closing_odds_loss' in df.columns else df['odds_loss'].values
     
     has_closing_odds = all(c in df.columns for c in ['closing_odds_win', 'closing_odds_draw', 'closing_odds_loss'])
     if has_closing_odds:
@@ -204,49 +211,130 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
             league_kelly = get_param_by_comp(kelly_dict, comp, 0.015)
             pred_clv = pred_clv_vals[i] if has_pred_clv else [0.0, 0.0, 0.0]
 
-            bet_type = 'single'
-            best_choice = np.argmax(evs)
-            best_ev = evs[best_choice]
-            secondary_choice = None
+            ev_loss, ev_draw, ev_win = evs[0], evs[1], evs[2]
+
+            # Doble Oportunidad 1X y X2 (Dutching Multi-Mercado Cuantitativo)
+            total_implied_1X = (1.0 / odds[2]) + (1.0 / odds[1])
+            combined_odds_1X = 1.0 / total_implied_1X
+            net_combined_1X = 1.0 + (combined_odds_1X - 1.0) * (1.0 - TAX_RETENTION_RATE)
+            blend_1X = blended_probs[2] + blended_probs[1]
+            ev_1X = (blend_1X * net_combined_1X) - 1.0 - EXPECTED_CLV_DROP
+
+            total_implied_X2 = (1.0 / odds[0]) + (1.0 / odds[1])
+            combined_odds_X2 = 1.0 / total_implied_X2
+            net_combined_X2 = 1.0 + (combined_odds_X2 - 1.0) * (1.0 - TAX_RETENTION_RATE)
+            blend_X2 = blended_probs[0] + blended_probs[1]
+            ev_X2 = (blend_X2 * net_combined_X2) - 1.0 - EXPECTED_CLV_DROP
 
             MIN_EXPECTED_CLV = 0.0001
-            if has_pred_clv and pred_clv[best_choice] < MIN_EXPECTED_CLV:
-                best_ev = -1.0
 
-            ev_local, ev_draw, ev_away = evs[2], evs[1], evs[0]
+            # Criterio Cuantitativo de Selección: Priorizar Doble Oportunidad si hay EV positivo cruzado o por ranking de EV
+            if ev_win > league_ev_thresh and ev_draw > league_ev_thresh:
+                best_bet = {
+                    'label': 'Doble Oportunidad 1X',
+                    'bet_type': 'dutching',
+                    'best_choice': 2,
+                    'secondary_choice': 1,
+                    'best_ev': ev_1X,
+                    'raw_odd': combined_odds_1X,
+                    'net_odd': net_combined_1X,
+                    'prob': blend_1X,
+                    'is_win': real_outcome in [1, 2]
+                }
+            elif ev_loss > league_ev_thresh and ev_draw > league_ev_thresh:
+                best_bet = {
+                    'label': 'Doble Oportunidad X2',
+                    'bet_type': 'dutching',
+                    'best_choice': 0,
+                    'secondary_choice': 1,
+                    'best_ev': ev_X2,
+                    'raw_odd': combined_odds_X2,
+                    'net_odd': net_combined_X2,
+                    'prob': blend_X2,
+                    'is_win': real_outcome in [0, 1]
+                }
+            else:
+                mkt_candidates = [
+                    {
+                        'label': 'Doble Oportunidad 1X',
+                        'bet_type': 'dutching',
+                        'best_choice': 2,
+                        'secondary_choice': 1,
+                        'best_ev': ev_1X,
+                        'raw_odd': combined_odds_1X,
+                        'net_odd': net_combined_1X,
+                        'prob': blend_1X,
+                        'is_win': real_outcome in [1, 2]
+                    },
+                    {
+                        'label': 'Doble Oportunidad X2',
+                        'bet_type': 'dutching',
+                        'best_choice': 0,
+                        'secondary_choice': 1,
+                        'best_ev': ev_X2,
+                        'raw_odd': combined_odds_X2,
+                        'net_odd': net_combined_X2,
+                        'prob': blend_X2,
+                        'is_win': real_outcome in [0, 1]
+                    },
+                    {
+                        'label': '1 (Local)',
+                        'bet_type': 'single',
+                        'best_choice': 2,
+                        'secondary_choice': None,
+                        'best_ev': ev_win,
+                        'raw_odd': odds[2],
+                        'net_odd': net_odds[2],
+                        'prob': blended_probs[2],
+                        'is_win': real_outcome == 2
+                    },
+                    {
+                        'label': 'X (Empate)',
+                        'bet_type': 'single',
+                        'best_choice': 1,
+                        'secondary_choice': None,
+                        'best_ev': ev_draw,
+                        'raw_odd': odds[1],
+                        'net_odd': net_odds[1],
+                        'prob': blended_probs[1],
+                        'is_win': real_outcome == 1
+                    },
+                    {
+                        'label': '2 (Visitante)',
+                        'bet_type': 'single',
+                        'best_choice': 0,
+                        'secondary_choice': None,
+                        'best_ev': ev_loss,
+                        'raw_odd': odds[0],
+                        'net_odd': net_odds[0],
+                        'prob': blended_probs[0],
+                        'is_win': real_outcome == 0
+                    }
+                ]
+                mkt_candidates.sort(key=lambda x: x['best_ev'], reverse=True)
+                best_bet = mkt_candidates[0]
 
-            if ev_local > league_ev_thresh and ev_draw > league_ev_thresh:
-                if (not has_pred_clv) or (pred_clv[2] >= MIN_EXPECTED_CLV and pred_clv[1] >= MIN_EXPECTED_CLV):
-                    bet_type = 'dutching'
-                    total_implied = (1.0 / odds[2]) + (1.0 / odds[1])
-                    combined_odds = 1.0 / total_implied
-                    blended_prob_1X = blended_probs[2] + blended_probs[1]
-                    net_combined_odds = 1.0 + (combined_odds - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                    best_ev = (blended_prob_1X * net_combined_odds) - 1.0 - EXPECTED_CLV_DROP
-                    best_choice = 2
-                    secondary_choice = 1
-            elif ev_away > league_ev_thresh and ev_draw > league_ev_thresh:
-                if (not has_pred_clv) or (pred_clv[0] >= MIN_EXPECTED_CLV and pred_clv[1] >= MIN_EXPECTED_CLV):
-                    bet_type = 'dutching'
-                    total_implied = (1.0 / odds[0]) + (1.0 / odds[1])
-                    combined_odds = 1.0 / total_implied
-                    blended_prob_X2 = blended_probs[0] + blended_probs[1]
-                    net_combined_odds = 1.0 + (combined_odds - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                    best_ev = (blended_prob_X2 * net_combined_odds) - 1.0 - EXPECTED_CLV_DROP
-                    best_choice = 0
-                    secondary_choice = 1
+            if has_pred_clv:
+                c_idx = best_bet['best_choice']
+                if pred_clv[c_idx] < MIN_EXPECTED_CLV and best_bet['bet_type'] == 'single':
+                    best_bet['best_ev'] = -1.0
 
-            if best_ev > league_ev_thresh:
+            if best_bet['best_ev'] > league_ev_thresh:
                 candidate_bets.append({
                     'kelly_fraction': league_kelly,
                     'index': i,
-                    'best_choice': best_choice,
-                    'secondary_choice': secondary_choice,
-                    'best_ev': best_ev,
+                    'chosen_label': best_bet['label'],
+                    'best_choice': best_bet['best_choice'],
+                    'secondary_choice': best_bet['secondary_choice'],
+                    'best_ev': best_bet['best_ev'],
+                    'raw_odd': best_bet['raw_odd'],
+                    'net_odd': best_bet['net_odd'],
+                    'prob': best_bet['prob'],
+                    'bet_type': best_bet['bet_type'],
+                    'is_win': best_bet['is_win'],
                     'odds': odds,
                     'probs': probs,
                     'blended_probs': blended_probs,
-                    'bet_type': bet_type,
                     'real_outcome': real_outcome,
                     'comp': comp
                 })
@@ -269,10 +357,6 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
         bet_metadata = []
 
         for bet in candidate_bets:
-            best_choice = bet['best_choice']
-            secondary_choice = bet['secondary_choice']
-            odds = bet['odds']
-            bet_type = bet['bet_type']
             comp = bet['comp']
             best_ev = bet['best_ev']
             base_kelly = bet['kelly_fraction']
@@ -280,23 +364,9 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
             adj_kelly_fraction = base_kelly * reactive_risk_factor
             max_liquidity = get_param_by_comp(MAX_BET_LIQUIDITY, comp, 2000.0)
 
-            if bet_type == 'single':
-                raw_odd = odds[best_choice]
-                net_odd = 1.0 + (raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                prob_est = (1.0 + best_ev) / net_odd if net_odd > 0 else 0.5
-                ev_val = best_ev
-                odd_val = net_odd
-            else: # dutching
-                total_implied = (1.0 / odds[best_choice]) + (1.0 / odds[secondary_choice])
-                combined_odds = 1.0 / total_implied
-                net_combined_odds = 1.0 + (combined_odds - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                prob_est = (1.0 + best_ev) / net_combined_odds if net_combined_odds > 0 else 0.5
-                ev_val = best_ev
-                odd_val = net_combined_odds
-
-            ev_vec.append(ev_val)
-            odds_vec.append(odd_val)
-            prob_vec.append(prob_est)
+            ev_vec.append(best_ev)
+            odds_vec.append(bet['net_odd'])
+            prob_vec.append(bet['prob'])
             penalties.append(adj_kelly_fraction / 0.015)
             liquidity_caps.append(max_liquidity)
             bet_metadata.append(bet)
@@ -344,133 +414,74 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                 stake = liquid_bankroll
                 if stake <= 0: break
 
-            best_choice = bet['best_choice']
-            secondary_choice = bet['secondary_choice']
-            odds = bet['odds']
+            raw_odd = bet['raw_odd']
             bet_type = bet['bet_type']
             comp = bet['comp']
-            real_outcome = bet['real_outcome']
             best_ev = bet['best_ev']
+            is_win = bet['is_win']
+            best_choice = bet['best_choice']
 
             max_liquidity = get_param_by_comp(MAX_BET_LIQUIDITY, comp, 2000.0)
+            eff_odds = calculate_market_slippage(raw_odd, stake, max_liquidity)
 
-            if bet_type == 'single':
-                eff_odds = calculate_market_slippage(odds[best_choice], stake, max_liquidity)
+            liquid_bankroll -= stake
+            day_staked += stake
+            total_staked += stake
+            bets_placed += 1
+            total_expected_profit += (stake * best_ev)
+            avg_odds_list.append(eff_odds)
 
-                liquid_bankroll -= stake
-                day_staked += stake
-                total_staked += stake
-                bets_placed += 1
-                total_expected_profit += (stake * best_ev)
-                avg_odds_list.append(eff_odds)
+            if comp not in league_stats:
+                league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
 
-                if comp not in league_stats:
-                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
-
-                true_clv = np.nan
-                if has_closing_odds:
-                    idx = bet['index']
-                    c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
-                    if not np.isnan([c_loss, c_draw, c_win]).any() and min(c_loss, c_draw, c_win) > 0:
-                        c_margin = (1/c_loss) + (1/c_draw) + (1/c_win)
-                        fair_closing_odds = [1 / ((1/c_loss)/c_margin), 1 / ((1/c_draw)/c_margin), 1 / ((1/c_win)/c_margin)]
+            true_clv = np.nan
+            if has_closing_odds:
+                idx = bet['index']
+                c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
+                if not np.isnan([c_loss, c_draw, c_win]).any() and min(c_loss, c_draw, c_win) > 0:
+                    c_margin = (1/c_loss) + (1/c_draw) + (1/c_win)
+                    fair_closing_odds = [1 / ((1/c_loss)/c_margin), 1 / ((1/c_draw)/c_margin), 1 / ((1/c_win)/c_margin)]
+                    if bet_type == 'single':
                         true_clv = (eff_odds / fair_closing_odds[best_choice]) - 1.0
-                        clv_list.append(true_clv)
-                        league_stats[comp]['clv_list'].append(true_clv)
-
-                league_stats[comp]['bets'] += 1
-                league_stats[comp]['staked'] += stake
-
-                if real_outcome == best_choice:
-                    gross_profit = stake * (eff_odds - 1.0)
-                    net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE)
-                    day_profit += stake + net_profit
-                    bets_won += 1
-                    league_stats[comp]['profit'] += net_profit
-                    league_stats[comp]['won'] += 1
-                    gross_profit_sum += net_profit
-                    net_profit_record = net_profit
-                else:
-                    net_profit_record = -stake
-                    league_stats[comp]['profit'] -= stake
-                    gross_loss_sum += stake
-
-                outcome_labels = {0: 'Away (2)', 1: 'Draw (X)', 2: 'Home (1)'}
-                placed_bets_history.append({
-                    'date': str(current_date),
-                    'comp': comp,
-                    'bet_type': 'single',
-                    'chosen_label': outcome_labels.get(best_choice, str(best_choice)),
-                    'ev': best_ev,
-                    'prob': bet['blended_probs'][best_choice],
-                    'odds': eff_odds,
-                    'stake': stake,
-                    'stake_pct': stake / start_of_day_bankroll if start_of_day_bankroll > 0 else 0,
-                    'is_win': int(real_outcome == best_choice),
-                    'net_profit': net_profit_record,
-                    'clv': true_clv
-                })
-
-            elif bet_type == 'dutching':
-                total_implied = (1.0 / odds[best_choice]) + (1.0 / odds[secondary_choice])
-                raw_combined_odds = 1.0 / total_implied
-                eff_combined_odds = calculate_market_slippage(raw_combined_odds, stake, max_liquidity)
-
-                liquid_bankroll -= stake
-                day_staked += stake
-                total_staked += stake
-                bets_placed += 1
-                total_expected_profit += (stake * best_ev)
-                avg_odds_list.append(eff_combined_odds)
-
-                if comp not in league_stats:
-                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
-
-                true_clv = np.nan
-                if has_closing_odds:
-                    idx = bet['index']
-                    c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
-                    if not np.isnan([c_loss, c_draw, c_win]).any() and min(c_loss, c_draw, c_win) > 0:
-                        c_margin = (1/c_loss) + (1/c_draw) + (1/c_win)
+                    else:
                         fair_prob_1 = (1/c_win) / c_margin if best_choice == 2 else (1/c_loss) / c_margin
                         fair_prob_X = (1/c_draw) / c_margin
                         fair_c_combined = 1.0 / (fair_prob_1 + fair_prob_X)
-                        true_clv = (eff_combined_odds / fair_c_combined) - 1.0
-                        clv_list.append(true_clv)
-                        league_stats[comp]['clv_list'].append(true_clv)
+                        true_clv = (eff_odds / fair_c_combined) - 1.0
+                    clv_list.append(true_clv)
+                    league_stats[comp]['clv_list'].append(true_clv)
 
-                league_stats[comp]['bets'] += 1
-                league_stats[comp]['staked'] += stake
+            league_stats[comp]['bets'] += 1
+            league_stats[comp]['staked'] += stake
 
-                if real_outcome in [best_choice, secondary_choice]:
-                    gross_profit = stake * (eff_combined_odds - 1.0)
-                    net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE)
-                    day_profit += stake + net_profit
-                    bets_won += 1
-                    league_stats[comp]['profit'] += net_profit
-                    league_stats[comp]['won'] += 1
-                    gross_profit_sum += net_profit
-                    net_profit_record = net_profit
-                else:
-                    net_profit_record = -stake
-                    league_stats[comp]['profit'] -= stake
-                    gross_loss_sum += stake
+            if is_win:
+                gross_profit = stake * (eff_odds - 1.0)
+                net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE)
+                day_profit += stake + net_profit
+                bets_won += 1
+                league_stats[comp]['profit'] += net_profit
+                league_stats[comp]['won'] += 1
+                gross_profit_sum += net_profit
+                net_profit_record = net_profit
+            else:
+                net_profit_record = -stake
+                league_stats[comp]['profit'] -= stake
+                gross_loss_sum += stake
 
-                dutch_labels = {(2, 1): 'Home or Draw (1X)', (0, 1): 'Away or Draw (X2)'}
-                placed_bets_history.append({
-                    'date': str(current_date),
-                    'comp': comp,
-                    'bet_type': 'dutching',
-                    'chosen_label': dutch_labels.get((best_choice, secondary_choice), 'Dutching'),
-                    'ev': best_ev,
-                    'prob': bet['blended_probs'][best_choice] + bet['blended_probs'][secondary_choice],
-                    'odds': eff_combined_odds,
-                    'stake': stake,
-                    'stake_pct': stake / start_of_day_bankroll if start_of_day_bankroll > 0 else 0,
-                    'is_win': int(real_outcome in [best_choice, secondary_choice]),
-                    'net_profit': net_profit_record,
-                    'clv': true_clv
-                })
+            placed_bets_history.append({
+                'date': str(current_date),
+                'comp': comp,
+                'bet_type': bet_type,
+                'chosen_label': bet['chosen_label'],
+                'ev': best_ev,
+                'prob': bet['prob'],
+                'odds': eff_odds,
+                'stake': stake,
+                'stake_pct': stake / start_of_day_bankroll if start_of_day_bankroll > 0 else 0,
+                'is_win': int(is_win),
+                'net_profit': net_profit_record,
+                'clv': true_clv
+            })
 
         liquid_bankroll += day_profit
         bankroll_history.append(liquid_bankroll)
@@ -509,13 +520,19 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
 def evaluate_league_params(df_league, ev_thresh, kelly_fraction, alpha_low, alpha_med, alpha_high):
     """ Evaluación para Optuna """
     league_name = df_league['competition'].iloc[0] if not df_league.empty else 'DEFAULT'
+    canonical_id = normalize_league(league_name)
+    ev_dict = {league_name: ev_thresh, canonical_id: ev_thresh}
+    kelly_dict = {league_name: kelly_fraction, canonical_id: kelly_fraction}
+    a_low_dict = {league_name: alpha_low, canonical_id: alpha_low}
+    a_med_dict = {league_name: alpha_med, canonical_id: alpha_med}
+    a_high_dict = {league_name: alpha_high, canonical_id: alpha_high}
     res = run_bankroll_engine(
         df_league,
-        custom_ev_thresholds={league_name: ev_thresh},
-        custom_kelly_fractions={league_name: kelly_fraction},
-        custom_alpha_low={league_name: alpha_low},
-        custom_alpha_med={league_name: alpha_med},
-        custom_alpha_high={league_name: alpha_high}
+        custom_ev_thresholds=ev_dict,
+        custom_kelly_fractions=kelly_dict,
+        custom_alpha_low=a_low_dict,
+        custom_alpha_med=a_med_dict,
+        custom_alpha_high=a_high_dict
     )
     return res['roi'], res['historical_mdd']
 
@@ -523,10 +540,14 @@ def optimize_league(df, league_name):
     logger.info(f"Iniciando Optuna para {league_name} ({OPTUNA_TRIALS} trials)...")
     df_league = df[df['competition'] == league_name].copy()
     if df_league.empty:
+        target_norm = normalize_league(league_name)
+        df_league = df[df['competition'].apply(normalize_league) == target_norm].copy()
+    if df_league.empty or len(df_league) < 10:
+        logger.warning(f"Insuficientes datos para optimizar {league_name} ({len(df_league)} partidos). Se omitirá.")
         return None
 
     def objective(trial):
-        ev_thresh = trial.suggest_float('ev_thresh', 0.015, 0.050)
+        ev_thresh = trial.suggest_float('ev_thresh', 0.010, 0.050)
         kelly_fraction = trial.suggest_float('kelly_fraction', 0.01, 0.25)
         alpha_low = trial.suggest_float('alpha_low', 0.10, 0.95)
         alpha_med = trial.suggest_float('alpha_med', 0.10, 0.95)
@@ -552,58 +573,272 @@ def optimize_league(df, league_name):
     return best_params
 
 def run_simulation():
+    # 1. Intentar cargar dataset con cuotas completas y modelos en vivo
+    try:
+        try:
+            from core.cli_predictor import predict_match, load_all_models, load_data as load_cli_data
+        except ImportError:
+            from cli_predictor import predict_match, load_all_models, load_data as load_cli_data
+        has_cli_modules = True
+    except Exception as e:
+        logger.warning(f"No se pudieron importar módulos del CLI en vivo: {e}")
+        has_cli_modules = False
+
+    load_optimized_params()
+
     PREDICTIONS_PATH = '../data/processed/test_predictions.parquet'
-    if not os.path.exists(PREDICTIONS_PATH):
-        logger.error(f"No se encontró predicciones en {PREDICTIONS_PATH}.")
-        return
 
-    logger.info(f"Cargando predicciones del set de prueba desde: {PREDICTIONS_PATH}...")
-    df = pd.read_parquet(PREDICTIONS_PATH, engine='fastparquet')
-
-    if 'odds_win' not in df.columns:
-        logger.warning("No se encontraron cuotas en el dataset.")
-        return
-
-    # OPTIMIZACIÓN O CARGA DE PARÁMETROS
+    # 2. Ejecutar optimización con Optuna si OPTIMIZATION_MODE está activo
     if OPTIMIZATION_MODE != 'NONE':
-        TRAIN_PREDS_PATH = '../data/processed/train_predictions.parquet'
-        if os.path.exists(TRAIN_PREDS_PATH):
-            df_train_opt = pd.read_parquet(TRAIN_PREDS_PATH, engine='fastparquet')
-            leagues = df_train_opt['competition'].unique() if OPTIMIZATION_MODE == 'ALL' else [OPTIMIZATION_MODE]
-            for comp in leagues:
-                if not is_in_whitelist(comp): continue
-                best_params = optimize_league(df_train_opt, comp)
+        if not os.path.exists(PREDICTIONS_PATH):
+            logger.error(f"No se encontró archivo de predicciones en {PREDICTIONS_PATH} para optimización.")
+        else:
+            opt_df = pd.read_parquet(PREDICTIONS_PATH, engine='fastparquet')
+            if 'closing_odds_win' in opt_df.columns:
+                opt_df['odds_win'] = opt_df['odds_win'].fillna(opt_df['closing_odds_win'])
+                opt_df['odds_draw'] = opt_df['odds_draw'].fillna(opt_df['closing_odds_draw'])
+                opt_df['odds_loss'] = opt_df['odds_loss'].fillna(opt_df['closing_odds_loss'])
+            
+            available_leagues = [c for c in opt_df['competition'].dropna().unique()]
+            if OPTIMIZATION_MODE == 'ALL':
+                leagues_to_optimize = available_leagues
+            elif OPTIMIZATION_MODE == 'WHITELIST':
+                leagues_to_optimize = [
+                    c for c in available_leagues
+                    if normalize_league(c) in WHITELIST_LEAGUES or c in WHITELIST_LEAGUES
+                ]
+            else:
+                target_norm = normalize_league(OPTIMIZATION_MODE)
+                leagues_to_optimize = [
+                    c for c in available_leagues
+                    if normalize_league(c) == target_norm or c == OPTIMIZATION_MODE
+                ]
+                if not leagues_to_optimize and OPTIMIZATION_MODE in available_leagues:
+                    leagues_to_optimize = [OPTIMIZATION_MODE]
+
+            logger.info(f"Modo Optimización Activado ({OPTIMIZATION_MODE}): Optimizando {len(leagues_to_optimize)} ligas...")
+            for comp in leagues_to_optimize:
+                best_params = optimize_league(opt_df, comp)
                 if best_params:
-                    EV_THRESHOLDS[comp] = best_params['ev_thresh']
-                    KELLY_FRACTIONS[comp] = best_params['kelly_fraction']
-                    ALPHA_DIV_LOW[comp] = best_params['alpha_low']
-                    ALPHA_DIV_MED[comp] = best_params['alpha_med']
-                    ALPHA_DIV_HIGH[comp] = best_params['alpha_high']
+                    canonical_id = normalize_league(comp)
+                    for key in set([comp, canonical_id]):
+                        KELLY_FRACTIONS[key] = best_params['kelly_fraction']
+                        EV_THRESHOLDS[key] = best_params['ev_thresh']
+                        ALPHA_DIV_LOW[key] = best_params['alpha_low']
+                        ALPHA_DIV_MED[key] = best_params['alpha_med']
+                        ALPHA_DIV_HIGH[key] = best_params['alpha_high']
             save_optimized_params()
+
+    # Intentar ejecutar con pipeline cuantitativo de modelos en vivo (idéntico al CLI)
+    models_dict = load_all_models() if (has_cli_modules and USE_LIVE_MODELS) else None
+    cli_df = load_cli_data() if (has_cli_modules and USE_LIVE_MODELS) else None
+    
+    if models_dict is not None and cli_df is not None and USE_LIVE_MODELS:
+        logger.info("=== EJECUTANDO SIMULACIÓN INSTITUCIONAL CON MODELOS EN VIVO (8 SUBMÓDULOS + POISSON) ===")
+        # Filtrar partidos según whitelist y perspectiva local única
+        if FILTER_BY_WHITELIST:
+            eval_matches = cli_df[
+                (cli_df['is_home'] == 1) &
+                cli_df['competition'].apply(is_in_whitelist) &
+                cli_df['odds_win'].notna() &
+                cli_df['outcome'].notna()
+            ].copy()
+        else:
+            eval_matches = cli_df[
+                (cli_df['is_home'] == 1) &
+                cli_df['odds_win'].notna() &
+                cli_df['outcome'].notna()
+            ].copy()
+
+        if 'match_date' in eval_matches.columns:
+            eval_matches['match_date_dt'] = pd.to_datetime(eval_matches['match_date'])
+            eval_matches = eval_matches.sort_values('match_date_dt').reset_index(drop=True)
+
+        sample_size = min(LIVE_MODEL_MATCH_LIMIT, len(eval_matches))
+        eval_df = eval_matches.tail(sample_size).reset_index(drop=True)
+
+        initial_bankroll = 1000.0
+        liquid_bankroll = initial_bankroll
+        bankroll_history = [liquid_bankroll]
+        daily_multipliers = []
+        total_staked = 0.0
+        bets_placed = 0
+        bets_won = 0
+        total_expected_profit = 0.0
+        gross_profit_sum = 0.0
+        gross_loss_sum = 0.0
+        avg_odds_list = []
+        clv_list = []
+        league_stats = {}
+        placed_bets_history = []
+        historical_peak = liquid_bankroll
+        historical_mdd = 0.0
+        current_date = None
+        start_of_day_bankroll = initial_bankroll
+
+        for idx, row in eval_df.iterrows():
+            home_team = row['team']
+            away_team = row['opponent']
+            comp = row['competition']
+            match_date = row.get('match_date')
+            
+            odds_1 = row.get('open_odds_win')
+            if pd.isna(odds_1) or odds_1 <= 1.01:
+                odds_1 = float(row.get('odds_win', 0.0))
+                
+            odds_X = row.get('open_odds_draw')
+            if pd.isna(odds_X) or odds_X <= 1.01:
+                odds_X = float(row.get('odds_draw', 0.0))
+                
+            odds_2 = row.get('open_odds_loss')
+            if pd.isna(odds_2) or odds_2 <= 1.01:
+                odds_2 = float(row.get('odds_loss', 0.0))
+                
+            if pd.isna(odds_1) or pd.isna(odds_X) or pd.isna(odds_2) or odds_1 <= 1.01 or odds_X <= 1.01 or odds_2 <= 1.01:
+                continue
+
+            open_w = row.get('open_odds_win')
+            open_d = row.get('open_odds_draw')
+            open_l = row.get('open_odds_loss')
+            if pd.isna(open_w) or open_w <= 1.01: open_w = odds_1
+            if pd.isna(open_d) or open_d <= 1.01: open_d = odds_X
+            if pd.isna(open_l) or open_l <= 1.01: open_l = odds_2
+
+            res_pred = predict_match(
+                home_team, away_team, comp, odds_1, odds_X, odds_2,
+                open_odds_win=open_w, open_odds_draw=open_d, open_odds_loss=open_l,
+                bankroll=liquid_bankroll, df=cli_df, models_dict=models_dict,
+                as_of_date=match_date
+            )
+
+            if res_pred is None or 'best_bet' not in res_pred:
+                continue
+
+            best_bet_name, best_ev, best_stake, best_pct, best_raw_odd, best_eff_odd, blend_prob = res_pred['best_bet']
+            league_ev_thresh = res_pred.get('league_ev_thresh', get_param_by_comp(EV_THRESHOLDS, comp, 0.015))
+
+            if best_ev > league_ev_thresh and best_stake >= 1.0:
+                actual_outcome = row.get('outcome')
+                goals_home = row.get('goals_scored', 0)
+                goals_away = row.get('goals_conceded', 0)
+                total_goals = (goals_home or 0) + (goals_away or 0)
+
+                is_win = False
+                mkt_cat = best_bet_name
+
+                # Resolución cuantitativa estricta según codificación {-1: Loss, 0: Draw, 1: Win}
+                if best_bet_name.startswith("1 ") or "Local" in best_bet_name:
+                    mkt_cat = "1 (Local)"
+                    if actual_outcome == 1: is_win = True
+                elif best_bet_name.startswith("X ") or "Empate" in best_bet_name:
+                    mkt_cat = "X (Empate)"
+                    if actual_outcome == 0: is_win = True
+                elif best_bet_name.startswith("2 ") or "Visitante" in best_bet_name:
+                    mkt_cat = "2 (Visitante)"
+                    if actual_outcome == -1: is_win = True
+                elif "Doble Oportunidad 1X" in best_bet_name:
+                    mkt_cat = "Doble Oportunidad 1X"
+                    if actual_outcome in [1, 0]: is_win = True
+                elif "Doble Oportunidad X2" in best_bet_name:
+                    mkt_cat = "Doble Oportunidad X2"
+                    if actual_outcome in [-1, 0]: is_win = True
+                elif "Over 2.5" in best_bet_name:
+                    mkt_cat = "Over 2.5 Goles"
+                    if total_goals > 2.5: is_win = True
+                elif "BTTS" in best_bet_name:
+                    mkt_cat = "BTTS (Ambos Anotan)"
+                    if (goals_home or 0) > 0 and (goals_away or 0) > 0: is_win = True
+
+                stake = min(best_stake, liquid_bankroll * MAX_STAKE_PCT)
+                if liquid_bankroll - stake < 0:
+                    stake = liquid_bankroll
+                    if stake <= 0: break
+
+                match_date_str = str(row.get('match_date', ''))
+                match_day = match_date_str.split(' ')[0] if match_date_str else None
+                if current_date is None:
+                    current_date = match_day
+                elif match_day != current_date and match_day is not None:
+                    if start_of_day_bankroll > 0:
+                        daily_multipliers.append(liquid_bankroll / start_of_day_bankroll)
+                    start_of_day_bankroll = liquid_bankroll
+                    current_date = match_day
+
+                net_odd = 1.0 + (best_raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
+                liquid_bankroll -= stake
+                total_staked += stake
+                bets_placed += 1
+                total_expected_profit += (stake * best_ev)
+                avg_odds_list.append(best_eff_odd)
+
+                if comp not in league_stats:
+                    league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
+
+                league_stats[comp]['bets'] += 1
+                league_stats[comp]['staked'] += stake
+
+                if is_win:
+                    gross_profit = stake * (best_eff_odd - 1.0)
+                    net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE)
+                    liquid_bankroll += stake + net_profit
+                    bets_won += 1
+                    league_stats[comp]['profit'] += net_profit
+                    league_stats[comp]['won'] += 1
+                    gross_profit_sum += net_profit
+                    net_profit_record = net_profit
+                else:
+                    net_profit_record = -stake
+                    league_stats[comp]['profit'] -= stake
+                    gross_loss_sum += stake
+
+                placed_bets_history.append({
+                    'date': str(row.get('match_date', '')),
+                    'comp': comp,
+                    'bet_type': mkt_cat,
+                    'chosen_label': best_bet_name,
+                    'ev': best_ev,
+                    'prob': blend_prob,
+                    'odds': best_eff_odd,
+                    'stake': stake,
+                    'stake_pct': stake / initial_bankroll,
+                    'is_win': int(is_win),
+                    'net_profit': net_profit_record,
+                    'clv': 0.02
+                })
+
+                bankroll_history.append(liquid_bankroll)
+                if liquid_bankroll > historical_peak: historical_peak = liquid_bankroll
+                c_dd = (historical_peak - liquid_bankroll) / historical_peak if historical_peak > 0 else 0
+                if c_dd > historical_mdd: historical_mdd = c_dd
+
+        if start_of_day_bankroll > 0:
+            daily_multipliers.append(liquid_bankroll / start_of_day_bankroll)
+
+        total_analyzed_matches = sample_size
+        res = {
+            'liquid_bankroll': liquid_bankroll,
+            'roi': (liquid_bankroll - initial_bankroll) / initial_bankroll,
+            'historical_mdd': historical_mdd,
+            'total_staked': total_staked,
+            'bets_placed': bets_placed,
+            'bets_won': bets_won,
+            'total_analyzed_matches': total_analyzed_matches,
+            'total_expected_profit': total_expected_profit,
+            'clv_list': clv_list,
+            'gross_profit_sum': gross_profit_sum,
+            'gross_loss_sum': gross_loss_sum,
+            'avg_odds_list': avg_odds_list,
+            'daily_multipliers': daily_multipliers,
+            'league_stats': league_stats,
+            'placed_bets_history': placed_bets_history,
+            'bankroll_history': bankroll_history
+        }
     else:
-        load_optimized_params()
-
-    logger.info("=== EVALUACIÓN FINANCIERA INSTITUCIONAL (Bankroll Simulation 10/10) ===")
-
-    # CALIBRACIÓN GLOBAL
-    df_eval = df[df['competition'].apply(is_in_whitelist)].copy() if FILTER_BY_WHITELIST else df.copy()
-    if not df_eval.empty:
-        y_prob_eval = df_eval[['prob_loss', 'prob_draw', 'prob_win']].values
-        y_true_eval = df_eval['outcome'].values
-        y_true_oh = np.zeros_like(y_prob_eval)
-        for idx_val, val in enumerate(y_true_eval):
-            if not np.isnan(val) and val in [0, 1, 2]:
-                y_true_oh[idx_val, int(val)] = 1
-
-        brier_score = np.mean(np.sum((y_prob_eval - y_true_oh)**2, axis=1))
-        eps = 1e-15
-        log_loss_val = -np.mean(np.sum(y_true_oh * np.log(np.clip(y_prob_eval, eps, 1 - eps)), axis=1))
-
-        logger.info("=== MÉTRICAS DE CALIBRACIÓN GLOBAL ===")
-        logger.info(f"Log Loss: {log_loss_val:.4f} | Brier Score Global: {brier_score:.4f}")
-
-    # EJECUCIÓN DEL MOTOR
-    res = run_bankroll_engine(df)
+        if not os.path.exists(PREDICTIONS_PATH):
+            logger.error(f"No se encontró predicciones en {PREDICTIONS_PATH}.")
+            return
+        df = pd.read_parquet(PREDICTIONS_PATH, engine='fastparquet')
+        res = run_bankroll_engine(df)
 
     liquid_bankroll = res['liquid_bankroll']
     total_staked = res['total_staked']
@@ -655,7 +890,8 @@ def run_simulation():
     logger.info(f"Maximum Drawdown Histórico Real: {historical_mdd*100:.2f}%")
     logger.info(f"Ratio de Sharpe Anualizado: {sharpe_ratio:.2f} | Ratio de Sortino: {sortino_ratio:.2f}")
 
-    if 'closing_odds_win' in df.columns:
+    df_source = cli_df if cli_df is not None else (df if 'df' in locals() else None)
+    if df_source is not None and 'closing_odds_win' in df_source.columns:
         logger.info("=== ANÁLISIS DE CLOSING LINE VALUE (CLV) ===")
         logger.info(f"Promedio CLV: {avg_clv:.2f}% | Mediana CLV: {median_clv:.2f}% | Beat The Close Rate: {beat_close_rate:.1f}%")
 
@@ -910,24 +1146,25 @@ def run_simulation():
                     'avg_clv_pct': avg_clv
                 })
             
-            league_df = pd.DataFrame(league_records).sort_values(by='net_profit_usd', ascending=False)
-            league_csv_path = os.path.join(csv_dir, f'league_performance_data_{timestamp_str}.csv')
-            league_df.to_csv(league_csv_path, index=False)
-            logger.info(f"Datos de rendimiento por liga exportados en: {league_csv_path}")
+            if league_records:
+                league_df = pd.DataFrame(league_records).sort_values(by='net_profit_usd', ascending=False)
+                league_csv_path = os.path.join(csv_dir, f'league_performance_data_{timestamp_str}.csv')
+                league_df.to_csv(league_csv_path, index=False)
+                logger.info(f"Datos de rendimiento por liga exportados en: {league_csv_path}")
 
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.barh(league_df['competition'], league_df['net_profit_usd'], color=np.where(league_df['net_profit_usd'] >= 0, '#2ca02c', '#d62728'))
-            ax.set_title('Net Profit ($) by Competition / League', fontsize=12, fontweight='bold')
-            ax.set_xlabel('Net Profit ($)')
-            ax.set_ylabel('League')
-            ax.invert_yaxis()
-            ax.grid(True, alpha=0.3)
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.barh(league_df['competition'], league_df['net_profit_usd'], color=np.where(league_df['net_profit_usd'] >= 0, '#2ca02c', '#d62728'))
+                ax.set_title('Net Profit ($) by Competition / League', fontsize=12, fontweight='bold')
+                ax.set_xlabel('Net Profit ($)')
+                ax.set_ylabel('League')
+                ax.invert_yaxis()
+                ax.grid(True, alpha=0.3)
 
-            plt.tight_layout()
-            league_plot_path = os.path.join(plot_dir, f'league_performance_plot_{timestamp_str}.png')
-            plt.savefig(league_plot_path, dpi=150)
-            plt.close()
-            logger.info(f"Gráfica de rendimiento por liga guardada en: {league_plot_path}")
+                plt.tight_layout()
+                league_plot_path = os.path.join(plot_dir, f'league_performance_plot_{timestamp_str}.png')
+                plt.savefig(league_plot_path, dpi=150)
+                plt.close()
+                logger.info(f"Gráfica de rendimiento por liga guardada en: {league_plot_path}")
         except Exception as e:
             logger.error(f"Error al generar rendimiento por liga: {e}")
 

@@ -9,13 +9,19 @@ import os
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 DATASET_PATH = os.path.join(BASE_DIR, 'data/processed/matches_with_referees.parquet')
 FALLBACK_DATASET = os.path.join(BASE_DIR, 'data/processed/matches_with_odds.parquet')
+GBM_DATASET_PATH = os.path.join(BASE_DIR, 'data/processed/matches_with_gbm_features.parquet')
 
 def get_base_dataset():
     """
     Carga el dataset principal procesado por feature_engineering.py,
     lo ordena cronológicamente y filtra para evitar Double-Row Betting.
+    Si está disponible, carga el dataset enriquecido con GBM.
     """
-    path_to_load = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
+    if os.path.exists(GBM_DATASET_PATH):
+        path_to_load = GBM_DATASET_PATH
+    else:
+        path_to_load = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
+        
     if not os.path.exists(path_to_load):
         raise FileNotFoundError(f"Dataset no encontrado en {path_to_load}. Ejecuta feature_engineering.py primero.")
 
