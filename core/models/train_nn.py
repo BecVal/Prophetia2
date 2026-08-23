@@ -36,7 +36,7 @@ from core.logger_config import get_logger
 # ==============================================================================
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA Y DEEP ENSEMBLE)
 # ==============================================================================
-RUN_OPTUNA = True
+RUN_OPTUNA = False
 OPTUNA_TRIALS = 30
 ENSEMBLE_SEEDS = [42, 100, 2024]  # Bagging de 3 semillas por pliegue
 # ==============================================================================

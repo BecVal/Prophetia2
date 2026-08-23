@@ -2,10 +2,12 @@ import os
 import sys
 import json
 import joblib
+import warnings
+warnings.filterwarnings('ignore')
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from scipy.stats import entropy, poisson
+from scipy.stats import entropy, poisson, nbinom
 import questionary
 from questionary import Style, Choice
 from rich.console import Console
@@ -358,11 +360,12 @@ def export_trade_signals(res, filepath='trade_signals.json'):
     return filepath
 
 def load_data():
-    gbm_dataset_path = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_gbm_features.parquet'))
-    if os.path.exists(gbm_dataset_path):
-        path = gbm_dataset_path
+    if os.path.exists(DATASET_PATH):
+        path = DATASET_PATH
+    elif os.path.exists(FALLBACK_DATASET):
+        path = FALLBACK_DATASET
     else:
-        path = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET
+        path = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_gbm_features.parquet'))
         
     if not os.path.exists(path):
         console.print(f"[red]Error: Dataset no encontrado en {path}[/red]")
@@ -405,27 +408,36 @@ def get_latest_team_row(df, team_name, as_of_date=None):
         return None
     norm = normalize_team_name(team_name)
     
-    search_df = df
-    if as_of_date is not None and 'match_date' in df.columns:
-        as_of_str = str(as_of_date)
-        search_df = df[df['match_date'].astype(str) < as_of_str]
-        if search_df.empty:
-            search_df = df
+    def _filter_date(sub_df):
+        if as_of_date is not None and not sub_df.empty and 'match_date' in sub_df.columns:
+            as_of_val = as_of_date
+            if pd.api.types.is_datetime64_any_dtype(sub_df['match_date']):
+                as_of_val = pd.to_datetime(as_of_date)
+            elif not isinstance(as_of_date, str):
+                as_of_val = str(as_of_date)
+            dated_df = sub_df[sub_df['match_date'] < as_of_val]
+            if not dated_df.empty:
+                return dated_df
+        return sub_df
     
     # 1. Búsqueda exacta por nombre o normalizado
-    team_df = search_df[(search_df['team'] == team_name) | (search_df['team'] == norm)].sort_values('match_date')
+    team_df = df[(df['team'] == team_name) | (df['team'] == norm)]
     if not team_df.empty:
-        return team_df.iloc[-1]
+        team_df = _filter_date(team_df).sort_values('match_date')
+        if not team_df.empty:
+            return team_df.iloc[-1]
         
-    opp_df = search_df[(search_df['opponent'] == team_name) | (search_df['opponent'] == norm)].sort_values('match_date')
+    opp_df = df[(df['opponent'] == team_name) | (df['opponent'] == norm)]
     if not opp_df.empty:
-        return opp_df.iloc[-1]
+        opp_df = _filter_date(opp_df).sort_values('match_date')
+        if not opp_df.empty:
+            return opp_df.iloc[-1]
         
     # 2. Búsqueda flexible por alias / minúsculas
     raw_lower = str(team_name).lower().replace(' ', '').replace('cf', '').replace('fc', '')
     norm_lower = str(norm).lower().replace(' ', '').replace('cf', '').replace('fc', '')
     
-    all_teams = set(search_df['team'].dropna().unique()).union(set(search_df['opponent'].dropna().unique()))
+    all_teams = set(df['team'].dropna().unique()).union(set(df['opponent'].dropna().unique()))
     matched_name = None
     for t in all_teams:
         t_norm = normalize_team_name(t)
@@ -443,12 +455,16 @@ def get_latest_team_row(df, team_name, as_of_date=None):
                 break
 
     if matched_name:
-        team_df = search_df[(search_df['team'] == matched_name)].sort_values('match_date')
+        team_df = df[(df['team'] == matched_name)]
         if not team_df.empty:
-            return team_df.iloc[-1]
-        opp_df = search_df[(search_df['opponent'] == matched_name)].sort_values('match_date')
+            team_df = _filter_date(team_df).sort_values('match_date')
+            if not team_df.empty:
+                return team_df.iloc[-1]
+        opp_df = df[(df['opponent'] == matched_name)]
         if not opp_df.empty:
-            return opp_df.iloc[-1]
+            opp_df = _filter_date(opp_df).sort_values('match_date')
+            if not opp_df.empty:
+                return opp_df.iloc[-1]
 
     return None
 
@@ -481,6 +497,97 @@ def compute_meta_features_live(df_base, open_odds_win, open_odds_draw, open_odds
     meta['competition_id'] = comp_id
     
     return pd.concat([df_base, meta], axis=1)
+
+def predict_corners_live(corners_data, home_row, away_row):
+    """
+    Calcula los córneres esperados con perspectiva dual (Home + Away)
+    y la probabilidad calibrada de Over 9.5 mediante Binomial Negativa / Poisson + Isotonic Regression.
+    """
+    if not corners_data or 'model_corners' not in corners_data:
+        return 4.9, 4.9, 9.8, 0.48
+    
+    if home_row is None:
+        home_row = pd.Series({'team_elo': 1500.0})
+    if away_row is None:
+        away_row = pd.Series({'team_elo': 1500.0})
+
+    feature_cols = corners_data.get('features', [])
+    model_corners = corners_data['model_corners']
+    c_disp = float(corners_data.get('c_dispersion', 1.0))
+    calibrators = corners_data.get('calibrators', {})
+
+    # 1. Perspectiva Local (is_home = 1)
+    df_h = pd.DataFrame(index=[0])
+    for stat in ['crosses', 'possession_pct', 'shots_total', 'corners']:
+        for span in [3, 5]:
+            df_h[f'{stat}_ema{span}'] = float(home_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
+            df_h[f'opp_{stat}_ema{span}'] = float(away_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
+
+    df_h['team_att_rating'] = float(home_row.get('team_att_rating', 0.0) or 0.0)
+    df_h['team_def_rating'] = float(home_row.get('team_def_rating', 0.0) or 0.0)
+    df_h['opp_att_rating'] = float(away_row.get('team_att_rating', 0.0) or 0.0)
+    df_h['opp_def_rating'] = float(away_row.get('team_def_rating', 0.0) or 0.0)
+
+    h_elo = float(home_row.get('team_elo', 1500.0) or 1500.0)
+    a_elo = float(away_row.get('team_elo', 1500.0) or 1500.0)
+    df_h['elo_diff'] = h_elo - a_elo
+    df_h['relative_attack_strength'] = float(home_row.get('relative_attack_strength', 0.0) or 0.0)
+    df_h['xg_momentum_macd'] = float(home_row.get('xg_momentum_macd', 0.0) or 0.0)
+    df_h['is_home'] = 1
+
+    # 2. Perspectiva Visitante (is_home = 0)
+    df_a = pd.DataFrame(index=[0])
+    for stat in ['crosses', 'possession_pct', 'shots_total', 'corners']:
+        for span in [3, 5]:
+            df_a[f'{stat}_ema{span}'] = float(away_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
+            df_a[f'opp_{stat}_ema{span}'] = float(home_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
+
+    df_a['team_att_rating'] = float(away_row.get('team_att_rating', 0.0) or 0.0)
+    df_a['team_def_rating'] = float(away_row.get('team_def_rating', 0.0) or 0.0)
+    df_a['opp_att_rating'] = float(home_row.get('team_att_rating', 0.0) or 0.0)
+    df_a['opp_def_rating'] = float(home_row.get('team_def_rating', 0.0) or 0.0)
+
+    df_a['elo_diff'] = -(h_elo - a_elo)
+    df_a['relative_attack_strength'] = -float(home_row.get('relative_attack_strength', 0.0) or 0.0)
+    df_a['xg_momentum_macd'] = -float(home_row.get('xg_momentum_macd', 0.0) or 0.0)
+    df_a['is_home'] = 0
+
+    # Llenar cualquier feature faltante
+    for f in feature_cols:
+        if f not in df_h.columns: df_h[f] = 0.0
+        if f not in df_a.columns: df_a[f] = 0.0
+
+    try:
+        exp_h = float(model_corners.predict(df_h[feature_cols].fillna(0.0))[0])
+        exp_a = float(model_corners.predict(df_a[feature_cols].fillna(0.0))[0])
+    except Exception:
+        exp_h, exp_a = 4.9, 4.9
+
+    exp_tot = max(exp_h + exp_a, 0.5)
+
+    # Cálculo estocástico de Over 9.5
+    k = 9
+    if c_disp <= 1.02:
+        prob_over95_raw = float(1.0 - poisson.cdf(k, exp_tot))
+    else:
+        p_nb = 1.0 / c_disp
+        n_nb = max(exp_tot, 1e-4) * p_nb / (1.0 - p_nb)
+        n_nb = max(n_nb, 1e-4)
+        prob_over95_raw = float(1.0 - nbinom.cdf(k, n_nb, p_nb))
+
+    prob_over95_raw = float(np.clip(prob_over95_raw, 0.01, 0.99))
+
+    calib = calibrators.get(9.5)
+    if calib is not None:
+        try:
+            prob_over95_calib = float(calib.predict(np.array([prob_over95_raw]))[0])
+            prob_over95 = float(np.clip(prob_over95_calib, 0.01, 0.99))
+        except Exception:
+            prob_over95 = prob_over95_raw
+    else:
+        prob_over95 = prob_over95_raw
+
+    return exp_h, exp_a, exp_tot, prob_over95
 
 def build_live_match_features(
     df, home_team, away_team, comp, odds_1, odds_X, odds_2,
@@ -774,13 +881,12 @@ def predict_match(
     prob_btts_yes = float(np.sum(poisson_matrix[1:, 1:]))
     prob_btts_no = 1.0 - prob_btts_yes
 
-    corners_data = models_dict['corners']
-    exp_corners = 9.8
-    if corners_data and 'model_corners' in corners_data:
-        try:
-            df_c_feat = df_input_full[corners_data['features']] if all(c in df_input_full.columns for c in corners_data['features']) else None
-            if df_c_feat is not None: exp_corners = float(corners_data['model_corners'].predict(df_c_feat)[0])
-        except Exception: pass
+    corners_data = models_dict.get('corners')
+    home_row_corners = get_latest_team_row(df, home_team, as_of_date=as_of_date)
+    away_row_corners = get_latest_team_row(df, away_team, as_of_date=as_of_date)
+    exp_corners_home, exp_corners_away, exp_corners, prob_over95_corners = predict_corners_live(
+        corners_data, home_row_corners, away_row_corners
+    )
 
     cards_data = models_dict['cards']
     exp_cards = 4.2
@@ -789,7 +895,6 @@ def predict_match(
             exp_cards = float(cards_data.predict(df_input_full)[0]) if hasattr(cards_data, 'predict') else 4.2
         except Exception: pass
 
-    prob_over95_corners = float(1.0 - sum(poisson.pmf(k, exp_corners) for k in range(10)))
     prob_over45_cards = float(1.0 - sum(poisson.pmf(k, exp_cards) for k in range(5)))
 
     impl_win, impl_draw, impl_loss = 1.0/odds_1, 1.0/odds_X, 1.0/odds_2
@@ -822,21 +927,21 @@ def predict_match(
     blend_X2 = blend_draw + blend_loss
     ev_X2 = (blend_X2 * net_combined_X2) - 1.0 - EXPECTED_CLV_DROP
 
-    odd_ou25 = extra_odds.get('ou25_over', 1.0 / max(prob_over25_goals, 0.05))
+    odd_ou25 = float(extra_odds.get('ou25_over', 1.95))
     ev_ou25 = (prob_over25_goals * (1.0 + (odd_ou25 - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
 
     implied_over = 1.0 / max(odd_ou25, 1.01)
     implied_under_est = max(1.0 - implied_over, 0.05)
-    odd_ou25_under = extra_odds.get('ou25_under', 1.0 / implied_under_est)
+    odd_ou25_under = float(extra_odds.get('ou25_under', 1.0 / implied_under_est))
     ev_ou25_under = (prob_under25_goals * (1.0 + (odd_ou25_under - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
 
-    odd_btts = extra_odds.get('btts_yes', 1.0 / max(prob_btts_yes, 0.05))
+    odd_btts = float(extra_odds.get('btts_yes', 1.85))
     ev_btts = (prob_btts_yes * (1.0 + (odd_btts - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
 
-    odd_corners = extra_odds.get('corners_over95', 1.0 / max(prob_over95_corners, 0.05))
+    odd_corners = float(extra_odds.get('corners_over95', 1.85))
     ev_corners = (prob_over95_corners * (1.0 + (odd_corners - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
 
-    odd_cards = extra_odds.get('cards_over45', 1.0 / max(prob_over45_cards, 0.05))
+    odd_cards = float(extra_odds.get('cards_over45', 1.85))
     ev_cards = (prob_over45_cards * (1.0 + (odd_cards - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
 
     max_liquidity = get_param_by_comp(MAX_BET_LIQUIDITY, comp, 2000.0)
@@ -890,7 +995,8 @@ def predict_match(
         'home_team': home_team, 'away_team': away_team, 'competition': comp,
         'home_official': home_official, 'away_official': away_official,
         'xg_scored': xg_s, 'xg_conceded': xg_c,
-        'exp_corners': exp_corners, 'exp_cards': exp_cards,
+        'exp_corners': exp_corners, 'exp_corners_home': exp_corners_home, 'exp_corners_away': exp_corners_away,
+        'exp_cards': exp_cards,
         'prob_win': prob_win, 'prob_draw': prob_draw, 'prob_loss': prob_loss,
         'ci_win_low': ci_win_low, 'ci_win_high': ci_win_high, 'se_win': se_win,
         'ci_draw_low': ci_draw_low, 'ci_draw_high': ci_draw_high, 'se_draw': se_draw,
@@ -1092,7 +1198,7 @@ def main():
         f"[bold bright_cyan]🏠 LOCAL: {home_off}[/bold bright_cyan]\n"
         f"[bold bright_magenta]✈️ VISITANTE: {away_off}[/bold bright_magenta]\n\n"
         f"[bold cyan]Marcador Esperado Quant (xG):[/bold cyan] [bold bright_cyan]{home_off}[/bold bright_cyan] [bold bright_yellow]{res['xg_scored']:.2f} - {res['xg_conceded']:.2f}[/bold bright_yellow] [bold bright_magenta]{away_off}[/bold bright_magenta]\n"
-        f"[bold cyan]Córneres Esperados:[/bold cyan] [bold bright_yellow]{res['exp_corners']:.1f}[/bold bright_yellow] | [bold cyan]Tarjetas Esperadas:[/bold cyan] [bold bright_yellow]{res['exp_cards']:.1f}[/bold bright_yellow]\n"
+        f"[bold cyan]Córneres Esperados:[/bold cyan] [bold bright_yellow]{res['exp_corners']:.1f}[/bold bright_yellow] [dim](Local: {res.get('exp_corners_home', 0):.1f} | Visita: {res.get('exp_corners_away', 0):.1f})[/dim] | [bold cyan]Tarjetas Esperadas:[/bold cyan] [bold bright_yellow]{res['exp_cards']:.1f}[/bold bright_yellow]\n"
         f"{odds_footer}",
         title=f"[bold bright_yellow]⚽ PROYECCIONES QUANT - {get_formatted_comp_name(comp)}[/bold bright_yellow]", border_style="bright_blue"
     ))
@@ -1134,11 +1240,11 @@ def main():
     t2.add_column("Net EV", justify="right")
     t2.add_column("Stake Kelly Multi ($ / %)", justify="right")
 
-    odd_ou25 = extra_odds.get('ou25_over', 1.0 / max(res['prob_over25_goals'], 0.05))
-    odd_ou25_under = res.get('odd_ou25_under', 1.0 / max(res['prob_under25_goals'], 0.05))
-    odd_btts = extra_odds.get('btts_yes', 1.0 / max(res['prob_btts_yes'], 0.05))
-    odd_corn = extra_odds.get('corners_over95', 1.0 / max(res['prob_over95_corners'], 0.05))
-    odd_card = extra_odds.get('cards_over45', 1.0 / max(res['prob_over45_cards'], 0.05))
+    odd_ou25 = float(extra_odds.get('ou25_over', 1.95))
+    odd_ou25_under = float(res.get('odd_ou25_under', 1.85))
+    odd_btts = float(extra_odds.get('btts_yes', 1.85))
+    odd_corn = float(extra_odds.get('corners_over95', 1.85))
+    odd_card = float(extra_odds.get('cards_over45', 1.85))
 
     t2.add_row("Over 2.5 Goles Totales", f"{odd_ou25:.2f}", f"{res['prob_over25_goals']*100:.1f}%", c_ev(res['ev_ou25']), c_stake(res['stake_ou25'], res['pct_ou25']))
     t2.add_row("Under 2.5 Goles Totales", f"{odd_ou25_under:.2f}", f"{res['prob_under25_goals']*100:.1f}%", c_ev(res['ev_ou25_under']), "$0.00 [dim](0.00%)[/dim]")

@@ -148,7 +148,7 @@ class LiveOddsFeedFetcher:
                         'home_team': home, 'away_team': away, 'competition': comp,
                         'odds_1': odds_1, 'odds_X': odds_X, 'odds_2': odds_2,
                         'open_odds_win': odds_1, 'open_odds_draw': odds_X, 'open_odds_loss': odds_2,
-                        'extra_odds': {'ou25_over': ou25, 'btts_yes': 1.85},
+                        'extra_odds': {'ou25_over': ou25, 'btts_yes': 1.85, 'corners_over95': 1.85, 'cards_over45': 1.85},
                         'date': item.get('commence_time', ''),
                         'source': 'The-Odds-API (Pinnacle)'
                     })
@@ -272,7 +272,7 @@ class LiveOddsFeedFetcher:
                         'open_odds_win': open_1,
                         'open_odds_draw': open_X,
                         'open_odds_loss': open_2,
-                        'extra_odds': {'ou25_over': ou25, 'btts_yes': 1.85},
+                        'extra_odds': {'ou25_over': ou25, 'btts_yes': 1.85, 'corners_over95': 1.85, 'cards_over45': 1.85},
                         'date': date_str,
                         'has_live_odds': has_live_odds,
                         'source': 'ESPN Live Schedule & Odds' if has_live_odds else 'ESPN Live Schedule (Cuotas Aún No Publicadas)'
@@ -336,7 +336,7 @@ class LiveOddsFeedFetcher:
                     'open_odds_win': open_win,
                     'open_odds_draw': open_draw,
                     'open_odds_loss': open_loss,
-                    'extra_odds': {'ou25_over': ou25 if ou25 > 1.0 else 1.95, 'btts_yes': btts if btts > 1.0 else 1.85},
+                    'extra_odds': {'ou25_over': ou25 if ou25 > 1.0 else 1.95, 'btts_yes': btts if btts > 1.0 else 1.85, 'corners_over95': 1.85, 'cards_over45': 1.85},
                     'date': date_str,
                     'source': 'Football-Data Live Feed'
                 })

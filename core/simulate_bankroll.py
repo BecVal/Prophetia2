@@ -56,7 +56,7 @@ MAX_BET_LIQUIDITY = {             # Límites de liquidez absolutos por competici
 }
 
 # CONFIGURACIÓN DE OPTIMIZACIÓN
-OPTIMIZATION_MODE = 'ALL'  # 'NONE', 'ALL', 'WHITELIST', o liga específica
+OPTIMIZATION_MODE = 'NONE'  # 'NONE' para evaluación instantánea, 'ALL' o 'WHITELIST' para optimizar con Optuna
 OPTUNA_TRIALS = 100
 OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
 

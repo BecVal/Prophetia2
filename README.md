@@ -86,40 +86,85 @@ Para ejecutar inferencias en tiempo real sobre los próximos partidos con asigna
 python core/cli_predictor.py
 ```
 
-### 2. Servidor de Inferencia API (FastAPI)
-Para exponer el motor cuantitativo y consultar predicciones vía REST API:
-```bash
-uvicorn api.main:app --reload
-```
+### 2. Pipeline de Actualización y Reentrenamiento Mensual Automatizado (Recomendado)
 
-### 3. Pipeline Cuantitativo Completo
+Para mantener los modelos calibrados con los resultados más recientes del fútbol mundial, se dispone del orquestador institucional maestro `core/update_monthly_pipeline.py`. Este script ejecuta automáticamente las 4 fases del sistema, registra logs visuales en consola con `rich`, almacena el historial detallado en la carpeta `logs/` (`logs/pipeline_monthly_update_YYYY-MM-DD.log`) y valida el rendimiento financiero antes de certificar los nuevos modelos:
+
+#### A. Actualización Completa (Modo Mensual por Defecto)
+Descarga los últimos resultados de todas las ligas, actualiza los valores de mercado de las plantillas en Transfermarkt, procesa las características dinámicas (EMAs, Elo, fatiga, H2H, xG Share), reentrena los 9 modelos especializados, ajusta el Meta-Stacker final y ejecuta la suite de validación financiera:
+```bash
+python core/update_monthly_pipeline.py
+```
+> **¿Para qué sirve?** Es el comando principal a ejecutar periódicamente (ej. una vez al mes) para que el bot y el CLI aprendan de los partidos recién disputados y ajusten sus probabilidades a la forma actual de los equipos.
+
+#### B. Modo Anti-Bloqueo de Red (Omitir Scraping de Transfermarkt)
+Si el servidor de Transfermarkt presenta restricciones de tasa de peticiones (rate limiting) o bloqueos temporales por IP, este comando actualiza todos los partidos oficiales y cuotas utilizando las valoraciones de plantilla preexistentes:
+```bash
+python core/update_monthly_pipeline.py --skip-scraping
+```
+> **¿Para qué sirve?** Permite refrescar resultados y reentrenar todos los modelos sin riesgo de que el pipeline se detenga por fallas de conexión a sitios web externos.
+
+#### C. Solo Reentrenamiento y Validación (Omitir Descargas)
+Si ya cuentas con los datasets procesados y únicamente deseas reentrenar los 9 modelos cuantitativos, ajustar el Meta-Stacker y verificar las métricas financieras:
+```bash
+python core/update_monthly_pipeline.py --train-only
+```
+> **¿Para qué sirve?** Ahorra tiempo de descarga cuando estás ajustando hiperparámetros o algoritmos de Machine Learning sobre los datos locales existentes.
+
+#### D. Validación Financiera y Pruebas del Motor CLI (Control de Calidad)
+Ejecuta de manera inmediata la simulación de bankroll a gran escala (`simulate_bankroll.py`), la prueba de rendimiento en Liga MX 2026 (`test_cli_predictor_liga_mx.py`) y la validación en el conjunto Out-Of-Sample internacional 2026 (`test_cli_predictor_real_data.py`):
+```bash
+python core/update_monthly_pipeline.py --validate-only
+```
+> **¿Para qué sirve?** Para auditar el ROI, Winrate, Profit Factor, Drawdown y comportamiento de la gestión de capital (Markowitz/Kelly) sin modificar ni reentrenar los archivos de modelos existentes.
+
+---
+
+### 3. Ejecución Manual Paso a Paso (Pipeline Modular)
+
+Si prefieres ejecutar cada componente de forma individual:
 
 1. **Ingesta y Adaptación de Datos**:
-   Descarga de eventos crudos (StatsBomb) y valoraciones de liquidez/plantilla (Transfermarkt).
+   Descarga de eventos crudos, scraping de valores de plantilla y unificación del dataset intermedio.
    ```bash
-   python core/download_football_data.py
+   python core/download_football_data.py --force-refresh
    python ingestion/transfermarkt_scraper.py
    python core/data_adapter.py
    ```
-2. **Ingeniería de Características y Dinámica de Cuotas**:
-   Generación de medias móviles temporales, extracción jerárquica de cuotas de apertura/cierre y métricas de disciplina arbitral.
+2. **Ingeniería de Características y Cuotas de Mercado**:
+   Cálculo de medias móviles temporales (EMAs), Elo dinámico, xG Share, fatiga, H2H, extracción de cuotas Pinnacle/Bet365 y métricas disciplinarias arbitrales.
    ```bash
    python core/feature_engineering.py
    python ingestion/fetch_odds.py
    python ingestion/fetch_referees.py
    ```
-3. **Entrenamiento de Modelos y Meta-Stacker**:
-   Entrenamiento del modelo cuantitativo GBM con Método de Shin (1993), modelos base y Meta-Stacker final (Nivel 2 con XGBoost GPU) libre de fugas de datos (*Data Leakage*).
+3. **Reentrenamiento de los 9 Modelos Especializados y Meta-Stacker**:
+   Entrenamiento paralelo con validación temporal estricta (`data_splitter.py`) y ensamble de segundo nivel libre de *Data Leakage*.
    ```bash
+   python core/models/train_quant_advanced.py
+   python core/models/train_context.py
+   python core/models/train_nn.py
+   python core/models/train_draws.py
+   python core/market_models/train_market.py
    python core/market_models/train_gbm_model.py
-   python core/run_pipeline.py
+   python core/models/train_corners_model.py
+   python core/models/train_cards_model.py
+   python core/models/train_shots_on_goal.py
+   python core/models/train_stacker.py
    python core/market_models/train_clv_model.py
    ```
-4. **Validación Financiera y Simulación de Bankroll**:
-   Simulador de la curva de capital, optimización multivariable por liga con Optuna y métricas de portafolio (Sharpe, Sortino, CLV Promedio, MDD, Monte Carlo).
+4. **Validación Financiera Global**:
    ```bash
    python core/simulate_bankroll.py
+   python tests/test_cli_predictor_liga_mx.py
+   python tests/test_cli_predictor_real_data.py
    ```
+
+### 4. Servidor de Inferencia API (FastAPI)
+Para exponer el motor cuantitativo y consultar predicciones vía REST API:
+```bash
+uvicorn api.main:app --reload
+```
 
 ---
 

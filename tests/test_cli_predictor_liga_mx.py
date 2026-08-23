@@ -29,7 +29,6 @@ __main__.SklearnPyTorchWrapper = SklearnPyTorchWrapper10
 __main__.HybridDrawsEnsemble = HybridDrawsEnsemble
 
 from cli_predictor import predict_match, load_all_models, load_data, TAX_RETENTION_RATE
-from models.data_splitter import get_base_dataset
 
 import logging
 logging.disable(logging.INFO)
@@ -38,8 +37,8 @@ console = Console()
 
 def run_liga_mx_cli_test():
     console.print(Panel.fit(
-        "[bold bright_yellow]PROPHETIA2 - SUITE DE PRUEBAS EXCLUSIVA LIGA MX[/bold bright_yellow]\n"
-        "[dim white]Evaluando Winrate, Beneficio Neto y ROI con una Billetera Inicial de $1,000 USD...[/dim white]",
+        "[bold bright_yellow]PROPHETIA2 - SUITE DE PRUEBAS CUANTITATIVA LIGA MX[/bold bright_yellow]\n"
+        "[dim white]Evaluación Integral de Rendimiento, Winrate, Net EV y Multi-Asset Staking hasta Agosto 2026...[/dim white]",
         border_style="bright_blue"
     ))
     
@@ -48,25 +47,39 @@ def run_liga_mx_cli_test():
         console.print("[red]Error: No se pudo cargar el dataset.[/red]")
         return
         
-    # Filtrar únicamente partidos de Liga MX que tengan cuotas y resultado definido
+    # Mapeo de eventos del equipo visitante por match_id (córneres y tarjetas totales)
+    df_away_map = df[df['is_home'] == 0].drop_duplicates('match_id').set_index('match_id')
+    
+    # Filtrar partidos oficiales de Liga MX desde la perspectiva Local (is_home == 1)
     mex_df = df[
         df['competition'].isin(['Liga MX', 'MEX', 'MEX1']) & 
+        (df['is_home'] == 1) &
         df['odds_win'].notna() & 
         df['outcome'].notna()
     ].copy()
     
     if 'match_date' in mex_df.columns:
         mex_df['match_date_dt'] = pd.to_datetime(mex_df['match_date'])
+        # Filtrar hasta el 23 de agosto de 2026
+        mex_df = mex_df[mex_df['match_date_dt'] <= '2026-08-23 23:59:59']
         mex_df = mex_df.sort_values('match_date_dt').reset_index(drop=True)
     
-    # Tomar los 150 partidos más recientes de Liga MX
+    # Evaluar los 150 partidos más recientes hasta agosto 2026
     sample_size = min(150, len(mex_df))
     eval_df = mex_df.tail(sample_size).reset_index(drop=True)
+    
+    # Mapear métricas de partido completo (córneres y tarjetas totales)
+    eval_df['away_corners'] = eval_df['match_id'].map(df_away_map['corners']).fillna(0)
+    eval_df['total_corners'] = eval_df['corners'].fillna(0) + eval_df['away_corners']
+    
+    eval_df['away_yellows'] = eval_df['match_id'].map(df_away_map['yellow_cards']).fillna(0)
+    eval_df['away_reds'] = eval_df['match_id'].map(df_away_map['red_cards']).fillna(0)
+    eval_df['total_cards'] = eval_df['yellow_cards'].fillna(0) + (eval_df['red_cards'].fillna(0) * 2) + eval_df['away_yellows'] + (eval_df['away_reds'] * 2)
     
     first_date = str(eval_df['match_date'].iloc[0])[:10] if 'match_date' in eval_df.columns else "N/A"
     last_date = str(eval_df['match_date'].iloc[-1])[:10] if 'match_date' in eval_df.columns else "N/A"
     
-    console.print(f"[cyan]📊 Partidos evaluados de Liga MX:[/cyan] [bold bright_yellow]{sample_size}[/bold bright_yellow] (Período: [bold cyan]{first_date}[/bold cyan] a [bold cyan]{last_date}[/bold cyan])")
+    console.print(f"[cyan]📊 Partidos evaluados de Liga MX:[/cyan] [bold bright_yellow]{len(eval_df)}[/bold bright_yellow] (Período: [bold cyan]{first_date}[/bold cyan] al [bold cyan]{last_date}[/bold cyan])")
     
     models_dict = load_all_models()
     if models_dict is None:
@@ -75,12 +88,15 @@ def run_liga_mx_cli_test():
         
     initial_bankroll = 1000.0
     bankroll = initial_bankroll
+    bankroll_history = [bankroll]
     
     total_bets = 0
     wins = 0
     losses = 0
     total_staked = 0.0
     total_profit = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
     ev_list = []
     odds_list = []
     
@@ -90,6 +106,7 @@ def run_liga_mx_cli_test():
         home_team = row['team']
         away_team = row['opponent']
         comp = row['competition']
+        match_date = row.get('match_date')
         
         odds_1 = row.get('open_odds_win')
         if pd.isna(odds_1) or odds_1 <= 1.01:
@@ -109,7 +126,8 @@ def run_liga_mx_cli_test():
         res = predict_match(
             home_team, away_team, comp, odds_1, odds_X, odds_2,
             open_odds_win=odds_1, open_odds_draw=odds_X, open_odds_loss=odds_2,
-            bankroll=bankroll, df=df, models_dict=models_dict
+            bankroll=bankroll, df=df, models_dict=models_dict,
+            as_of_date=match_date
         )
         
         if res is None or 'best_bet' not in res:
@@ -117,7 +135,7 @@ def run_liga_mx_cli_test():
             
         best_bet_name, best_ev, best_stake, best_pct, best_raw_odd, best_eff_odd, _ = res['best_bet']
         
-        # Filtro de Staking: Apostar solo si supera el umbral EV de Liga MX y stake >= $1.00
+        # Filtro de Staking Cuantitativo: Apostar si supera el umbral EV de Liga MX y stake >= $1.00
         if best_ev > res['league_ev_thresh'] and best_stake >= 1.0:
             total_bets += 1
             total_staked += best_stake
@@ -132,31 +150,42 @@ def run_liga_mx_cli_test():
             goals_home = row.get('goals_scored', 0)
             goals_away = row.get('goals_conceded', 0)
             total_goals = goals_home + goals_away
+            total_corners = row.get('total_corners', 0)
+            total_cards = row.get('total_cards', 0)
             
             is_win = False
             mkt_category = best_bet_name
             
             if best_bet_name.startswith("1 ") or "Local" in best_bet_name:
                 mkt_category = "1 (Local)"
-                if actual_outcome == 2: is_win = True
+                if actual_outcome == 2 or goals_home > goals_away: is_win = True
             elif best_bet_name.startswith("X ") or "Empate" in best_bet_name:
                 mkt_category = "X (Empate)"
-                if actual_outcome == 1: is_win = True
+                if actual_outcome == 1 or goals_home == goals_away: is_win = True
             elif best_bet_name.startswith("2 ") or "Visitante" in best_bet_name:
                 mkt_category = "2 (Visitante)"
-                if actual_outcome == 0: is_win = True
+                if actual_outcome == 0 or goals_away > goals_home: is_win = True
             elif "Doble Oportunidad 1X" in best_bet_name:
                 mkt_category = "Doble Oportunidad 1X"
-                if actual_outcome in [1, 2]: is_win = True
+                if actual_outcome in [1, 2] or goals_home >= goals_away: is_win = True
             elif "Doble Oportunidad X2" in best_bet_name:
                 mkt_category = "Doble Oportunidad X2"
-                if actual_outcome in [0, 1]: is_win = True
+                if actual_outcome in [0, 1] or goals_away >= goals_home: is_win = True
             elif "Over 2.5" in best_bet_name:
                 mkt_category = "Over 2.5 Goles"
                 if total_goals > 2.5: is_win = True
+            elif "Under 2.5" in best_bet_name:
+                mkt_category = "Under 2.5 Goles"
+                if total_goals < 2.5: is_win = True
             elif "BTTS" in best_bet_name:
                 mkt_category = "BTTS (Ambos Anotan)"
                 if goals_home > 0 and goals_away > 0: is_win = True
+            elif "Córneres" in best_bet_name or "Corners" in best_bet_name:
+                mkt_category = "Over 9.5 Córneres"
+                if total_corners > 9.5: is_win = True
+            elif "Tarjetas" in best_bet_name or "Cards" in best_bet_name:
+                mkt_category = "Over 4.5 Tarjetas"
+                if total_cards > 4.5: is_win = True
 
             net_odd = 1.0 + (best_raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
             
@@ -165,12 +194,16 @@ def run_liga_mx_cli_test():
                 payout = best_stake * net_odd
                 profit = payout - best_stake
                 total_profit += profit
+                gross_profit += profit
                 bankroll += profit
             else:
                 losses += 1
                 profit = -best_stake
                 total_profit += profit
+                gross_loss += abs(profit)
                 bankroll += profit
+
+            bankroll_history.append(bankroll)
 
             if mkt_category not in market_stats:
                 market_stats[mkt_category] = {'bets': 0, 'wins': 0, 'staked': 0.0, 'profit': 0.0}
@@ -180,28 +213,41 @@ def run_liga_mx_cli_test():
             market_stats[mkt_category]['staked'] += best_stake
             market_stats[mkt_category]['profit'] += profit
 
+    # Métricas de Riesgo y Portafolio
+    peak = bankroll_history[0]
+    max_drawdown = 0.0
+    for b in bankroll_history:
+        if b > peak:
+            peak = b
+        dd = (peak - b) / peak
+        if dd > max_drawdown:
+            max_drawdown = dd
+
     winrate = (wins / total_bets * 100.0) if total_bets > 0 else 0.0
     roi = (total_profit / total_staked * 100.0) if total_staked > 0 else 0.0
     avg_ev = np.mean(ev_list) * 100.0 if ev_list else 0.0
     avg_odds = np.mean(odds_list) if odds_list else 0.0
     growth_pct = ((bankroll - initial_bankroll) / initial_bankroll) * 100.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
 
     console.print("\n[bold bright_green]=== RENDIMIENTO FINAL DEL CLI PREDICTOR EN LIGA MX ===[/bold bright_green]")
     console.print(f"Billetera Inicial: [bold white]${initial_bankroll:,.2f} USD[/bold white]")
     console.print(f"Billetera Final: [bold bright_yellow]${bankroll:,.2f} USD[/bold bright_yellow] ([bold bright_green]{growth_pct:+.2f}% Crecimiento Total[/bold bright_green])")
-    console.print(f"Partidos Evaluados: [bold]{sample_size}[/bold]")
-    console.print(f"Apuestas Recomendadas Ejecutadas: [bold]{total_bets}[/bold]")
+    console.print(f"Partidos Evaluados: [bold]{len(eval_df)}[/bold]")
+    console.print(f"Apuestas Ejecutadas: [bold]{total_bets}[/bold]")
     console.print(f"Apuestas Ganadas: [bold bright_green]{wins}[/bold bright_green] | Apuestas Perdidas: [bold bright_red]{losses}[/bold bright_red]")
     console.print(f"Winrate Global: [bold bright_cyan]{winrate:.2f}%[/bold bright_cyan]")
     console.print(f"Capital Total Apostado: [bold]${total_staked:,.2f} USD[/bold]")
     
     if total_profit >= 0:
-        console.print(f"Beneficio Neto Generado (Profit): [bold bright_green]+${total_profit:,.2f} USD[/bold bright_green]")
+        console.print(f"Beneficio Neto Generado: [bold bright_green]+${total_profit:,.2f} USD[/bold bright_green]")
         console.print(f"Retorno sobre Inversión (ROI): [bold bright_green]+{roi:.2f}%[/bold bright_green]")
     else:
-        console.print(f"Beneficio Neto Generado (Profit): [bold bright_red]-${abs(total_profit):,.2f} USD[/bold bright_red]")
+        console.print(f"Beneficio Neto Generado: [bold bright_red]-${abs(total_profit):,.2f} USD[/bold bright_red]")
         console.print(f"Retorno sobre Inversión (ROI): [bold bright_red]{roi:.2f}%[/bold bright_red]")
         
+    console.print(f"Profit Factor: [bold bright_cyan]{profit_factor:.2f}[/bold bright_cyan]")
+    console.print(f"Máximo Drawdown (MDD): [bold yellow]{max_drawdown*100:.2f}%[/bold yellow]")
     console.print(f"EV Promedio de Apuestas: [bold]+{avg_ev:.2f}%[/bold]")
     console.print(f"Cuota Promedio Apostada: [bold]{avg_odds:.2f}[/bold]\n")
 
@@ -226,3 +272,4 @@ def run_liga_mx_cli_test():
 
 if __name__ == '__main__':
     run_liga_mx_cli_test()
+
