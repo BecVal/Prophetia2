@@ -9,6 +9,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from core.logger_config import get_logger
+from core.team_mapping import normalize_team_name
 
 logger = get_logger(__name__, 'feature_engineering')
 
@@ -72,6 +73,8 @@ def add_ema_features(df, spans=[3, 5, 10]):
             new_cols_dict[f'{col}_ema{span}'] = ema_block[col]
 
     df = pd.concat([df, pd.DataFrame(new_cols_dict, index=df.index)], axis=1)
+    if 'xg_share' in df.columns:
+        df['xg_share'] = df.groupby('team', sort=False)['xg_share'].shift(1).fillna(0.5)
 
     # 2. Form Ratios: Racha a Corto Plazo vs Baseline a Largo Plazo (EMA3 vs EMA10)
     if 'xg_created_ema3' in df.columns and 'xg_created_ema10' in df.columns:
@@ -90,7 +93,7 @@ def add_ema_features(df, spans=[3, 5, 10]):
             lambda x: x.shift(1).ewm(halflife=f'{halflife_days}D', times=df.loc[x.index, 'match_date']).mean()
         ).fillna(df.get('xg_conceded_ema3', 0.0))
 
-    # 4. Continuidad de Alineación (Retention Rate del 11 titular respecto al partido anterior)
+    # 4. Continuidad de Alineación (Retention Rate histórica respecto a partidos previos, desplazada 1 partido para evitar look-ahead pre-partido)
     if 'starting_xi' in df.columns:
         def calc_lineup_overlap(curr, prev):
             if not curr or not prev or pd.isna(curr) or pd.isna(prev):
@@ -104,7 +107,8 @@ def add_ema_features(df, spans=[3, 5, 10]):
                 return 1.0
 
         prev_xi = df.groupby('team')['starting_xi'].shift(1)
-        df['lineup_continuity_pct'] = [calc_lineup_overlap(c, p) for c, p in zip(df['starting_xi'], prev_xi)]
+        raw_continuity = pd.Series([calc_lineup_overlap(c, p) for c, p in zip(df['starting_xi'], prev_xi)], index=df.index)
+        df['lineup_continuity_pct'] = raw_continuity.groupby(df['team']).shift(1).fillna(1.0)
     else:
         # Indicador base de estabilidad de la plantilla
         df['lineup_continuity_pct'] = 1.0
@@ -351,16 +355,16 @@ def add_contextual_features(df):
     opp_cols = list(set(ema_cols + extra_opp_cols))
     opp_cols = [c for c in opp_cols if c in df.columns]
     
-    opp_df = df[['team', 'match_date'] + opp_cols].copy()
+    opp_df = df[['match_id', 'is_home'] + opp_cols].drop_duplicates(subset=['match_id', 'is_home']).copy()
+    opp_df['is_home'] = 1 - opp_df['is_home']
     opp_rename = {c: f"opp_{c}" for c in opp_cols}
-    opp_rename['team'] = 'opponent'
     opp_df = opp_df.rename(columns=opp_rename)
 
-    # Merge limpio sin registros duplicados
-    df = pd.merge(df, opp_df, on=['opponent', 'match_date'], how='left')
+    # Merge 1-a-1 exacto por match_id e is_home invertido (sin producto cartesiano)
+    df = pd.merge(df, opp_df, on=['match_id', 'is_home'], how='left')
 
     for c in opp_rename.values():
-        if c != 'opponent' and c in df.columns:
+        if c in df.columns:
             df[c] = df[c].fillna(0.0)
 
     # 4. Métricas Relativas
@@ -440,18 +444,21 @@ def add_advanced_fatigue(df):
 
 def add_squad_value_features(df):
     """
-    Integra valores de mercado de Transfermarkt imputando con medianas de liga/temporada
+    Integra valores de mercado de Transfermarkt imputando con medianas históricas causales
     para evitar Data Leakage y contaminación entre equipos.
     """
     logger.info("Integrando Valores de Mercado de Transfermarkt...")
     
-    tm_path = '../data/raw/transfermarkt_squad_values.parquet'
+    tm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../data/raw/transfermarkt_squad_values.parquet')
     if not os.path.exists(tm_path):
         logger.warning(f"No se encontró el archivo de Transfermarkt en {tm_path}. Saltando variable.")
         return df
         
     tm_df = pd.read_parquet(tm_path, engine='fastparquet')
+    tm_df['team'] = tm_df['team'].apply(normalize_team_name)
+    tm_df = tm_df.groupby(['season_year', 'team'], as_index=False)['squad_value_millions'].mean()
     
+    df = df.sort_values('match_date').reset_index(drop=True)
     df['season_year'] = df['match_date'].dt.year
     df.loc[df['match_date'].dt.month < 7, 'season_year'] -= 1
     
@@ -472,10 +479,11 @@ def add_squad_value_features(df):
         how='left'
     )
     
-    # Imputación por mediana de temporada sin contaminación cruzada
-    season_medians = df.groupby('season_year')['team_squad_value'].transform('median').fillna(15.0)
-    df['team_squad_value'] = df['team_squad_value'].fillna(season_medians)
-    df['opp_squad_value'] = df['opp_squad_value'].fillna(season_medians)
+    # Imputación causal estricta usando mediana histórica expansiva previa al partido
+    df = df.sort_values('match_date').reset_index(drop=True)
+    causal_medians = df['team_squad_value'].shift(1).expanding(min_periods=1).median().fillna(15.0)
+    df['team_squad_value'] = df['team_squad_value'].fillna(causal_medians)
+    df['opp_squad_value'] = df['opp_squad_value'].fillna(causal_medians)
     
     df['squad_value_diff'] = df['team_squad_value'] - df['opp_squad_value']
     df = df.drop(columns=['season_year']).copy().sort_values('match_date').reset_index(drop=True)

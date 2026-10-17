@@ -31,7 +31,7 @@ logger = get_logger('monthly_pipeline', 'pipeline_monthly_update')
 # Python executable
 PYTHON_EXE = sys.executable or 'python'
 
-def run_step(step_name, script_rel_path, allow_fail=False, timeout_seconds=None):
+def run_step(step_name, script_rel_path, script_args=None, allow_fail=False, timeout_seconds=None):
     """
     Ejecuta un script individual del pipeline, midiendo tiempo y registrando logs duales.
     """
@@ -54,8 +54,12 @@ def run_step(step_name, script_rel_path, allow_fail=False, timeout_seconds=None)
     try:
         # Ejecución en el directorio donde reside el script para mantener consistencia de rutas relativas
         script_parent = os.path.dirname(script_full_path)
+        cmd = [PYTHON_EXE, script_full_path]
+        if script_args:
+            cmd.extend(script_args)
+
         proc = subprocess.Popen(
-            [PYTHON_EXE, script_full_path],
+            cmd,
             cwd=script_parent,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -72,7 +76,7 @@ def run_step(step_name, script_rel_path, allow_fail=False, timeout_seconds=None)
                 # Imprimir líneas informativas en terminal con formato sutil
                 if any(k in clean_line.lower() for k in ['error', 'exception', 'traceback', 'failed']):
                     console.print(f"  [red]{clean_line}[/red]")
-                elif any(k in clean_line.lower() for k in ['guardado', 'exitosamente', 'completado', 'accuracy', 'winrate', 'roi', 'profit']):
+                elif any(k in clean_line.lower() for k in ['guardado', 'exitosamente', 'completado', 'accuracy', 'winrate', 'roi', 'profit', 'cobertura']):
                     console.print(f"  [bright_green]{clean_line}[/bright_green]")
                     
         proc.wait(timeout=timeout_seconds)
@@ -107,6 +111,7 @@ def main():
     parser.add_argument('--train-only', action='store_true', help="Omitir ingesta y ejecutar solo reentrenamiento de modelos y validación")
     parser.add_argument('--validate-only', action='store_true', help="Omitir reentrenamiento y ejecutar solo la validación financiera y tests")
     parser.add_argument('--skip-scraping', action='store_true', help="Omitir el web scraper de Transfermarkt si hay bloqueos de red")
+    parser.add_argument('--skip-espn', action='store_true', help="Omitir el scraper de estadísticas avanzadas de ESPN FC")
     args = parser.parse_args()
 
     start_time_all = time.time()
@@ -139,39 +144,49 @@ def main():
         )
         step_results.append(("Descarga Football-Data", success, t))
 
-        # 1.2 Web Scraping de Valores de Planteles (Transfermarkt)
+        # 1.2 Enriquecimiento de Estadísticas Detalladas de Ligas Extra (ESPN FC API)
+        if not args.skip_espn:
+            success, t = run_step(
+                "1.2 Enriquecimiento Estadísticas Avanzadas (ESPN FC: Liga MX, MLS, etc.)",
+                "ingestion/espn_match_stats_scraper.py",
+                script_args=["--league", "ALL", "--max-workers", "20"],
+                allow_fail=True
+            )
+            step_results.append(("ESPN Match Stats Scraper", success, t))
+
+        # 1.3 Web Scraping de Valores de Planteles (Transfermarkt)
         if not args.skip_scraping:
             success, t = run_step(
-                "1.2 Scraping Valores de Mercado (Transfermarkt)",
+                "1.3 Scraping Valores de Mercado (Transfermarkt)",
                 "ingestion/transfermarkt_scraper.py",
                 allow_fail=True # Si Transfermarkt bloquea temporalmente por IP, se usan valores existentes
             )
             step_results.append(("Transfermarkt Scraping", success, t))
 
-        # 1.3 Adaptador Universal de Eventos (StatsBomb + Football-Data)
+        # 1.4 Adaptador Universal de Eventos (StatsBomb + Football-Data)
         success, t = run_step(
-            "1.3 Adaptador Universal de Datos (Data Adapter)",
+            "1.4 Adaptador Universal de Datos (Data Adapter)",
             "core/data_adapter.py"
         )
         step_results.append(("Data Adapter", success, t))
 
-        # 1.4 Ingeniería de Características Avanzadas (EMAs, Elo, xG Share, Fatiga, H2H)
+        # 1.5 Ingeniería de Características Avanzadas (EMAs, Elo, xG Share, Fatiga, H2H)
         success, t = run_step(
-            "1.4 Feature Engineering & Dynamic Elo/EMAs",
+            "1.5 Feature Engineering & Dynamic Elo/EMAs",
             "core/feature_engineering.py"
         )
         step_results.append(("Feature Engineering", success, t))
 
-        # 1.5 Sincronización y Merge de Cuotas de Mercado (Pinnacle/B365)
+        # 1.6 Sincronización y Merge de Cuotas de Mercado (Pinnacle/B365)
         success, t = run_step(
-            "1.5 Extracción y Fusión de Cuotas (Fetch Odds)",
+            "1.6 Extracción y Fusión de Cuotas (Fetch Odds)",
             "ingestion/fetch_odds.py"
         )
         step_results.append(("Fetch Odds", success, t))
 
-        # 1.6 Sincronización de Métricas Arbitrales y Disciplinarias
+        # 1.7 Sincronización de Métricas Arbitrales y Disciplinarias
         success, t = run_step(
-            "1.6 Extracción y Fusión de Árbitros (Fetch Referees)",
+            "1.7 Extracción y Fusión de Árbitros (Fetch Referees)",
             "ingestion/fetch_referees.py"
         )
         step_results.append(("Fetch Referees", success, t))
@@ -192,7 +207,7 @@ def main():
         )
         step_results.append(("Quant Dixon-Coles/Kalman", success, t))
 
-        # 2.2 Modelo de Contexto Táctico y Fatiga (CatBoost/RandomForest)
+        # 2.2 Modelo de Contexto Táctico y Fatiga (XGBoost + Calibración Sigmoid Temporal)
         success, t = run_step(
             "2.2 Clasificador de Contexto Táctico y Fatiga",
             "core/models/train_context.py"

@@ -180,7 +180,10 @@ def run_liga_mx_cli_test():
             elif "BTTS" in best_bet_name:
                 mkt_category = "BTTS (Ambos Anotan)"
                 if goals_home > 0 and goals_away > 0: is_win = True
-            elif "Córneres" in best_bet_name or "Corners" in best_bet_name:
+            elif "Under 9.5" in best_bet_name:
+                mkt_category = "Under 9.5 Córneres"
+                if total_corners < 9.5: is_win = True
+            elif "Over 9.5" in best_bet_name or "Córneres" in best_bet_name or "Corners" in best_bet_name:
                 mkt_category = "Over 9.5 Córneres"
                 if total_corners > 9.5: is_win = True
             elif "Tarjetas" in best_bet_name or "Cards" in best_bet_name:

@@ -17,7 +17,9 @@ def get_base_dataset():
     lo ordena cronológicamente y filtra para evitar Double-Row Betting.
     Si está disponible, carga el dataset enriquecido con GBM.
     """
-    if os.path.exists(GBM_DATASET_PATH):
+    if os.path.exists(GBM_DATASET_PATH) and (
+        not os.path.exists(DATASET_PATH) or os.path.getmtime(GBM_DATASET_PATH) >= os.path.getmtime(DATASET_PATH)
+    ):
         path_to_load = GBM_DATASET_PATH
     else:
         path_to_load = DATASET_PATH if os.path.exists(DATASET_PATH) else FALLBACK_DATASET

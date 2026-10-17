@@ -32,9 +32,12 @@ def fetch_and_merge_referees():
     
     logger.info("Iniciando descarga de datos de árbitros concurrentemente...")
     
-    def process_ref_df(url):
+    def process_ref_df(source):
         try:
-            df_csv = pd.read_csv(url, encoding='latin-1', on_bad_lines='skip')
+            try:
+                df_csv = pd.read_csv(source, encoding='utf-8', on_bad_lines='skip', low_memory=False)
+            except UnicodeDecodeError:
+                df_csv = pd.read_csv(source, encoding='latin-1', on_bad_lines='skip', low_memory=False)
             
             if 'Home' in df_csv.columns and 'HomeTeam' not in df_csv.columns:
                 df_csv.rename(columns={'Home': 'HomeTeam', 'Away': 'AwayTeam'}, inplace=True)
@@ -60,43 +63,51 @@ def fetch_and_merge_referees():
             df_csv['AwayTeam'] = df_csv['AwayTeam'].apply(normalize_team_name)
             df_csv['Referee'] = df_csv['Referee'].astype(str).str.strip()
             # Reemplazamos los 'nan' string por np.nan real
-            df_csv['Referee'] = df_csv['Referee'].replace('nan', np.nan)
+            df_csv['Referee'] = df_csv['Referee'].replace({'nan': np.nan, 'None': np.nan, '': np.nan})
             
             return df_csv.dropna(subset=['Referee'])
         except Exception as e:
-            logger.warning(f"Error descargando {url}: {e}")
+            logger.warning(f"Error procesando árbitros desde {source}: {e}")
             return None
 
-    urls = []
-    for season in SEASONS:
-        for league in LEAGUES:
-            urls.append(BASE_URL.format(season=season, league=league))
-    for league in EXTRA_LEAGUES:
-        urls.append(EXTRA_BASE_URL.format(league=league))
+    import glob
+    local_dir = os.path.join(script_dir, '..', 'data', 'raw', 'football_data')
+    local_csvs = sorted(glob.glob(os.path.join(local_dir, '*.csv')))
+    if local_csvs:
+        logger.info(f"Cargando datos de árbitros desde {len(local_csvs)} CSVs locales en {local_dir} (incluyendo enriquecimiento ESPN)...")
+        sources = local_csvs
+    else:
+        urls = []
+        for season in SEASONS:
+            for league in LEAGUES:
+                urls.append(BASE_URL.format(season=season, league=league))
+        for league in EXTRA_LEAGUES:
+            urls.append(EXTRA_BASE_URL.format(league=league))
+        sources = urls
         
     with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(process_ref_df, url): url for url in urls}
+        futures = {executor.submit(process_ref_df, src): src for src in sources}
         for future in as_completed(futures):
             res = future.result()
             if res is not None and not res.empty:
                 ref_dataframes.append(res)
             
     if not ref_dataframes:
-        logger.error("No se pudo descargar ningún archivo de árbitros.")
+        logger.error("No se pudo cargar ningún archivo de árbitros.")
         return
         
     df_ref_master = pd.concat(ref_dataframes, ignore_index=True)
     df_ref_master = df_ref_master.sort_values('Date').drop_duplicates(subset=['HomeTeam', 'AwayTeam', 'Date'])
     
-    logger.info(f"Descargados {len(df_ref_master)} partidos con árbitros.")
+    logger.info(f"Cargados {len(df_ref_master)} partidos con árbitros.")
 
     # Calcular métricas históricas de los árbitros
-    df_ref_master['total_fouls'] = df_ref_master['HF'].fillna(0) + df_ref_master['AF'].fillna(0)
-    df_ref_master['total_yellows'] = df_ref_master['HY'].fillna(0) + df_ref_master['AY'].fillna(0)
-    df_ref_master['total_reds'] = df_ref_master['HR'].fillna(0) + df_ref_master['AR'].fillna(0)
+    df_ref_master['total_fouls'] = pd.to_numeric(df_ref_master['HF'], errors='coerce').fillna(0) + pd.to_numeric(df_ref_master['AF'], errors='coerce').fillna(0)
+    df_ref_master['total_yellows'] = pd.to_numeric(df_ref_master['HY'], errors='coerce').fillna(0) + pd.to_numeric(df_ref_master['AY'], errors='coerce').fillna(0)
+    df_ref_master['total_reds'] = pd.to_numeric(df_ref_master['HR'], errors='coerce').fillna(0) + pd.to_numeric(df_ref_master['AR'], errors='coerce').fillna(0)
     
     # Calcular promedios móviles expandidos (shifted por 1 para no incluir el partido actual)
-    df_ref_master = df_ref_master.sort_values(by=['Referee', 'Date'])
+    df_ref_master = df_ref_master.sort_values(by=['Referee', 'Date']).reset_index(drop=True)
     
     df_ref_master['referee_avg_fouls'] = df_ref_master.groupby('Referee')['total_fouls'].transform(lambda x: x.expanding().mean().shift(1))
     df_ref_master['referee_avg_yellows'] = df_ref_master.groupby('Referee')['total_yellows'].transform(lambda x: x.expanding().mean().shift(1))
@@ -110,17 +121,21 @@ def fetch_and_merge_referees():
         np.nan
     )
     
-    # Rellenar nulos con el promedio global para árbitros debutantes
-    global_avg_fouls = df_ref_master['total_fouls'].mean()
-    global_avg_yellows = df_ref_master['total_yellows'].mean()
-    global_avg_reds = df_ref_master['total_reds'].mean()
+    # Rellenar nulos con el promedio histórico expansivo causal (sin Look-Ahead Bias) para árbitros debutantes
+    df_ref_master = df_ref_master.sort_values('Date').reset_index(drop=True)
+    causal_avg_fouls = df_ref_master['total_fouls'].shift(1).expanding(min_periods=1).mean().fillna(22.0)
+    causal_avg_yellows = df_ref_master['total_yellows'].shift(1).expanding(min_periods=1).mean().fillna(4.0)
+    causal_avg_reds = df_ref_master['total_reds'].shift(1).expanding(min_periods=1).mean().fillna(0.2)
     
-    df_ref_master['referee_avg_fouls'] = df_ref_master['referee_avg_fouls'].fillna(global_avg_fouls)
-    df_ref_master['referee_avg_yellows'] = df_ref_master['referee_avg_yellows'].fillna(global_avg_yellows)
-    df_ref_master['referee_avg_reds'] = df_ref_master['referee_avg_reds'].fillna(global_avg_reds)
+    df_ref_master['referee_avg_fouls'] = df_ref_master['referee_avg_fouls'].fillna(causal_avg_fouls)
+    df_ref_master['referee_avg_yellows'] = df_ref_master['referee_avg_yellows'].fillna(causal_avg_yellows)
+    df_ref_master['referee_avg_reds'] = df_ref_master['referee_avg_reds'].fillna(causal_avg_reds)
     
-    global_strictness = global_avg_fouls / global_avg_yellows if global_avg_yellows > 0 else 5.0
-    df_ref_master['referee_fouls_per_yellow'] = df_ref_master['referee_fouls_per_yellow'].fillna(global_strictness)
+    causal_strictness = pd.Series(
+        np.where(causal_avg_yellows > 0, causal_avg_fouls / causal_avg_yellows, 5.5),
+        index=df_ref_master.index
+    )
+    df_ref_master['referee_fouls_per_yellow'] = df_ref_master['referee_fouls_per_yellow'].fillna(causal_strictness)
     
     cols_to_merge = ['Date', 'HomeTeam', 'AwayTeam', 'Referee', 
                      'referee_avg_fouls', 'referee_avg_yellows', 'referee_avg_reds', 'referee_fouls_per_yellow']

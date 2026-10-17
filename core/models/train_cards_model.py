@@ -178,9 +178,9 @@ def generate_time_series_oof(X_train, y_train, best_params, n_splits=5):
         )
         y_oof_train[first_train_idx[sub_va_idx]] = m.predict(X_first_tr.iloc[sub_va_idx])
         
-    # Para la fracción inicial donde no hay suficientes datos para validación temporal, usar la media histórica previa
+    # Para la fracción inicial donde no hay suficientes datos para validación temporal, usar la media expansiva histórica previa (causal)
     initial_unpredicted_count = first_train_idx[sub_splits[0][1][0]]
-    y_oof_train[:initial_unpredicted_count] = y_train.iloc[:initial_unpredicted_count].mean()
+    y_oof_train[:initial_unpredicted_count] = y_train.iloc[:initial_unpredicted_count].shift(1).expanding(min_periods=1).mean().fillna(2.0).values
 
     # 2. Rellenar el resto de bloques de TimeSeriesSplit
     for tr_idx, va_idx in splits:
@@ -257,15 +257,19 @@ def train_target(target_prefix, X_train, y_train, X_test, y_test, available_feat
     logger.info(f"Generando predicciones OOF (TimeSeriesSplit estricto) para {target_prefix}...")
     y_oof_train = generate_time_series_oof(X_train, y_train, best_params, n_splits=5)
         
-    # ====== MODELO FINAL ======
+    # ====== MODELO FINAL (Early Stopping sobre split de validación temporal interno de X_train, nunca X_test) ======
     logger.info(f"Entrenando Modelo Final para {target_prefix}...")
     final_params = best_params.copy()
     final_params['eval_metric'] = f"tweedie-nloglik@{best_params.get('tweedie_variance_power', 1.2)}"
     
+    val_split = int(len(X_train) * 0.90)
+    X_tr_fin, y_tr_fin = X_train.iloc[:val_split], y_train.iloc[:val_split]
+    X_va_fin, y_va_fin = X_train.iloc[val_split:], y_train.iloc[val_split:]
+    
     model = XGBRegressor(**final_params)
     model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
+        X_tr_fin, y_tr_fin,
+        eval_set=[(X_va_fin, y_va_fin)],
         verbose=False
     )
     

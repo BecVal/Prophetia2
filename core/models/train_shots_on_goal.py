@@ -90,7 +90,7 @@ class SklearnPyTorchRegressorWrapper(BaseEstimator, RegressorMixin):
         self.device = device
         self.model = None
         self.scaler = StandardScaler()
-        self.imputer = SimpleImputer(strategy='median')
+        self.imputer = SimpleImputer(strategy='median', keep_empty_features=True)
         
     def _init_model(self):
         self.model = PyTorchMLPRegressor(self.input_dim, self.hidden_dims, self.dropout_rate).to(self.device)
@@ -102,11 +102,12 @@ class SklearnPyTorchRegressorWrapper(BaseEstimator, RegressorMixin):
         if val_idx < 1:
             val_idx = len(X)
             
-        X_imputed = self.imputer.fit_transform(X)
-        X_scaled = self.scaler.fit_transform(X_imputed)
+        X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
+        X_tr_raw = X_arr[:val_idx]
+        X_val_raw = X_arr[val_idx:] if val_idx < len(X_arr) else X_arr[:val_idx]
         
-        X_tr = X_scaled[:val_idx]
-        X_val = X_scaled[val_idx:] if val_idx < len(X) else X_scaled[:val_idx]
+        X_tr = self.scaler.fit_transform(self.imputer.fit_transform(X_tr_raw))
+        X_val = self.scaler.transform(self.imputer.transform(X_val_raw))
         
         y_arr = y.values if hasattr(y, 'values') else np.asarray(y)
         y_tr = y_arr[:val_idx]
@@ -172,7 +173,8 @@ class SklearnPyTorchRegressorWrapper(BaseEstimator, RegressorMixin):
 
     def predict(self, X):
         self.model.eval()
-        X_imputed = self.imputer.transform(X)
+        X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
+        X_imputed = self.imputer.transform(X_arr)
         X_scaled = self.scaler.transform(X_imputed)
         X_tensor = torch.FloatTensor(np.ascontiguousarray(X_scaled)).to(self.device)
         with torch.no_grad():
@@ -200,39 +202,48 @@ class StackingRegressorEnsemble(BaseEstimator, RegressorMixin):
         self.cv_splits = cv_splits
         
         self.mlp_model = SklearnPyTorchRegressorWrapper(**mlp_params)
-        self.ridge_imputer = SimpleImputer(strategy='median')
+        self.ridge_imputer = SimpleImputer(strategy='median', keep_empty_features=True)
         self.ridge_scaler = StandardScaler()
         self.ridge_model = MultiOutputRegressor(PoissonRegressor(alpha=ridge_alpha))
         self.meta_model = Ridge(alpha=meta_alpha)
         
     def fit(self, X, y, sample_weight=None):
-        X_full_scaled = self.ridge_scaler.fit_transform(self.ridge_imputer.fit_transform(X))
+        X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
         y_arr = y.values if hasattr(y, 'values') else np.asarray(y)
+        w_arr = (sample_weight.values if hasattr(sample_weight, 'values') else np.asarray(sample_weight)) if sample_weight is not None else None
         
-        # Predicciones OOF estrictas para AMBOS modelos base (MLP y Ridge)
-        mlp_oof = np.zeros_like(y_arr, dtype=float)
-        kf = KFold(n_splits=self.cv_splits, shuffle=False)
+        # Predicciones OOF estrictamente temporales para AMBOS modelos base (MLP y Ridge)
+        mlp_oof = np.full_like(y_arr, np.nan, dtype=float)
+        ridge_oof = np.full_like(y_arr, np.nan, dtype=float)
+        tscv_inner = TimeSeriesSplit(n_splits=self.cv_splits)
         
-        for tr_idx, val_idx in kf.split(X):
-            X_tr = X.iloc[tr_idx] if hasattr(X, 'iloc') else X[tr_idx]
-            y_tr = y.iloc[tr_idx] if hasattr(y, 'iloc') else y[tr_idx]
-            X_va = X.iloc[val_idx] if hasattr(X, 'iloc') else X[val_idx]
-            w_tr = (sample_weight.iloc[tr_idx] if hasattr(sample_weight, 'iloc') else sample_weight[tr_idx]) if sample_weight is not None else None
+        for tr_idx, val_idx in tscv_inner.split(X_arr):
+            X_tr, y_tr = X_arr[tr_idx], y_arr[tr_idx]
+            X_va = X_arr[val_idx]
+            w_tr = w_arr[tr_idx] if w_arr is not None else None
             
             fold_mlp = SklearnPyTorchRegressorWrapper(**self.mlp_params)
             fold_mlp.fit(X_tr, y_tr, sample_weight=w_tr)
             mlp_oof[val_idx] = fold_mlp.predict(X_va)
             
-        ridge_base = MultiOutputRegressor(PoissonRegressor(alpha=self.ridge_alpha))
-        ridge_oof = cross_val_predict(ridge_base, X_full_scaled, y_arr, cv=self.cv_splits)
+            fold_imp = SimpleImputer(strategy='median', keep_empty_features=True)
+            fold_scl = StandardScaler()
+            X_tr_scl = fold_scl.fit_transform(fold_imp.fit_transform(X_tr))
+            X_va_scl = fold_scl.transform(fold_imp.transform(X_va))
+            fold_ridge = MultiOutputRegressor(PoissonRegressor(alpha=self.ridge_alpha))
+            fold_ridge.fit(X_tr_scl, y_tr, sample_weight=w_tr)
+            ridge_oof[val_idx] = fold_ridge.predict(X_va_scl)
+            
+        valid_mask = ~np.isnan(mlp_oof[:, 0])
+        meta_X = np.column_stack([mlp_oof[valid_mask], ridge_oof[valid_mask]])
+        meta_y = y_arr[valid_mask]
+        meta_w = w_arr[valid_mask] if w_arr is not None else None
+        self.meta_model.fit(meta_X, meta_y, sample_weight=meta_w)
         
-        # Meta-modelo entrenado sobre características OOF limpias
-        meta_X = np.column_stack([mlp_oof, ridge_oof])
-        self.meta_model.fit(meta_X, y_arr, sample_weight=sample_weight)
-        
-        # Modelos base finales entrenados en 100% de los datos
-        self.mlp_model.fit(X, y, sample_weight=sample_weight)
-        self.ridge_model.fit(X_full_scaled, y_arr, sample_weight=sample_weight)
+        # Modelos base finales entrenados en 100% de los datos de este bloque
+        X_full_scaled = self.ridge_scaler.fit_transform(self.ridge_imputer.fit_transform(X_arr))
+        self.mlp_model.fit(X_arr, y_arr, sample_weight=w_arr)
+        self.ridge_model.fit(X_full_scaled, y_arr, sample_weight=w_arr)
         return self
         
     def predict(self, X):
@@ -320,8 +331,9 @@ def train_shots_on_goal():
         df['implied_prob_away'] = inv_loss / margin
         df['odds_ratio_home_away'] = np.log(df['odds_win'].clip(lower=1.01) / df['odds_loss'].clip(lower=1.01))
         
-        if 'open_odds_win' in df.columns and df['open_odds_win'].notna().any():
-            df['market_drift_home'] = (df['odds_win'] / df['open_odds_win'].clip(lower=1.01)).fillna(1.0)
+        if 'closing_odds_win' in df.columns and 'open_odds_win' in df.columns and df['open_odds_win'].notna().any():
+            raw_drift = (df['closing_odds_win'] / df['open_odds_win'].clip(lower=1.01)).fillna(1.0)
+            df['market_drift_home'] = raw_drift.groupby(df['team'], sort=False).shift(1).fillna(1.0) if 'team' in df.columns else raw_drift.shift(1).fillna(1.0)
         else:
             df['market_drift_home'] = 1.0
     else:
@@ -330,9 +342,9 @@ def train_shots_on_goal():
         df['odds_ratio_home_away'] = 0.0
         df['market_drift_home'] = 1.0
     
-    # Eliminar partidos sin métrica de target para no distorsionar la distribución
-    valid_target_mask = df['shots_on_target'].notna() & df['away_shots_on_target'].notna()
-    df = df[valid_target_mask].reset_index(drop=True)
+    # Imputar partidos sin métrica de target para mantener alineación estricta de dimensionalidad
+    df['shots_on_target'] = df['shots_on_target'].fillna(0.0)
+    df['away_shots_on_target'] = df['away_shots_on_target'].fillna(0.0)
     
     split_idx = get_train_test_split(df)
     
@@ -491,10 +503,14 @@ def train_shots_on_goal():
         val_idx_orig = first_train_idx[val_in]
         preds_train[val_idx_orig] = stack.predict(X_va_in)
 
-    # Imputar la porción no cubierta del primer split con la media expandida
+    # Imputar la porción no cubierta del primer split con la media expansiva histórica previa (causal)
     first_unpredicted = first_train_idx[np.isnan(preds_train[first_train_idx, 0])]
     if len(first_unpredicted) > 0:
-        preds_train[first_unpredicted] = y_train.iloc[first_train_idx].mean().values
+        y_burn = y_train.iloc[first_unpredicted]
+        burn_h = y_burn['shots_on_target'].shift(1).expanding(min_periods=1).mean().fillna(4.5).values
+        burn_a = y_burn['away_shots_on_target'].shift(1).expanding(min_periods=1).mean().fillna(3.8).values
+        preds_train[first_unpredicted, 0] = burn_h
+        preds_train[first_unpredicted, 1] = burn_a
 
     # Expanding Windows CV
     for i, (train_idx, val_idx) in enumerate(splits):
@@ -552,21 +568,38 @@ def train_shots_on_goal():
     for col, vals in train_total_probs.items(): df_train_tmp[col + '_total'] = vals
     for col, vals in test_total_probs.items(): df_test_tmp[col + '_total'] = vals
         
-    # Calibración Isotónica sobre OOF
+    # Calibración Isotónica sobre OOF temporal (sin sobreajuste in-sample)
     calibrators = {}
+    cal_splits = list(TimeSeriesSplit(n_splits=5).split(df_train_tmp))
     for line in team_lines:
         col = f'prob_over_{line}_team'
         true_over_train = (df_train_tmp['shots_on_target'] > line).astype(int).values
+        raw_p = df_train_tmp[col].values.copy()
+        oof_cal_p = raw_p.copy()
+        for c_tr, c_va in cal_splits:
+            ir_fold = IsotonicRegression(out_of_bounds='clip')
+            ir_fold.fit(raw_p[c_tr], true_over_train[c_tr])
+            oof_cal_p[c_va] = ir_fold.predict(raw_p[c_va])
+        df_train_tmp[col] = oof_cal_p
+        
         ir = IsotonicRegression(out_of_bounds='clip')
-        df_train_tmp[col] = ir.fit_transform(df_train_tmp[col].values, true_over_train)
+        ir.fit(raw_p, true_over_train)
         df_test_tmp[col] = ir.predict(df_test_tmp[col].values)
         calibrators[col] = ir
         
     for line in total_lines:
         col = f'prob_over_{line}_total'
         true_over_train = (df_train_tmp['true_total_shots'] > line).astype(int).values
+        raw_p = df_train_tmp[col].values.copy()
+        oof_cal_p = raw_p.copy()
+        for c_tr, c_va in cal_splits:
+            ir_fold = IsotonicRegression(out_of_bounds='clip')
+            ir_fold.fit(raw_p[c_tr], true_over_train[c_tr])
+            oof_cal_p[c_va] = ir_fold.predict(raw_p[c_va])
+        df_train_tmp[col] = oof_cal_p
+        
         ir = IsotonicRegression(out_of_bounds='clip')
-        df_train_tmp[col] = ir.fit_transform(df_train_tmp[col].values, true_over_train)
+        ir.fit(raw_p, true_over_train)
         df_test_tmp[col] = ir.predict(df_test_tmp[col].values)
         calibrators[col] = ir
 

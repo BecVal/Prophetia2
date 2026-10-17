@@ -56,14 +56,18 @@ def train_clv_model():
     open_draw_df = df['open_odds_draw'].fillna(df['odds_draw'])
     open_win_df = df['open_odds_win'].fillna(df['odds_win'])
 
-    target_loss_log = np.log(np.clip(open_loss_df / df['odds_loss'], 1e-4, 1e4)).fillna(0)
-    target_draw_log = np.log(np.clip(open_draw_df / df['odds_draw'], 1e-4, 1e4)).fillna(0)
-    target_win_log = np.log(np.clip(open_win_df / df['odds_win'], 1e-4, 1e4)).fillna(0)
+    close_loss_df = df['closing_odds_loss'].fillna(open_loss_df) if 'closing_odds_loss' in df.columns else df['odds_loss']
+    close_draw_df = df['closing_odds_draw'].fillna(open_draw_df) if 'closing_odds_draw' in df.columns else df['odds_draw']
+    close_win_df = df['closing_odds_win'].fillna(open_win_df) if 'closing_odds_win' in df.columns else df['odds_win']
+
+    target_loss_log = np.log(np.clip(open_loss_df / close_loss_df, 1e-4, 1e4)).fillna(0)
+    target_draw_log = np.log(np.clip(open_draw_df / close_draw_df, 1e-4, 1e4)).fillna(0)
+    target_win_log = np.log(np.clip(open_win_df / close_win_df, 1e-4, 1e4)).fillna(0)
     
     # Guardar también target lineal para métricas financieras reales
-    target_loss_lin = (open_loss_df / df['odds_loss'] - 1).fillna(0)
-    target_draw_lin = (open_draw_df / df['odds_draw'] - 1).fillna(0)
-    target_win_lin = (open_win_df / df['odds_win'] - 1).fillna(0)
+    target_loss_lin = (open_loss_df / close_loss_df - 1).fillna(0)
+    target_draw_lin = (open_draw_df / close_draw_df - 1).fillna(0)
+    target_win_lin = (open_win_df / close_win_df - 1).fillna(0)
 
     y_drift_loss_train = target_loss_log.iloc[:split_idx]
     y_drift_draw_train = target_draw_log.iloc[:split_idx]
@@ -351,10 +355,6 @@ def train_clv_model():
     df_test_preds.to_parquet(PREDICTIONS_PATH, engine='fastparquet')
     logger.info(f"Predicciones de CLV Lineal % acopladas exitosamente añadidas a {PREDICTIONS_PATH}")
     logger.info("Ejecuta 'python core/simulate_bankroll.py' a continuación para la evaluación financiera independiente.")
-
-if __name__ == "__main__":
-    train_clv_model()
-
 
 if __name__ == "__main__":
     train_clv_model()

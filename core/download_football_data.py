@@ -71,6 +71,7 @@ def download_football_data(force_refresh_current=True):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Descargador de datos históricos y recientes de football-data.co.uk")
     parser.add_argument('--force-refresh', action='store_true', default=True, help="Refrescar temporadas activas y ligas extra")
+    parser.add_argument('--enrich-espn', action='store_true', help="Enriquecer ligas extra (Liga MX, MLS, etc.) con estadísticas de ESPN FC")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,3 +79,15 @@ if __name__ == '__main__':
     logger.info("Iniciando descarga y sincronización de datos de Football-Data.co.uk...")
     download_football_data(force_refresh_current=args.force_refresh)
     logger.info("Descarga y sincronización finalizada con éxito.")
+
+    if args.enrich_espn:
+        logger.info("Iniciando enriquecimiento con estadísticas de ESPN FC...")
+        try:
+            from ingestion.espn_match_stats_scraper import ESPNMatchStatsScraper, EXTRA_LEAGUES_ESPN
+            scraper = ESPNMatchStatsScraper()
+            for lg in EXTRA_LEAGUES_ESPN.keys():
+                scraper.enrich_csv(league_code=lg)
+            logger.info("Enriquecimiento con ESPN FC completado.")
+        except Exception as e:
+            logger.error(f"Error al enriquecer con ESPN FC: {e}")
+

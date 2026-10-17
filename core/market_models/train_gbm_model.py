@@ -8,6 +8,7 @@ import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import log_loss, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models')))
 from data_splitter import get_base_dataset, get_train_test_split, get_cv_strategy
@@ -20,7 +21,7 @@ from core.logger_config import get_logger
 # ==============================================================================
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
 # ==============================================================================
-RUN_OPTUNA = True
+RUN_OPTUNA = False
 OPTUNA_TRIALS = 30
 # ==============================================================================
 
@@ -102,38 +103,47 @@ def compute_gbm_features(df):
         logger.error(f"Faltan columnas para calcular GBM: {missing}")
         return None
         
-    # 1. Remoción de Margen y Estimación de Insiders por Método de Shin (Apertura y Cierre)
-    logger.info("Aplicando Método de Shin (1993) para remoción de margen y extracción de dinero informado (insider z)...")
+    # 1. Remoción de Margen y Estimación de Insiders por Método de Shin (Apertura pre-partido y Cierre histórico)
+    logger.info("Aplicando Método de Shin (1993) sobre cuotas de Apertura (pre-partido) y derivas históricas desplazadas...")
     p_open_w, p_open_d, p_open_l, z_open = shin_margin_removal(df['open_odds_win'], df['open_odds_draw'], df['open_odds_loss'])
-    p_w, p_d, p_l, z_close = shin_margin_removal(df['odds_win'], df['odds_draw'], df['odds_loss'])
     
-    df['shin_base_prob_win'] = p_w
-    df['shin_base_prob_draw'] = p_d
-    df['shin_base_prob_loss'] = p_l
+    close_w_col = 'closing_odds_win' if 'closing_odds_win' in df.columns else 'odds_win'
+    close_d_col = 'closing_odds_draw' if 'closing_odds_draw' in df.columns else 'odds_draw'
+    close_l_col = 'closing_odds_loss' if 'closing_odds_loss' in df.columns else 'odds_loss'
+    p_close_w, p_close_d, p_close_l, z_close = shin_margin_removal(df[close_w_col], df[close_d_col], df[close_l_col])
+    
+    # Las probabilidades base del partido actual provienen exclusivamente de la Apertura (sin Look-Ahead Bias)
+    df['shin_base_prob_win'] = p_open_w
+    df['shin_base_prob_draw'] = p_open_d
+    df['shin_base_prob_loss'] = p_open_l
     df['shin_insider_open'] = z_open
-    df['shin_insider_close'] = z_close
-    df['shin_insider_drift'] = z_close - z_open
+    df['_raw_insider_close'] = z_close
+    df['_raw_insider_drift'] = z_close - z_open
     
-    # 2. Logits y Deriva Estocástica (mu) sobre Probabilidades Shin
+    # 2. Logits y Deriva Estocástica (mu) de Apertura a Cierre (que será desplazada 1 partido por equipo)
     logit_open_w = safe_logit(p_open_w)
     logit_open_d = safe_logit(p_open_d)
     logit_open_l = safe_logit(p_open_l)
     
-    logit_w = safe_logit(p_w)
-    logit_d = safe_logit(p_d)
-    logit_l = safe_logit(p_l)
+    logit_close_w = safe_logit(p_close_w)
+    logit_close_d = safe_logit(p_close_d)
+    logit_close_l = safe_logit(p_close_l)
     
-    df['gbm_mu_win'] = logit_w - logit_open_w
-    df['gbm_mu_draw'] = logit_d - logit_open_d
-    df['gbm_mu_loss'] = logit_l - logit_open_l
+    df['_raw_mu_win'] = logit_close_w - logit_open_w
+    df['_raw_mu_draw'] = logit_close_d - logit_open_d
+    df['_raw_mu_loss'] = logit_close_l - logit_open_l
     
-    # 3. Volatilidad (sigma) y Deriva con Ventanas Móviles y EWMA por Equipo
+    # 3. Volatilidad (sigma) y Deriva con Ventanas Móviles y EWMA por Equipo (100% causal: shift(1))
     logger.info("Calculando volatilidad (sigma), EWMA y desviaciones temporales (sin Data Leakage)...")
     
     df['orig_order'] = np.arange(len(df))
     df = df.sort_values(by=['team', 'match_date']).reset_index(drop=True)
     
+    df['shin_insider_close'] = df.groupby('team')['_raw_insider_close'].shift(1).fillna(df['shin_insider_open'])
+    df['shin_insider_drift'] = df.groupby('team')['_raw_insider_drift'].shift(1).fillna(0.0)
+    
     for outcome in ['win', 'draw', 'loss']:
+        raw_mu_col = f'_raw_mu_{outcome}'
         mu_col = f'gbm_mu_{outcome}'
         sigma_col = f'gbm_sigma_{outcome}'
         mean_drift_col = f'gbm_mean_{outcome}'
@@ -141,17 +151,19 @@ def compute_gbm_features(df):
         ewma_std_col = f'gbm_ewma_std_{outcome}'
         z_col = f'gbm_z_{outcome}'
         
-        grouped_mu = df.groupby('team')[mu_col]
+        grouped_raw_mu = df.groupby('team')[raw_mu_col]
+        # gbm_mu_{outcome} representa la deriva observada hasta el partido previo (t-1)
+        df[mu_col] = grouped_raw_mu.shift(1).fillna(0.0)
         
-        df[sigma_col] = grouped_mu.transform(lambda x: x.shift(1).rolling(window=10, min_periods=3).std())
-        df[mean_drift_col] = grouped_mu.transform(lambda x: x.shift(1).rolling(window=10, min_periods=3).mean())
+        df[sigma_col] = grouped_raw_mu.transform(lambda x: x.shift(1).rolling(window=10, min_periods=3).std())
+        df[mean_drift_col] = grouped_raw_mu.transform(lambda x: x.shift(1).rolling(window=10, min_periods=3).mean())
         
-        df[ewma_mu_col] = grouped_mu.transform(lambda x: x.shift(1).ewm(span=10, min_periods=3).mean())
-        df[ewma_std_col] = grouped_mu.transform(lambda x: x.shift(1).ewm(span=10, min_periods=3).std())
+        df[ewma_mu_col] = grouped_raw_mu.transform(lambda x: x.shift(1).ewm(span=10, min_periods=3).mean())
+        df[ewma_std_col] = grouped_raw_mu.transform(lambda x: x.shift(1).ewm(span=10, min_periods=3).std())
         
-        # Imputación de NaNs usando estadísticas en expansión históricas
-        exp_std = grouped_mu.transform(lambda x: x.shift(1).expanding(min_periods=1).std()).fillna(0.1)
-        exp_mean = grouped_mu.transform(lambda x: x.shift(1).expanding(min_periods=1).mean()).fillna(0.0)
+        # Imputación de NaNs usando estadísticas en expansión históricas previas
+        exp_std = grouped_raw_mu.transform(lambda x: x.shift(1).expanding(min_periods=1).std()).fillna(0.1)
+        exp_mean = grouped_raw_mu.transform(lambda x: x.shift(1).expanding(min_periods=1).mean()).fillna(0.0)
         
         df[sigma_col] = df[sigma_col].fillna(exp_std)
         df[mean_drift_col] = df[mean_drift_col].fillna(exp_mean)
@@ -161,7 +173,8 @@ def compute_gbm_features(df):
         raw_z = (df[mu_col] - df[mean_drift_col]) / df[sigma_col].replace(0, 1e-5)
         df[z_col] = raw_z.clip(-4.0, 4.0).fillna(0.0)
         
-    df = df.sort_values(by='orig_order').drop(columns=['orig_order']).reset_index(drop=True)
+    drop_raw = ['orig_order', '_raw_insider_close', '_raw_insider_drift', '_raw_mu_win', '_raw_mu_draw', '_raw_mu_loss']
+    df = df.sort_values(by='orig_order').drop(columns=drop_raw).reset_index(drop=True)
     return df
 
 def objective(trial, X_train, y_train, dates_train, cv_strategy):
@@ -203,13 +216,24 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
     return np.mean(cv_scores)
 
 def train_gbm_model():
-    df = get_base_dataset()
-    df_gbm = compute_gbm_features(df)
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+    ref_path = os.path.join(base_dir, 'data/processed/matches_with_referees.parquet')
+    odds_path = os.path.join(base_dir, 'data/processed/matches_with_odds.parquet')
+    full_path = ref_path if os.path.exists(ref_path) else odds_path
+    df_full = pd.read_parquet(full_path, engine='fastparquet')
+    sort_cols = ['match_date', 'match_id'] if 'match_id' in df_full.columns else ['match_date']
+    df_full = df_full.sort_values(sort_cols).reset_index(drop=True)
     
-    if df_gbm is None:
+    df_gbm_full = compute_gbm_features(df_full)
+    if df_gbm_full is None:
         logger.error("Abortando entrenamiento GBM por falta de datos.")
         return
         
+    df_gbm_path = os.path.join(PROCESSED_DIR, 'matches_with_gbm_features.parquet')
+    df_gbm_full.to_parquet(df_gbm_path, engine='fastparquet')
+    logger.info(f"Dataset completo enriquecido con GBM guardado en: {df_gbm_path}")
+    
+    df_gbm = df_gbm_full[df_gbm_full['is_home'] == 1].reset_index(drop=True)
     split_idx = get_train_test_split(df_gbm)
     
     feature_cols = [
@@ -272,7 +296,34 @@ def train_gbm_model():
     pred_probs_train[:] = np.nan
     
     splits = list(cv_strategy.split(X_train, y_train))
-    
+
+    # 1. Primer bloque temporal con TimeSeriesSplit(3) + Shin analytical burn-in prior
+    first_train_idx = splits[0][0]
+    X_first = X_train.iloc[first_train_idx]
+    y_first = y_train.iloc[first_train_idx]
+    dates_first = train_dates.iloc[first_train_idx] if train_dates is not None else None
+    init_tscv = TimeSeriesSplit(n_splits=3)
+    init_splits = list(init_tscv.split(X_first, y_first))
+    burn_idx = first_train_idx[init_splits[0][0]]
+    if all(c in X_train.columns for c in ['shin_base_prob_loss', 'shin_base_prob_draw', 'shin_base_prob_win']):
+        burn_probs = X_train[['shin_base_prob_loss', 'shin_base_prob_draw', 'shin_base_prob_win']].iloc[burn_idx].values
+        burn_probs = burn_probs / np.maximum(burn_probs.sum(axis=1, keepdims=True), 1e-9)
+        pred_probs_train[burn_idx] = burn_probs
+    else:
+        pred_probs_train[burn_idx] = np.array([0.30, 0.25, 0.45])
+    for sub_tr, sub_val in init_splits:
+        X_sub_tr, y_sub_tr = X_first.iloc[sub_tr], y_first.iloc[sub_tr]
+        X_sub_val = X_first.iloc[sub_val]
+        dates_sub_tr = dates_first.iloc[sub_tr] if dates_first is not None else None
+        w_tr = get_time_weights(dates_sub_tr)
+        base_sub = XGBClassifier(**xgb_best_params)
+        sub_estimator = CalibratedClassifierCV(estimator=base_sub, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
+        if w_tr is not None:
+            sub_estimator.fit(X_sub_tr, y_sub_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
+        else:
+            sub_estimator.fit(X_sub_tr, y_sub_tr)
+        pred_probs_train[first_train_idx[sub_val]] = sub_estimator.predict_proba(X_sub_val)
+
     for i, (train_idx, val_idx) in enumerate(splits):
         X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
         X_val = X_train.iloc[val_idx]
@@ -281,7 +332,7 @@ def train_gbm_model():
         w_tr = get_time_weights(dates_tr)
         
         base_fold = XGBClassifier(**xgb_best_params)
-        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='sigmoid', cv=3)
+        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -292,7 +343,7 @@ def train_gbm_model():
     logger.info("Entrenando Modelo GBM final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
     base_final = XGBClassifier(**xgb_best_params)
-    final_estimator = CalibratedClassifierCV(estimator=base_final, method='sigmoid', cv=3)
+    final_estimator = CalibratedClassifierCV(estimator=base_final, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
     
     if final_w_tr is not None:
         final_estimator.fit(X_train, y_train, sample_weight=final_w_tr.values if isinstance(final_w_tr, pd.Series) else final_w_tr)
@@ -348,11 +399,6 @@ def train_gbm_model():
     
     oof_train.to_parquet(os.path.join(PROCESSED_DIR, 'oof_gbm_train.parquet'), engine='fastparquet')
     oof_test.to_parquet(os.path.join(PROCESSED_DIR, 'oof_gbm_test.parquet'), engine='fastparquet')
-    
-    # Exportar el dataset enriquecido con las caracteristicas GBM
-    df_gbm_path = os.path.join(PROCESSED_DIR, 'matches_with_gbm_features.parquet')
-    df_gbm.to_parquet(df_gbm_path, engine='fastparquet')
-    logger.info(f"Dataset enriquecido con GBM guardado en: {df_gbm_path}")
     
     if not os.path.exists(MODEL_SAVE_DIR):
         os.makedirs(MODEL_SAVE_DIR)

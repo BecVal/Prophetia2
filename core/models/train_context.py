@@ -75,7 +75,7 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         w_tr = get_time_weights(dates_tr, half_life_days=half_life)
         
         xgb_eval = XGBClassifier(**param)
-        calibrated_eval = CalibratedClassifierCV(estimator=xgb_eval, method='sigmoid', cv=3)
+        calibrated_eval = CalibratedClassifierCV(estimator=xgb_eval, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             calibrated_eval.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -90,13 +90,14 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
 
 def train_context():
     df = get_base_dataset()
+    split_idx = get_train_test_split(df)
     
     if 'competition' in df.columns:
-        df['competition_id'] = pd.factorize(df['competition'])[0]
-        df['competition_id'] = df['competition_id'].astype('category')
+        train_comps = df['competition'].iloc[:split_idx].dropna().unique()
+        comp_map = {c: i for i, c in enumerate(train_comps)}
+        df['competition_id'] = df['competition'].map(comp_map).fillna(-1).astype(int).astype('category')
     else:
-        df['competition_id'] = 0
-        df['competition_id'] = df['competition_id'].astype('category')
+        df['competition_id'] = pd.Series(0, index=df.index, dtype='category')
 
     # ==============================================================================
     # FEATURE ENGINEERING DE ELITE (11/10): PRIORES MATEMÁTICOS & INTERACCIONES
@@ -237,7 +238,7 @@ def train_context():
         w_tr = get_time_weights(dates_sub_tr, half_life_days=half_life_opt)
         
         base_sub = XGBClassifier(**xgb_best_params)
-        sub_estimator = CalibratedClassifierCV(estimator=base_sub, method='sigmoid', cv=3)
+        sub_estimator = CalibratedClassifierCV(estimator=base_sub, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             sub_estimator.fit(X_sub_tr, y_sub_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -246,23 +247,17 @@ def train_context():
         val_indices_in_original = first_train_idx[sub_val_idx]
         pred_probs_train[val_indices_in_original] = sub_estimator.predict_proba(X_sub_val)
 
-    # Rellenar micro-bloque inicial
+    # Rellenar micro-bloque inicial con frecuencias históricas causales (burn-in prior sin sobreajuste in-sample)
     unfilled_mask = np.isnan(pred_probs_train[first_train_idx]).any(axis=1)
     if np.any(unfilled_mask):
-        init_n = max(50, len(first_train_idx) // 4)
-        X_init, y_init = X_first.iloc[:init_n], y_first.iloc[:init_n]
-        dates_init = dates_first.iloc[:init_n] if dates_first is not None else None
-        w_init = get_time_weights(dates_init, half_life_days=half_life_opt)
-        
-        base_init = XGBClassifier(**xgb_best_params)
-        init_estimator = CalibratedClassifierCV(estimator=base_init, method='sigmoid', cv=3)
-        if w_init is not None:
-            init_estimator.fit(X_init, y_init, sample_weight=w_init.values if isinstance(w_init, pd.Series) else w_init)
-        else:
-            init_estimator.fit(X_init, y_init)
-        
         unfilled_global_idx = first_train_idx[unfilled_mask]
-        pred_probs_train[unfilled_global_idx] = init_estimator.predict_proba(X_train.iloc[unfilled_global_idx])
+        y_burn = y_train.iloc[unfilled_global_idx]
+        p0 = (y_burn == 0).astype(float).shift(1).expanding(min_periods=1).mean().fillna(0.30).values
+        p1 = (y_burn == 1).astype(float).shift(1).expanding(min_periods=1).mean().fillna(0.25).values
+        p2 = (y_burn == 2).astype(float).shift(1).expanding(min_periods=1).mean().fillna(0.45).values
+        burn_probs = np.column_stack([p0, p1, p2])
+        burn_probs = burn_probs / np.maximum(burn_probs.sum(axis=1, keepdims=True), 1e-9)
+        pred_probs_train[unfilled_global_idx] = burn_probs
 
     # 2. Expanding Windows
     for i, (train_idx, val_idx) in enumerate(splits):
@@ -274,7 +269,7 @@ def train_context():
         w_tr = get_time_weights(dates_tr, half_life_days=half_life_opt)
         
         base_fold = XGBClassifier(**xgb_best_params)
-        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='sigmoid', cv=3)
+        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -284,7 +279,7 @@ def train_context():
     logger.info("Entrenando Modelo B final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates, half_life_days=half_life_opt)
     base_final = XGBClassifier(**xgb_best_params)
-    final_estimator = CalibratedClassifierCV(estimator=base_final, method='sigmoid', cv=3)
+    final_estimator = CalibratedClassifierCV(estimator=base_final, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
     if final_w_tr is not None:
         final_estimator.fit(X_train, y_train, sample_weight=final_w_tr.values if isinstance(final_w_tr, pd.Series) else final_w_tr)
     else:

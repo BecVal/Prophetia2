@@ -273,10 +273,6 @@ class SklearnPyTorchWrapper10(BaseEstimator, ClassifierMixin):
 
             self.models.append(model)
 
-        # Refit scaler on full data
-        X_full_imp = self.imputer.fit_transform(X_cont)
-        self.scaler.fit(X_full_imp)
-
         return self
 
     def predict_proba(self, X):
@@ -326,14 +322,13 @@ class SklearnPyTorchWrapper10(BaseEstimator, ClassifierMixin):
 def train_nn():
     set_seed(42)
     df = get_base_dataset()
+    split_idx = get_train_test_split(df)
 
-    # Mapeo de Entity Embeddings para Equipos
-    teams = df['team'].astype(str).unique() if 'team' in df.columns else []
+    # Mapeo de Entity Embeddings para Equipos (ajustado estrictamente sobre Train; 0 = equipo desconocido)
+    teams = df.iloc[:split_idx]['team'].astype(str).unique() if 'team' in df.columns else []
     team2idx = {t: i + 1 for i, t in enumerate(teams)}
     df['team_idx'] = df['team'].astype(str).map(team2idx).fillna(0).astype(int) if 'team' in df.columns else 0
     num_teams = len(teams)
-
-    split_idx = get_train_test_split(df)
 
     base_stats = [
         'shots_total', 'shots_on_target',
@@ -485,13 +480,15 @@ def train_nn():
 
     logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con TimeSeriesSplit(5)...")
     ts_init = TimeSeriesSplit(n_splits=5)
+    init_splits = list(ts_init.split(X_first))
 
-    prior_probs = y_first.value_counts(normalize=True).sort_index().values
+    burnin_slice = init_splits[0][0]
+    prior_probs = y_first.iloc[burnin_slice].value_counts(normalize=True).sort_index().values
     if len(prior_probs) == 3:
-        for idx_pos in range(len(first_train_idx)):
+        for idx_pos in burnin_slice:
             pred_probs_train[first_train_idx[idx_pos]] = prior_probs
 
-    for ts_tr, ts_val in ts_init.split(X_first):
+    for ts_tr, ts_val in init_splits:
         X_ts_tr, y_ts_tr = X_first.iloc[ts_tr], y_first.iloc[ts_tr]
         X_ts_val = X_first.iloc[ts_val]
 

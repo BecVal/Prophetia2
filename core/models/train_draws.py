@@ -65,7 +65,7 @@ def get_time_weights(dates, half_life_days=365):
     return np.exp(-np.log(2) * days_diff / half_life_days)
 
 def fit_calibrated_model(base_estimator, X_tr, y_tr, w_tr=None):
-    calibrated = CalibratedClassifierCV(estimator=base_estimator, method='isotonic', cv=3)
+    calibrated = CalibratedClassifierCV(estimator=base_estimator, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
     try:
         if w_tr is not None:
             calibrated.fit(X_tr, y_tr, sample_weight=w_tr)
@@ -225,25 +225,32 @@ def train_draws():
     
     splits = list(cv_strategy.split(X_train, y_train))
     
-    # 1. Fold inicial
+    # 1. Fold inicial (TimeSeriesSplit estricto sin KFold shuffle + burn-in causal)
     first_train_idx = splits[0][0]
     X_first = X_train.iloc[first_train_idx]
     y_first = y_train.iloc[first_train_idx]
     dates_first = train_dates.iloc[first_train_idx] if train_dates is not None else None
     
-    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con KFold(5) para OOF completo...")
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    for kf_train, kf_val in kf.split(X_first):
-        X_kf_train, y_kf_train = X_first.iloc[kf_train], y_first.iloc[kf_train]
-        X_kf_val = X_first.iloc[kf_val]
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} muestras) con TimeSeriesSplit(3) causal...")
+    init_tscv = TimeSeriesSplit(n_splits=3)
+    init_splits = list(init_tscv.split(X_first))
+    
+    burn_idx = first_train_idx[init_splits[0][0]]
+    p_draw_burn = y_train.iloc[burn_idx].shift(1).expanding(min_periods=1).mean().fillna(0.26).values
+    pred_probs_train[burn_idx, 1] = p_draw_burn
+    pred_probs_train[burn_idx, 0] = 1.0 - p_draw_burn
+    
+    for sub_tr, sub_val in init_splits:
+        X_kf_train, y_kf_train = X_first.iloc[sub_tr], y_first.iloc[sub_tr]
+        X_kf_val = X_first.iloc[sub_val]
         
-        dates_kf_train = dates_first.iloc[kf_train] if dates_first is not None else None
+        dates_kf_train = dates_first.iloc[sub_tr] if dates_first is not None else None
         w_tr = get_time_weights(dates_kf_train)
         
         hybrid_fold = HybridDrawsEnsemble(best_params)
         hybrid_fold.fit(X_kf_train, y_kf_train, w_tr)
         
-        val_indices_in_original = first_train_idx[kf_val]
+        val_indices_in_original = first_train_idx[sub_val]
         pred_probs_train[val_indices_in_original] = hybrid_fold.predict_proba(X_kf_val)
 
     # 2. Expanding Windows estándar para el resto

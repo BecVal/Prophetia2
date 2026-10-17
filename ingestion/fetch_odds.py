@@ -39,9 +39,12 @@ def fetch_and_merge_odds():
     
     logger.info("Iniciando descarga de cuotas históricas concurrentemente...")
     
-    def process_odds_df(url):
+    def process_odds_df(source):
         try:
-            df_odds = pd.read_csv(url, encoding='latin-1', on_bad_lines='skip')
+            try:
+                df_odds = pd.read_csv(source, encoding='utf-8', on_bad_lines='skip', low_memory=False)
+            except UnicodeDecodeError:
+                df_odds = pd.read_csv(source, encoding='latin-1', on_bad_lines='skip', low_memory=False)
             
             if 'Home' in df_odds.columns and 'HomeTeam' not in df_odds.columns:
                 df_odds.rename(columns={'Home': 'HomeTeam', 'Away': 'AwayTeam'}, inplace=True)
@@ -68,33 +71,41 @@ def fetch_and_merge_odds():
             df_odds['AwayTeam'] = df_odds['AwayTeam'].apply(normalize_team_name)
             return df_odds
         except Exception as e:
-            logger.warning(f"Error descargando {url}: {e}")
+            logger.warning(f"Error procesando cuotas desde {source}: {e}")
             return None
 
-    urls = []
-    for season in SEASONS:
-        for league in LEAGUES:
-            urls.append(BASE_URL.format(season=season, league=league))
-    for league in EXTRA_LEAGUES:
-        urls.append(EXTRA_BASE_URL.format(league=league))
+    import glob
+    local_dir = os.path.join(script_dir, '..', 'data', 'raw', 'football_data')
+    local_csvs = sorted(glob.glob(os.path.join(local_dir, '*.csv')))
+    if local_csvs:
+        logger.info(f"Cargando cuotas desde {len(local_csvs)} archivos CSV locales en {local_dir}...")
+        sources = local_csvs
+    else:
+        urls = []
+        for season in SEASONS:
+            for league in LEAGUES:
+                urls.append(BASE_URL.format(season=season, league=league))
+        for league in EXTRA_LEAGUES:
+            urls.append(EXTRA_BASE_URL.format(league=league))
+        sources = urls
         
     with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(process_odds_df, url): url for url in urls}
+        futures = {executor.submit(process_odds_df, src): src for src in sources}
         for future in as_completed(futures):
             res = future.result()
             if res is not None:
                 odds_dataframes.append(res)
             
     if not odds_dataframes:
-        logger.error("No se pudo descargar ningún archivo de cuotas.")
+        logger.error("No se pudo cargar ningún archivo de cuotas.")
         return
         
     df_odds_master = pd.concat(odds_dataframes, ignore_index=True)
     df_odds_master = df_odds_master.dropna(subset=['HomeTeam', 'AwayTeam'])
-    logger.info(f"Descargados {len(df_odds_master)} partidos con cuotas.")
+    logger.info(f"Cargados {len(df_odds_master)} partidos con cuotas.")
     
-    # 1. Extracción jerárquica de Cuotas de Cierre (Closing Odds)
-    # Prioridad: Pinnacle Closing (PSCH) -> Bet365 Closing (B365CH) -> Avg Closing (AvgCH) -> Max Closing (MaxCH)
+    # 1. Extracción jerárquica de Cuotas de Apertura (Opening Odds — estrictamente pre-partido)
+    # Prioridad: Pinnacle Open (PSH) -> Bet365 Open (B365H) -> Avg Open (AvgH) -> Max Open (MaxH) -> WHH/BWH/IWH
     def extract_composite_odds(df, priority_cols):
         res = pd.Series(np.nan, index=df.index)
         for col in priority_cols:
@@ -102,24 +113,15 @@ def fetch_and_merge_odds():
                 res = res.fillna(pd.to_numeric(df[col], errors='coerce'))
         return res
 
-    close_win = extract_composite_odds(df_odds_master, ['PSCH', 'B365CH', 'AvgCH', 'MaxCH', 'PSH', 'B365H', 'AvgH', 'MaxH'])
-    close_draw = extract_composite_odds(df_odds_master, ['PSCD', 'B365CD', 'AvgCD', 'MaxCD', 'PSD', 'B365D', 'AvgD', 'MaxD'])
-    close_loss = extract_composite_odds(df_odds_master, ['PSCA', 'B365CA', 'AvgCA', 'MaxCA', 'PSA', 'B365A', 'AvgA', 'MaxA'])
+    open_win = extract_composite_odds(df_odds_master, ['PSH', 'B365H', 'AvgH', 'MaxH', 'WHH', 'BWH', 'IWH'])
+    open_draw = extract_composite_odds(df_odds_master, ['PSD', 'B365D', 'AvgD', 'MaxD', 'WHD', 'BWD', 'IWD'])
+    open_loss = extract_composite_odds(df_odds_master, ['PSA', 'B365A', 'AvgA', 'MaxA', 'WHA', 'BWA', 'IWA'])
 
-    # 2. Extracción jerárquica de Cuotas de Apertura (Opening Odds)
-    # Prioridad: Pinnacle Open (PSH) -> Bet365 Open (B365H) -> Avg Open (AvgH) -> Max Open (MaxH) -> WHH/BWH/IWH -> Fallback a Closing
-    open_win = extract_composite_odds(df_odds_master, ['PSH', 'B365H', 'AvgH', 'MaxH', 'WHH', 'BWH', 'IWH', 'PSCH', 'B365CH', 'AvgCH', 'MaxCH'])
-    open_draw = extract_composite_odds(df_odds_master, ['PSD', 'B365D', 'AvgD', 'MaxD', 'WHD', 'BWD', 'IWD', 'PSCD', 'B365CD', 'AvgCD', 'MaxCD'])
-    open_loss = extract_composite_odds(df_odds_master, ['PSA', 'B365A', 'AvgA', 'MaxA', 'WHA', 'BWA', 'IWA', 'PSCA', 'B365CA', 'AvgCA', 'MaxCA'])
-
-    # Fallback bidireccional estricto (Open <-> Close)
-    open_win = open_win.fillna(close_win)
-    open_draw = open_draw.fillna(close_draw)
-    open_loss = open_loss.fillna(close_loss)
-
-    close_win = close_win.fillna(open_win)
-    close_draw = close_draw.fillna(open_draw)
-    close_loss = close_loss.fillna(open_loss)
+    # 2. Extracción jerárquica de Cuotas de Cierre (Closing Odds — exclusivamente post-partido / CLV)
+    # Prioridad: Pinnacle Closing (PSCH) -> Bet365 Closing (B365CH) -> Avg Closing (AvgCH) -> Max Closing (MaxCH) -> Fallback unidireccional a Opening
+    close_win = extract_composite_odds(df_odds_master, ['PSCH', 'B365CH', 'AvgCH', 'MaxCH']).fillna(open_win)
+    close_draw = extract_composite_odds(df_odds_master, ['PSCD', 'B365CD', 'AvgCD', 'MaxCD']).fillna(open_draw)
+    close_loss = extract_composite_odds(df_odds_master, ['PSCA', 'B365CA', 'AvgCA', 'MaxCA']).fillna(open_loss)
 
     df_odds_master['open_w_home'] = open_win
     df_odds_master['open_d'] = open_draw
@@ -144,7 +146,13 @@ def fetch_and_merge_odds():
     df_main['AwayTeam_join'] = np.where(is_home, df_main['opponent'], df_main['team'])
 
     # Evitamos colisiones de columnas
-    cols_to_drop = [c for c in ['odds_win', 'odds_draw', 'odds_loss', 'open_odds_win', 'open_odds_draw', 'open_odds_loss'] if c in df_main.columns]
+    cols_to_drop = [
+        c for c in [
+            'odds_win', 'odds_draw', 'odds_loss',
+            'open_odds_win', 'open_odds_draw', 'open_odds_loss',
+            'closing_odds_win', 'closing_odds_draw', 'closing_odds_loss'
+        ] if c in df_main.columns
+    ]
     if cols_to_drop:
         df_main.drop(columns=cols_to_drop, inplace=True)
     
@@ -179,14 +187,20 @@ def fetch_and_merge_odds():
         
     is_home_mask = merged['is_home'] == 1
     
-    # Asignación relativa al equipo en perspectiva
-    merged['odds_win'] = np.where(is_home_mask, merged['close_w_home'], merged['close_l_home'])
-    merged['odds_draw'] = merged['close_d']
-    merged['odds_loss'] = np.where(is_home_mask, merged['close_l_home'], merged['close_w_home'])
-    
+    # Asignación relativa al equipo en perspectiva:
+    # open_odds_* y odds_* contienen exclusivamente Cuotas de Apertura (sin Look-Ahead Bias de cierre)
     merged['open_odds_win'] = np.where(is_home_mask, merged['open_w_home'], merged['open_l_home'])
     merged['open_odds_draw'] = merged['open_d']
     merged['open_odds_loss'] = np.where(is_home_mask, merged['open_l_home'], merged['open_w_home'])
+    
+    merged['odds_win'] = merged['open_odds_win']
+    merged['odds_draw'] = merged['open_odds_draw']
+    merged['odds_loss'] = merged['open_odds_loss']
+    
+    # closing_odds_* se reservan exclusivamente para evaluación post-partido (CLV) y derivas históricas desplazadas (shift(1))
+    merged['closing_odds_win'] = np.where(is_home_mask, merged['close_w_home'], merged['close_l_home'])
+    merged['closing_odds_draw'] = merged['close_d']
+    merged['closing_odds_loss'] = np.where(is_home_mask, merged['close_l_home'], merged['close_w_home'])
     
     df_final = merged.drop(columns=[
         'match_date_only', 'HomeTeam_join', 'AwayTeam_join', 

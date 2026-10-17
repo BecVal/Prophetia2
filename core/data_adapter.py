@@ -8,6 +8,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from core.logger_config import get_logger
+from core.league_mapping import normalize_league
 
 logger = get_logger(__name__, 'data_adapter')
 
@@ -462,16 +463,22 @@ def build_unified_intermediate_dataset():
         
     final_df = pd.concat(dfs, ignore_index=True)
     
-    # Ordenar por fecha
+    # Normalizar nombre de competición y ordenar por fecha
+    if 'competition' in final_df.columns:
+        final_df['competition'] = final_df['competition'].apply(normalize_league)
     final_df['match_date'] = pd.to_datetime(final_df['match_date'])
     final_df = final_df.sort_values('match_date').reset_index(drop=True)
 
-    # Eliminar posibles duplicados
-    # Algunos partidos podrían existir en StatsBomb y en FootballData
-    # Vamos a eliminar duplicados basados en 'match_date', 'team', 'opponent' dando prioridad a StatsBomb (que tiene más columnas ricas)
+    # Eliminar posibles duplicados dando prioridad a StatsBomb (source='statsbomb' > 'footballdata')
     final_df = final_df.sort_values(by=['match_date', 'team', 'opponent', 'source'], ascending=[True, True, True, False])
     before_drop = len(final_df)
     final_df = final_df.drop_duplicates(subset=['match_date', 'team', 'opponent'], keep='first')
+    # Si un partido residual sigue duplicado en la misma fecha para un mismo equipo con alias distinto de rival, descartar el match_id secundario completo
+    dup_team_mask = final_df.duplicated(subset=['match_date', 'team'], keep='first')
+    if dup_team_mask.any():
+        bad_match_ids = set(final_df.loc[dup_team_mask, 'match_id'])
+        final_df = final_df[~final_df['match_id'].isin(bad_match_ids)]
+    final_df = final_df.sort_values(['match_date', 'match_id', 'is_home'], ascending=[True, True, False]).reset_index(drop=True)
     after_drop = len(final_df)
     logger.info(f"Duplicados eliminados: {before_drop - after_drop}")
 

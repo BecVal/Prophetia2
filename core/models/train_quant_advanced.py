@@ -122,10 +122,10 @@ class KalmanDixonColesQuantModel(nn.Module):
     def compute_loss(self, h_idx, a_idx, h_goals, a_goals, days_ago, elo_diff=None, xg_diff=None):
         mu_h, mu_a = self.forward(h_idx, a_idx, elo_diff, xg_diff)
         
-        # Ponderación dinámica de Kalman Smoother: w(t) = 1 / (1 + gamma * days_ago)
-        gamma = 0.0001 + 0.0099 * torch.sigmoid(self.kalman_gamma_logit)
-        kalman_weights = 1.0 / (1.0 + gamma * days_ago)
-        kalman_weights = kalman_weights / kalman_weights.mean()
+        # Ponderación exponencial temporal con semivida fija (Half-Life H = 365 días) para evitar colapso de frontera en L-BFGS
+        half_life_days = 365.0
+        kalman_weights = torch.exp(-float(np.log(2.0)) * days_ago / half_life_days)
+        kalman_weights = kalman_weights / kalman_weights.mean().clamp(min=1e-8)
         
         # Log-Likelihood Poisson marginales
         log_p_h = h_goals.float() * torch.log(mu_h + 1e-8) - mu_h - torch.lgamma(h_goals.float() + 1.0)
@@ -174,6 +174,18 @@ class KalmanDixonColesQuantModel(nn.Module):
         return loss
 
 
+def _extract_bilateral_xg_diff(df_sub):
+    if 'xg_created_ema5' not in df_sub.columns or 'xg_conceded_ema5' not in df_sub.columns:
+        return None
+    h_att = df_sub['xg_created_ema5'].fillna(1.2)
+    h_def = df_sub['xg_conceded_ema5'].fillna(1.2)
+    a_att = df_sub['opp_xg_created_ema5'].fillna(1.2) if 'opp_xg_created_ema5' in df_sub.columns else pd.Series(1.2, index=df_sub.index)
+    a_def = df_sub['opp_xg_conceded_ema5'].fillna(1.2) if 'opp_xg_conceded_ema5' in df_sub.columns else pd.Series(1.2, index=df_sub.index)
+    xg_home_exp = 0.5 * (h_att + a_def)
+    xg_away_exp = 0.5 * (a_att + h_def)
+    return torch.tensor((xg_home_exp - xg_away_exp).values, dtype=torch.float32)
+
+
 def fit_quant_model(df_sub, team_mapping, n_teams, max_iter=100):
     """
     Ajusta el modelo cuantitativo Kalman Dixon-Coles en un subconjunto de datos usando L-BFGS optimizado.
@@ -188,11 +200,7 @@ def fit_quant_model(df_sub, team_mapping, n_teams, max_iter=100):
     days_ago = torch.tensor((max_date - dates).dt.days.values, dtype=torch.float32)
 
     elo_diff = torch.tensor(df_sub['elo_diff'].fillna(0.0).values / 100.0, dtype=torch.float32) if 'elo_diff' in df_sub.columns else None
-    
-    if 'xg_created_ema5' in df_sub.columns and 'xg_conceded_ema5' in df_sub.columns:
-        xg_diff = torch.tensor((df_sub['xg_created_ema5'].fillna(0.0) - df_sub['xg_conceded_ema5'].fillna(0.0)).values, dtype=torch.float32)
-    else:
-        xg_diff = None
+    xg_diff = _extract_bilateral_xg_diff(df_sub)
 
     model = KalmanDixonColesQuantModel(n_teams)
     optimizer = optim.LBFGS(model.parameters(), lr=0.5, max_iter=max_iter, line_search_fn='strong_wolfe')
@@ -215,11 +223,7 @@ def predict_from_model(model, team_mapping, df_test):
     a_idx = torch.tensor(df_test['opponent'].map(lambda t: team_mapping.get(t, -1)).values, dtype=torch.long)
     
     elo_diff = torch.tensor(df_test['elo_diff'].fillna(0.0).values / 100.0, dtype=torch.float32) if 'elo_diff' in df_test.columns else None
-    
-    if 'xg_created_ema5' in df_test.columns and 'xg_conceded_ema5' in df_test.columns:
-        xg_diff = torch.tensor((df_test['xg_created_ema5'].fillna(0.0) - df_test['xg_conceded_ema5'].fillna(0.0)).values, dtype=torch.float32)
-    else:
-        xg_diff = None
+    xg_diff = _extract_bilateral_xg_diff(df_test)
 
     with torch.no_grad():
         mu_h, mu_a = model(h_idx, a_idx, elo_diff, xg_diff)
@@ -259,16 +263,26 @@ def train_quant_advanced():
     logger.info("Generando predicciones OOF reales con TimeSeriesSplit(5)...")
     splits = list(tscv.split(df_train))
     
-    # 1. Procesar primer bloque inicial con KFold interno sin leakage
+    # 1. Procesar primer bloque inicial con TimeSeriesSplit interno (sin KFold aleatorio que filtre el futuro)
     first_train_idx = splits[0][0]
     df_first = df_train.iloc[first_train_idx]
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    for kf_tr, kf_val in kf.split(df_first):
-        df_tr_kf, df_val_kf = df_first.iloc[kf_tr], df_first.iloc[kf_val]
-        m_kf = fit_quant_model(df_tr_kf, team_mapping, n_teams, max_iter=60)
-        w_v, d_v, l_v, s_v, c_v = predict_from_model(m_kf, team_mapping, df_val_kf)
+    sub_tscv = get_cv_strategy(n_splits=3)
+    sub_splits = list(sub_tscv.split(df_first))
+    
+    # Burn-in inicial: usar prior neutro para el sub-bloque más antiguo antes del primer corte temporal
+    burnin_idx = first_train_idx[sub_splits[0][0]]
+    oof_win[burnin_idx] = 0.45
+    oof_draw[burnin_idx] = 0.27
+    oof_loss[burnin_idx] = 0.28
+    oof_scored[burnin_idx] = 1.35
+    oof_conceded[burnin_idx] = 1.15
+    
+    for sub_tr, sub_val in sub_splits:
+        df_tr_sub, df_val_sub = df_first.iloc[sub_tr], df_first.iloc[sub_val]
+        m_sub = fit_quant_model(df_tr_sub, team_mapping, n_teams, max_iter=60)
+        w_v, d_v, l_v, s_v, c_v = predict_from_model(m_sub, team_mapping, df_val_sub)
         
-        orig_indices = first_train_idx[kf_val]
+        orig_indices = first_train_idx[sub_val]
         oof_win[orig_indices] = w_v
         oof_draw[orig_indices] = d_v
         oof_loss[orig_indices] = l_v

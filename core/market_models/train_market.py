@@ -21,7 +21,7 @@ from core.logger_config import get_logger
 # ==============================================================================
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
 # ==============================================================================
-RUN_OPTUNA = True
+RUN_OPTUNA = False
 OPTUNA_TRIALS = 20
 # ==============================================================================
 
@@ -129,7 +129,7 @@ def objective(trial, X_train, y_train, dates_train, cv_strategy):
         w_tr = get_time_weights(dates_tr)
         
         xgb_eval = XGBClassifier(**param)
-        calibrated_eval = CalibratedClassifierCV(estimator=xgb_eval, method='sigmoid', cv=3)
+        calibrated_eval = CalibratedClassifierCV(estimator=xgb_eval, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             calibrated_eval.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -147,37 +147,13 @@ def train_market():
     split_idx = get_train_test_split(df)
     
     # ==============================================================================
-    # FEATURE ENGINEERING AVANZADO DE MERCADO (11/10)
+    # FEATURE ENGINEERING AVANZADO DE MERCADO (SIN LOOK-AHEAD BIAS DE CIERRE)
     # ==============================================================================
-    # 1. Remoción de Margen Proporcional, Shin y Power para Cierre
-    if 'odds_win' in df.columns and 'prob_win_implied' not in df.columns:
-        cw_win = df['odds_win']
-        cw_draw = df['odds_draw']
-        cw_loss = df['odds_loss']
-        
-        sum_implied_c = (1 / cw_win) + (1 / cw_draw) + (1 / cw_loss)
-        df['vig_close'] = sum_implied_c - 1.0
-        
-        df['prob_win_implied'] = (1 / cw_win) / sum_implied_c
-        df['prob_draw_implied'] = (1 / cw_draw) / sum_implied_c
-        df['prob_loss_implied'] = (1 / cw_loss) / sum_implied_c
-        
-        shin_w, shin_d, shin_l, shin_z = compute_shin_probs(cw_win, cw_draw, cw_loss)
-        df['shin_prob_win'] = shin_w
-        df['shin_prob_draw'] = shin_d
-        df['shin_prob_loss'] = shin_l
-        df['shin_z_param'] = shin_z
-        
-        pow_w, pow_d, pow_l = compute_power_probs(cw_win, cw_draw, cw_loss)
-        df['power_prob_win'] = pow_w
-        df['power_prob_draw'] = pow_d
-        df['power_prob_loss'] = pow_l
-
-    # 2. Imputación inteligente de Apertura (fallback a cierre si falta apertura)
+    # 1. Cuotas de Apertura (únicas disponibles al momento de apostar pre-partido)
     if 'open_odds_win' in df.columns:
-        ow_win = df['open_odds_win'].fillna(df['odds_win'])
-        ow_draw = df['open_odds_draw'].fillna(df['odds_draw'])
-        ow_loss = df['open_odds_loss'].fillna(df['odds_loss'])
+        ow_win = df['open_odds_win'].fillna(df.get('odds_win'))
+        ow_draw = df['open_odds_draw'].fillna(df.get('odds_draw'))
+        ow_loss = df['open_odds_loss'].fillna(df.get('odds_loss'))
     else:
         ow_win, ow_draw, ow_loss = df['odds_win'], df['odds_draw'], df['odds_loss']
         
@@ -188,33 +164,85 @@ def train_market():
     df['open_prob_draw'] = (1 / ow_draw) / sum_implied_o
     df['open_prob_loss'] = (1 / ow_loss) / sum_implied_o
 
-    # 3. Features de Steam y Movimiento de Líneas
-    df['steam_win'] = df['prob_win_implied'] - df['open_prob_win']
-    df['steam_draw'] = df['prob_draw_implied'] - df['open_prob_draw']
-    df['steam_loss'] = df['prob_loss_implied'] - df['open_prob_loss']
+    # Probabilidades implícitas, Shin y Power del partido actual calculadas ESTRICTAMENTE sobre Apertura
+    df['prob_win_implied'] = df['open_prob_win']
+    df['prob_draw_implied'] = df['open_prob_draw']
+    df['prob_loss_implied'] = df['open_prob_loss']
     
-    # Log Steam Ratio
-    df['log_steam_win'] = np.log(np.maximum(df['prob_win_implied'], 1e-4) / np.maximum(df['open_prob_win'], 1e-4))
-    df['log_steam_draw'] = np.log(np.maximum(df['prob_draw_implied'], 1e-4) / np.maximum(df['open_prob_draw'], 1e-4))
-    df['log_steam_loss'] = np.log(np.maximum(df['prob_loss_implied'], 1e-4) / np.maximum(df['open_prob_loss'], 1e-4))
+    shin_w, shin_d, shin_l, shin_z = compute_shin_probs(ow_win, ow_draw, ow_loss)
+    df['shin_prob_win'] = shin_w
+    df['shin_prob_draw'] = shin_d
+    df['shin_prob_loss'] = shin_l
+    df['shin_z_param'] = shin_z
     
-    # Steam Relativo (%)
-    df['rel_steam_win'] = df['steam_win'] / np.maximum(df['open_prob_win'], 1e-4)
-    df['rel_steam_draw'] = df['steam_draw'] / np.maximum(df['open_prob_draw'], 1e-4)
-    df['rel_steam_loss'] = df['steam_loss'] / np.maximum(df['open_prob_loss'], 1e-4)
+    pow_w, pow_d, pow_l = compute_power_probs(ow_win, ow_draw, ow_loss)
+    df['power_prob_win'] = pow_w
+    df['power_prob_draw'] = pow_d
+    df['power_prob_loss'] = pow_l
 
-    # 4. Entropía de Mercado y Microestructura
-    p_close = df[['prob_win_implied', 'prob_draw_implied', 'prob_loss_implied']].values
+    # 2. Features de Steam y Microestructura: calculadas sobre cierre histórico y desplazadas (shift(1)) por equipo
+    if 'closing_odds_win' in df.columns:
+        cw_win = df['closing_odds_win'].fillna(ow_win)
+        cw_draw = df['closing_odds_draw'].fillna(ow_draw)
+        cw_loss = df['closing_odds_loss'].fillna(ow_loss)
+    else:
+        cw_win, cw_draw, cw_loss = ow_win, ow_draw, ow_loss
+
+    sum_implied_c = (1 / cw_win) + (1 / cw_draw) + (1 / cw_loss)
+    raw_vig_close = sum_implied_c - 1.0
+    close_prob_w = (1 / cw_win) / sum_implied_c
+    close_prob_d = (1 / cw_draw) / sum_implied_c
+    close_prob_l = (1 / cw_loss) / sum_implied_c
+
+    df['_raw_steam_win'] = close_prob_w - df['open_prob_win']
+    df['_raw_steam_draw'] = close_prob_d - df['open_prob_draw']
+    df['_raw_steam_loss'] = close_prob_l - df['open_prob_loss']
+    
+    df['_raw_log_steam_win'] = np.log(np.maximum(close_prob_w, 1e-4) / np.maximum(df['open_prob_win'], 1e-4))
+    df['_raw_log_steam_draw'] = np.log(np.maximum(close_prob_d, 1e-4) / np.maximum(df['open_prob_draw'], 1e-4))
+    df['_raw_log_steam_loss'] = np.log(np.maximum(close_prob_l, 1e-4) / np.maximum(df['open_prob_loss'], 1e-4))
+    
+    df['_raw_rel_steam_win'] = df['_raw_steam_win'] / np.maximum(df['open_prob_win'], 1e-4)
+    df['_raw_rel_steam_draw'] = df['_raw_steam_draw'] / np.maximum(df['open_prob_draw'], 1e-4)
+    df['_raw_rel_steam_loss'] = df['_raw_steam_loss'] / np.maximum(df['open_prob_loss'], 1e-4)
+
+    p_close_hist = np.column_stack([close_prob_w, close_prob_d, close_prob_l])
     p_open = df[['open_prob_win', 'open_prob_draw', 'open_prob_loss']].values
     
-    df['market_entropy'] = -np.sum(p_close * np.log(np.maximum(p_close, 1e-9)), axis=1)
     df['open_market_entropy'] = -np.sum(p_open * np.log(np.maximum(p_open, 1e-9)), axis=1)
-    df['entropy_change'] = df['market_entropy'] - df['open_market_entropy']
+    df['market_entropy'] = df['open_market_entropy']
+    raw_close_entropy = -np.sum(p_close_hist * np.log(np.maximum(p_close_hist, 1e-9)), axis=1)
+    df['_raw_entropy_change'] = raw_close_entropy - df['open_market_entropy']
+    df['_raw_vig_close'] = raw_vig_close
+    df['_raw_overround_drop'] = df['vig_open'] - raw_vig_close
+
+    # Desplazar 1 partido (shift(1) + EMA5 por equipo) todas las métricas que involucran cuotas de cierre
+    lagged_map = {
+        '_raw_steam_win': 'steam_win',
+        '_raw_steam_draw': 'steam_draw',
+        '_raw_steam_loss': 'steam_loss',
+        '_raw_log_steam_win': 'log_steam_win',
+        '_raw_log_steam_draw': 'log_steam_draw',
+        '_raw_log_steam_loss': 'log_steam_loss',
+        '_raw_rel_steam_win': 'rel_steam_win',
+        '_raw_rel_steam_draw': 'rel_steam_draw',
+        '_raw_rel_steam_loss': 'rel_steam_loss',
+        '_raw_vig_close': 'vig_close',
+        '_raw_overround_drop': 'overround_drop',
+        '_raw_entropy_change': 'entropy_change',
+    }
+    for raw_col, target_col in lagged_map.items():
+        if 'team' in df.columns:
+            df[target_col] = df.groupby('team', sort=False)[raw_col].transform(
+                lambda x: x.shift(1).ewm(span=5, min_periods=1).mean()
+            ).fillna(0.0)
+        else:
+            df[target_col] = df[raw_col].shift(1).ewm(span=5, min_periods=1).mean().fillna(0.0)
+    df.drop(columns=list(lagged_map.keys()), inplace=True)
     
-    # Brecha de Favoritismo y Liquidez
-    sorted_probs = np.sort(p_close, axis=1)
+    # Brecha de Favoritismo pre-partido (sobre cuotas de apertura)
+    sorted_probs = np.sort(p_open, axis=1)
     df['fav_prob_gap'] = sorted_probs[:, 2] - sorted_probs[:, 1]
-    df['overround_drop'] = df['vig_open'] - df['vig_close']
         
     feature_cols = [
         'open_prob_win', 'open_prob_draw', 'open_prob_loss',
@@ -237,12 +265,14 @@ def train_market():
         logger.error("No hay variables de mercado disponibles. Abortando train_market.")
         return
 
-    # Imputación con media/mediana en lugar de fillna(0)
+    # Imputación causal: mediana calculada exclusivamente sobre X_train
     X = df[feature_cols].copy()
-    X = X.fillna(X.median())
     y = df['outcome'].replace({-1: 0, 0: 1, 1: 2})
     
     X_train, X_test = X.iloc[:split_idx].copy(), X.iloc[split_idx:].copy()
+    train_medians = X_train.median()
+    X_train = X_train.fillna(train_medians).fillna(0.0)
+    X_test = X_test.fillna(train_medians).fillna(0.0)
     y_train = y.iloc[:split_idx]
     
     train_dates = None
@@ -307,7 +337,7 @@ def train_market():
         w_tr = get_time_weights(dates_sub_tr)
         
         base_sub = XGBClassifier(**xgb_best.get_params())
-        sub_estimator = CalibratedClassifierCV(estimator=base_sub, method='sigmoid', cv=3)
+        sub_estimator = CalibratedClassifierCV(estimator=base_sub, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             sub_estimator.fit(X_sub_tr, y_sub_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -315,16 +345,14 @@ def train_market():
             
         pred_probs_train[sub_val_idx] = sub_estimator.predict_proba(X_sub_val)
         
-    half_sub = max(100, sub_size // 2)
-    X_h_tr, y_h_tr = X_train.iloc[:half_sub], y_train.iloc[:half_sub]
-    w_h_tr = get_time_weights(train_dates.iloc[:half_sub]) if train_dates is not None else None
-    base_h = XGBClassifier(**xgb_best.get_params())
-    h_estimator = CalibratedClassifierCV(estimator=base_h, method='sigmoid', cv=3)
-    if w_h_tr is not None:
-        h_estimator.fit(X_h_tr, y_h_tr, sample_weight=w_h_tr.values if isinstance(w_h_tr, pd.Series) else w_h_tr)
+    # Burn-in inicial: usar probabilidades analíticas de Shin de apertura (100% causal, sin sobreajuste in-sample)
+    burn_idx = first_train_idx[:sub_size]
+    if all(c in X_train.columns for c in ['shin_prob_loss', 'shin_prob_draw', 'shin_prob_win']):
+        burn_probs = X_train[['shin_prob_loss', 'shin_prob_draw', 'shin_prob_win']].iloc[burn_idx].values
+        burn_probs = burn_probs / np.maximum(burn_probs.sum(axis=1, keepdims=True), 1e-9)
+        pred_probs_train[burn_idx] = burn_probs
     else:
-        h_estimator.fit(X_h_tr, y_h_tr)
-    pred_probs_train[first_train_idx[:sub_size]] = h_estimator.predict_proba(X_train.iloc[first_train_idx[:sub_size]])
+        pred_probs_train[burn_idx] = np.array([0.30, 0.25, 0.45])
 
     # 2. Expanding Windows estándar para el resto
     for i, (train_idx, val_idx) in enumerate(splits):
@@ -336,7 +364,7 @@ def train_market():
         w_tr = get_time_weights(dates_tr)
         
         base_fold = XGBClassifier(**xgb_best.get_params())
-        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='sigmoid', cv=3)
+        fold_estimator = CalibratedClassifierCV(estimator=base_fold, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
         if w_tr is not None:
             fold_estimator.fit(X_tr, y_tr, sample_weight=w_tr.values if isinstance(w_tr, pd.Series) else w_tr)
         else:
@@ -346,7 +374,7 @@ def train_market():
     logger.info("Entrenando Modelo de Mercado final y prediciendo Test...")
     final_w_tr = get_time_weights(train_dates)
     base_final = XGBClassifier(**xgb_best.get_params())
-    final_estimator = CalibratedClassifierCV(estimator=base_final, method='sigmoid', cv=3)
+    final_estimator = CalibratedClassifierCV(estimator=base_final, method='sigmoid', cv=TimeSeriesSplit(n_splits=3))
     if final_w_tr is not None:
         final_estimator.fit(X_train, y_train, sample_weight=final_w_tr.values if isinstance(final_w_tr, pd.Series) else final_w_tr)
     else:

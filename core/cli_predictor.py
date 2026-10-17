@@ -25,6 +25,7 @@ from market_models.train_gbm_model import compute_gbm_features
 from market_models.train_market import compute_shin_probs, compute_power_probs
 from models.train_nn import SklearnPyTorchWrapper10, PyTorchGatedResNet10, GatedContext, ResidualBlock
 from models.train_draws import HybridDrawsEnsemble
+from models.train_cards_model import build_perspective_features, calc_cards_probabilities_vectorized
 from ingestion.live_odds_feed import LiveOddsFeedFetcher
 from ingestion.lineup_fetcher import LineupImpactFetcher
 from team_mapping import normalize_team_name
@@ -50,8 +51,12 @@ GBM_PATH = os.path.join(MODEL_DIR, 'gbm_model.pkl')
 FUNDAMENTAL_PATH = os.path.join(MODEL_DIR, 'stacker_fundamental_model.pkl')
 FINAL_PATH = os.path.join(MODEL_DIR, 'stacker_final_model.pkl')
 CORNERS_PATH = os.path.join(MODEL_DIR, 'corners_model.pkl')
+CARDS_HOME_PATH = os.path.join(MODEL_DIR, 'cards_home_xgboost_model.pkl')
+CARDS_AWAY_PATH = os.path.join(MODEL_DIR, 'cards_away_xgboost_model.pkl')
 CARDS_PATH = os.path.join(MODEL_DIR, 'cards_total_xgboost_model.pkl')
 
+GBM_DATASET_PATH = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_gbm_features.parquet'))
+REF_DATASET_PATH = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_referees.parquet'))
 DATASET_PATH = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_odds.parquet'))
 FALLBACK_DATASET = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_dataset.parquet'))
 OPTIMIZED_PARAMS_FILE = os.path.abspath(os.path.join(script_dir, '../data/processed/models_best_parameters/optimal_bankroll_params.json'))
@@ -253,11 +258,11 @@ MAX_BET_LIQUIDITY = {             # Límites de liquidez absolutos por competici
 from league_mapping import CANONICAL_LEAGUES, COMPETITION_MAPPING, normalize_league, get_param_by_comp
 
 def calculate_dynamic_alpha(p_model, p_market, alpha_low, alpha_med, alpha_high):
-    """ Función continua (smooth decay) para blending de probabilidades """
-    divergence = abs(p_model - p_market)
+    """ Función continua (smooth decay) para blending de probabilidades basada en divergencia relativa """
+    rel_divergence = abs(p_model - p_market) / max(p_market, 0.05)
     alpha_max = max(alpha_low, alpha_med, alpha_high)
     alpha_min = min(alpha_low, alpha_med, alpha_high)
-    decay = np.exp(-25.0 * (divergence ** 2))
+    decay = np.exp(-6.0 * (rel_divergence ** 2))
     return alpha_min + (alpha_max - alpha_min) * decay
 
 def calculate_market_slippage(odds, stake, liquidity_cap):
@@ -306,8 +311,8 @@ def solve_multi_asset_kelly(ev_vec, odds_vec, prob_vec, corr_matrix, bankroll, m
         liquidity_caps=liquidity_caps
     )
 
-    stakes = [float(s) for s in res['stakes']]
-    pcts = [float(p) for p in res['weights']]
+    stakes = [float(s) if ev_vec[i] > 0.0 else 0.0 for i, s in enumerate(res['stakes'])]
+    pcts = [float(p) if ev_vec[i] > 0.0 else 0.0 for i, p in enumerate(res['weights'])]
     return stakes, pcts
 
 def compute_poisson_market_correlations(poisson_matrix):
@@ -320,11 +325,17 @@ def compute_poisson_market_correlations(poisson_matrix):
     ind_1X = np.fromfunction(lambda i, j: i >= j, (rows, cols)).flatten().astype(float)
     ind_X2 = np.fromfunction(lambda i, j: i <= j, (rows, cols)).flatten().astype(float)
     ind_ou25 = np.fromfunction(lambda i, j: (i + j) > 2, (rows, cols)).flatten().astype(float)
+    ind_ou25_un = np.fromfunction(lambda i, j: (i + j) <= 2, (rows, cols)).flatten().astype(float)
     ind_btts = np.fromfunction(lambda i, j: (i >= 1) & (j >= 1), (rows, cols)).flatten().astype(float)
     ind_corn = np.ones(rows * cols) * 0.5
+    ind_corn_un = np.ones(rows * cols) * 0.5
     ind_card = np.ones(rows * cols) * 0.5
 
-    matrix_ind = np.vstack([ind_win, ind_draw, ind_loss, ind_1X, ind_X2, ind_ou25, ind_btts, ind_corn, ind_card])
+    matrix_ind = np.vstack([
+        ind_win, ind_draw, ind_loss, ind_1X, ind_X2,
+        ind_ou25, ind_ou25_un, ind_btts,
+        ind_corn, ind_corn_un, ind_card
+    ])
     
     mean_vec = matrix_ind @ weights
     dev = matrix_ind - mean_vec[:, None]
@@ -334,6 +345,11 @@ def compute_poisson_market_correlations(poisson_matrix):
     std_vec[std_vec == 0] = 1.0
     corr_matrix = weighted_cov / np.outer(std_vec, std_vec)
     np.fill_diagonal(corr_matrix, 1.0)
+    # Perfect negative correlation between complementary pairs
+    corr_matrix[5, 6] = -0.99
+    corr_matrix[6, 5] = -0.99
+    corr_matrix[8, 9] = -0.99
+    corr_matrix[9, 8] = -0.99
     return np.clip(corr_matrix, -1.0, 1.0)
 
 def export_trade_signals(res, filepath='trade_signals.json'):
@@ -360,17 +376,11 @@ def export_trade_signals(res, filepath='trade_signals.json'):
     return filepath
 
 def load_data():
-    if os.path.exists(DATASET_PATH):
-        path = DATASET_PATH
-    elif os.path.exists(FALLBACK_DATASET):
-        path = FALLBACK_DATASET
-    else:
-        path = os.path.abspath(os.path.join(script_dir, '../data/processed/matches_with_gbm_features.parquet'))
-        
-    if not os.path.exists(path):
-        console.print(f"[red]Error: Dataset no encontrado en {path}[/red]")
-        return None
-    return pd.read_parquet(path)
+    for candidate_path in [GBM_DATASET_PATH, REF_DATASET_PATH, DATASET_PATH, FALLBACK_DATASET]:
+        if os.path.exists(candidate_path):
+            return pd.read_parquet(candidate_path, engine='fastparquet')
+    console.print(f"[red]Error: Dataset no encontrado en {DATASET_PATH}[/red]")
+    return None
 
 def load_all_models():
     models_dict = {}
@@ -399,7 +409,15 @@ def load_all_models():
     models_dict['fundamental'] = joblib.load(FUNDAMENTAL_PATH)
     models_dict['final'] = joblib.load(FINAL_PATH)
     models_dict['corners'] = joblib.load(CORNERS_PATH) if os.path.exists(CORNERS_PATH) else None
-    models_dict['cards'] = joblib.load(CARDS_PATH) if os.path.exists(CARDS_PATH) else None
+    if os.path.exists(CARDS_HOME_PATH) and os.path.exists(CARDS_AWAY_PATH):
+        models_dict['cards'] = {
+            'home': joblib.load(CARDS_HOME_PATH),
+            'away': joblib.load(CARDS_AWAY_PATH)
+        }
+    elif os.path.exists(CARDS_PATH):
+        models_dict['cards'] = joblib.load(CARDS_PATH)
+    else:
+        models_dict['cards'] = None
 
     return models_dict
 
@@ -469,42 +487,47 @@ def get_latest_team_row(df, team_name, as_of_date=None):
     return None
 
 def compute_meta_features_live(df_base, open_odds_win, open_odds_draw, open_odds_loss, comp_id=0):
+    df_base = df_base.fillna(0.0)
     meta = pd.DataFrame(index=df_base.index)
     cols_loss = [c for c in df_base.columns if 'loss' in c.lower()]
     cols_draw = [c for c in df_base.columns if 'draw' in c.lower()]
     cols_win = [c for c in df_base.columns if 'win' in c.lower()]
     
-    meta['meta_std_loss'] = df_base[cols_loss].std(axis=1).fillna(0) if cols_loss else 0
-    meta['meta_std_draw'] = df_base[cols_draw].std(axis=1).fillna(0) if cols_draw else 0
-    meta['meta_std_win'] = df_base[cols_win].std(axis=1).fillna(0) if cols_win else 0
+    meta['meta_std_loss'] = df_base[cols_loss].std(axis=1).fillna(0.0) if cols_loss else 0.0
+    meta['meta_std_draw'] = df_base[cols_draw].std(axis=1).fillna(0.0) if cols_draw else 0.0
+    meta['meta_std_win'] = df_base[cols_win].std(axis=1).fillna(0.0) if cols_win else 0.0
     
-    mean_loss = df_base[cols_loss].mean(axis=1) if cols_loss else 0
-    mean_draw = df_base[cols_draw].mean(axis=1) if cols_draw else 0
-    mean_win = df_base[cols_win].mean(axis=1) if cols_win else 1
+    mean_loss = df_base[cols_loss].mean(axis=1) if cols_loss else 0.0
+    mean_draw = df_base[cols_draw].mean(axis=1) if cols_draw else 0.0
+    mean_win = df_base[cols_win].mean(axis=1) if cols_win else 1.0
     
     sums = mean_loss + mean_draw + mean_win
-    mean_loss = mean_loss / np.where(sums > 0, sums, 1)
-    mean_draw = mean_draw / np.where(sums > 0, sums, 1)
-    mean_win = mean_win / np.where(sums > 0, sums, 1)
+    mean_loss = mean_loss / np.where(sums > 0, sums, 1.0)
+    mean_draw = mean_draw / np.where(sums > 0, sums, 1.0)
+    mean_win = mean_win / np.where(sums > 0, sums, 1.0)
     
-    mean_probs = pd.DataFrame({'loss': mean_loss, 'draw': mean_draw, 'win': mean_win})
-    meta['meta_entropy'] = mean_probs.apply(lambda row: entropy([row['loss'] + 1e-9, row['draw'] + 1e-9, row['win'] + 1e-9]), axis=1)
+    mean_probs = pd.DataFrame({'loss': mean_loss, 'draw': mean_draw, 'win': mean_win}).fillna(1.0 / 3.0)
+    meta['meta_entropy'] = mean_probs.apply(lambda row: entropy([max(row['loss'], 1e-9), max(row['draw'], 1e-9), max(row['win'], 1e-9)]), axis=1)
     
-    meta['implied_open_loss'] = 1.0 / max(open_odds_loss, 1.01)
-    meta['implied_open_draw'] = 1.0 / max(open_odds_draw, 1.01)
-    meta['implied_open_win'] = 1.0 / max(open_odds_win, 1.01)
+    ow = float(open_odds_win) if pd.notna(open_odds_win) and open_odds_win > 1.01 else 2.50
+    od = float(open_odds_draw) if pd.notna(open_odds_draw) and open_odds_draw > 1.01 else 3.20
+    ol = float(open_odds_loss) if pd.notna(open_odds_loss) and open_odds_loss > 1.01 else 2.80
+    meta['implied_open_loss'] = 1.0 / max(ol, 1.01)
+    meta['implied_open_draw'] = 1.0 / max(od, 1.01)
+    meta['implied_open_win'] = 1.0 / max(ow, 1.01)
     meta['meta_competition_id'] = comp_id
     meta['competition_id'] = comp_id
     
-    return pd.concat([df_base, meta], axis=1)
+    return pd.concat([df_base, meta], axis=1).fillna(0.0)
 
 def predict_corners_live(corners_data, home_row, away_row):
     """
     Calcula los córneres esperados con perspectiva dual (Home + Away)
-    y la probabilidad calibrada de Over 9.5 mediante Binomial Negativa / Poisson + Isotonic Regression.
+    y la probabilidad calibrada de Over/Under 9.5 mediante Binomial Negativa / Poisson + Isotonic Regression.
+    Incorpora imputación dinámica de estadísticas de conteo para ligas donde los córneres crudos no son tabulados.
     """
     if not corners_data or 'model_corners' not in corners_data:
-        return 4.9, 4.9, 9.8, 0.48
+        return 5.2, 4.4, 9.6, 0.51, 0.49
     
     if home_row is None:
         home_row = pd.Series({'team_elo': 1500.0})
@@ -513,46 +536,111 @@ def predict_corners_live(corners_data, home_row, away_row):
 
     feature_cols = corners_data.get('features', [])
     model_corners = corners_data['model_corners']
-    c_disp = float(corners_data.get('c_dispersion', 1.0))
+    c_disp = float(corners_data.get('c_dispersion', 1.15))
     calibrators = corners_data.get('calibrators', {})
-
-    # 1. Perspectiva Local (is_home = 1)
-    df_h = pd.DataFrame(index=[0])
-    for stat in ['crosses', 'possession_pct', 'shots_total', 'corners']:
-        for span in [3, 5]:
-            df_h[f'{stat}_ema{span}'] = float(home_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
-            df_h[f'opp_{stat}_ema{span}'] = float(away_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
-
-    df_h['team_att_rating'] = float(home_row.get('team_att_rating', 0.0) or 0.0)
-    df_h['team_def_rating'] = float(home_row.get('team_def_rating', 0.0) or 0.0)
-    df_h['opp_att_rating'] = float(away_row.get('team_att_rating', 0.0) or 0.0)
-    df_h['opp_def_rating'] = float(away_row.get('team_def_rating', 0.0) or 0.0)
 
     h_elo = float(home_row.get('team_elo', 1500.0) or 1500.0)
     a_elo = float(away_row.get('team_elo', 1500.0) or 1500.0)
-    df_h['elo_diff'] = h_elo - a_elo
+    elo_diff = h_elo - a_elo
+    h_att = float(home_row.get('team_att_rating', 1.0) or 1.0)
+    a_att = float(away_row.get('team_att_rating', 1.0) or 1.0)
+    h_def = float(home_row.get('team_def_rating', 1.0) or 1.0)
+    a_def = float(away_row.get('team_def_rating', 1.0) or 1.0)
+
+    h_factor = np.clip(1.0 + (elo_diff / 800.0) + (h_att - a_def) * 0.15, 0.70, 1.40)
+    a_factor = np.clip(1.0 - (elo_diff / 800.0) + (a_att - h_def) * 0.15, 0.70, 1.40)
+
+    # Imputación dinámica si las estadísticas de evento están en cero en la base de datos (ej. Liga MX)
+    h_corn_val = float(home_row.get('corners_ema3', 0.0) or 0.0)
+    if h_corn_val <= 0.5:
+        h_corn_3 = 5.20 * h_factor
+        h_corn_5 = 5.20 * h_factor
+        h_shots_3 = 13.0 * h_factor
+        h_shots_5 = 13.0 * h_factor
+        h_cross_3 = 16.5 * h_factor
+        h_cross_5 = 16.5 * h_factor
+        h_poss = float(np.clip(0.52 + (elo_diff / 2000.0), 0.38, 0.65))
+    else:
+        h_corn_3 = h_corn_val
+        h_corn_5 = float(home_row.get('corners_ema5', h_corn_val) or h_corn_val)
+        h_shots_3 = float(home_row.get('shots_total_ema3', 12.5) or 12.5)
+        h_shots_5 = float(home_row.get('shots_total_ema5', 12.5) or 12.5)
+        h_cross_3 = float(home_row.get('crosses_ema3', 15.5) or 15.5)
+        h_cross_5 = float(home_row.get('crosses_ema5', 15.5) or 15.5)
+        h_poss = float(home_row.get('possession_pct_ema3', 0.50) or 0.50)
+
+    a_corn_val = float(away_row.get('corners_ema3', 0.0) or 0.0)
+    if a_corn_val <= 0.5:
+        a_corn_3 = 4.40 * a_factor
+        a_corn_5 = 4.40 * a_factor
+        a_shots_3 = 10.5 * a_factor
+        a_shots_5 = 10.5 * a_factor
+        a_cross_3 = 13.5 * a_factor
+        a_cross_5 = 13.5 * a_factor
+        a_poss = 1.0 - h_poss
+    else:
+        a_corn_3 = a_corn_val
+        a_corn_5 = float(away_row.get('corners_ema5', a_corn_val) or a_corn_val)
+        a_shots_3 = float(away_row.get('shots_total_ema3', 10.5) or 10.5)
+        a_shots_5 = float(away_row.get('shots_total_ema5', 10.5) or 10.5)
+        a_cross_3 = float(away_row.get('crosses_ema3', 13.5) or 13.5)
+        a_cross_5 = float(away_row.get('crosses_ema5', 13.5) or 13.5)
+        a_poss = float(away_row.get('possession_pct_ema3', 0.50) or 0.50)
+
+    # 1. Perspectiva Local (is_home = 1)
+    df_h = pd.DataFrame(index=[0])
+    df_h['corners_ema3'] = h_corn_3
+    df_h['corners_ema5'] = h_corn_5
+    df_h['shots_total_ema3'] = h_shots_3
+    df_h['shots_total_ema5'] = h_shots_5
+    df_h['crosses_ema3'] = h_cross_3
+    df_h['crosses_ema5'] = h_cross_5
+    df_h['possession_pct_ema3'] = h_poss
+    df_h['possession_pct_ema5'] = h_poss
+    df_h['opp_corners_ema3'] = a_corn_3
+    df_h['opp_corners_ema5'] = a_corn_5
+    df_h['opp_shots_total_ema3'] = a_shots_3
+    df_h['opp_shots_total_ema5'] = a_shots_5
+    df_h['opp_crosses_ema3'] = a_cross_3
+    df_h['opp_crosses_ema5'] = a_cross_5
+    df_h['opp_possession_pct_ema3'] = a_poss
+    df_h['opp_possession_pct_ema5'] = a_poss
+    df_h['team_att_rating'] = h_att
+    df_h['team_def_rating'] = h_def
+    df_h['opp_att_rating'] = a_att
+    df_h['opp_def_rating'] = a_def
+    df_h['elo_diff'] = elo_diff
     df_h['relative_attack_strength'] = float(home_row.get('relative_attack_strength', 0.0) or 0.0)
     df_h['xg_momentum_macd'] = float(home_row.get('xg_momentum_macd', 0.0) or 0.0)
     df_h['is_home'] = 1
 
     # 2. Perspectiva Visitante (is_home = 0)
     df_a = pd.DataFrame(index=[0])
-    for stat in ['crosses', 'possession_pct', 'shots_total', 'corners']:
-        for span in [3, 5]:
-            df_a[f'{stat}_ema{span}'] = float(away_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
-            df_a[f'opp_{stat}_ema{span}'] = float(home_row.get(f'{stat}_ema{span}', 0.0) or 0.0)
-
-    df_a['team_att_rating'] = float(away_row.get('team_att_rating', 0.0) or 0.0)
-    df_a['team_def_rating'] = float(away_row.get('team_def_rating', 0.0) or 0.0)
-    df_a['opp_att_rating'] = float(home_row.get('team_att_rating', 0.0) or 0.0)
-    df_a['opp_def_rating'] = float(home_row.get('team_def_rating', 0.0) or 0.0)
-
-    df_a['elo_diff'] = -(h_elo - a_elo)
+    df_a['corners_ema3'] = a_corn_3
+    df_a['corners_ema5'] = a_corn_5
+    df_a['shots_total_ema3'] = a_shots_3
+    df_a['shots_total_ema5'] = a_shots_5
+    df_a['crosses_ema3'] = a_cross_3
+    df_a['crosses_ema5'] = a_cross_5
+    df_a['possession_pct_ema3'] = a_poss
+    df_a['possession_pct_ema5'] = a_poss
+    df_a['opp_corners_ema3'] = h_corn_3
+    df_a['opp_corners_ema5'] = h_corn_5
+    df_a['opp_shots_total_ema3'] = h_shots_3
+    df_a['opp_shots_total_ema5'] = h_shots_5
+    df_a['opp_crosses_ema3'] = h_cross_3
+    df_a['opp_crosses_ema5'] = h_cross_5
+    df_a['opp_possession_pct_ema3'] = h_poss
+    df_a['opp_possession_pct_ema5'] = h_poss
+    df_a['team_att_rating'] = a_att
+    df_a['team_def_rating'] = a_def
+    df_a['opp_att_rating'] = h_att
+    df_a['opp_def_rating'] = h_def
+    df_a['elo_diff'] = -elo_diff
     df_a['relative_attack_strength'] = -float(home_row.get('relative_attack_strength', 0.0) or 0.0)
     df_a['xg_momentum_macd'] = -float(home_row.get('xg_momentum_macd', 0.0) or 0.0)
     df_a['is_home'] = 0
 
-    # Llenar cualquier feature faltante
     for f in feature_cols:
         if f not in df_h.columns: df_h[f] = 0.0
         if f not in df_a.columns: df_a[f] = 0.0
@@ -561,11 +649,13 @@ def predict_corners_live(corners_data, home_row, away_row):
         exp_h = float(model_corners.predict(df_h[feature_cols].fillna(0.0))[0])
         exp_a = float(model_corners.predict(df_a[feature_cols].fillna(0.0))[0])
     except Exception:
-        exp_h, exp_a = 4.9, 4.9
+        exp_h, exp_a = 5.20 * h_factor, 4.40 * a_factor
 
-    exp_tot = max(exp_h + exp_a, 0.5)
+    exp_h = float(np.clip(exp_h, 2.5, 9.5))
+    exp_a = float(np.clip(exp_a, 2.0, 8.5))
+    exp_tot = exp_h + exp_a
 
-    # Cálculo estocástico de Over 9.5
+    # Cálculo estocástico de Over 9.5 y Under 9.5
     k = 9
     if c_disp <= 1.02:
         prob_over95_raw = float(1.0 - poisson.cdf(k, exp_tot))
@@ -587,7 +677,8 @@ def predict_corners_live(corners_data, home_row, away_row):
     else:
         prob_over95 = prob_over95_raw
 
-    return exp_h, exp_a, exp_tot, prob_over95
+    prob_under95 = float(1.0 - prob_over95)
+    return exp_h, exp_a, exp_tot, prob_over95, prob_under95
 
 def build_live_match_features(
     df, home_team, away_team, comp, odds_1, odds_X, odds_2,
@@ -605,7 +696,7 @@ def build_live_match_features(
     input_data = {}
     
     for col in home_row.index:
-        if isinstance(home_row[col], (int, float, np.number)):
+        if isinstance(home_row[col], (int, float, np.number)) and not pd.isna(home_row[col]):
             input_data[col] = float(home_row[col])
 
     input_data['is_home'] = 1
@@ -616,24 +707,83 @@ def build_live_match_features(
     comp_categories = pd.factorize(df['competition'])[1]
     input_data['competition_id'] = comp_categories.get_loc(comp) if comp in comp_categories else 0
 
-    input_data['team_elo'] = float(home_row.get('team_elo', 1500))
-    input_data['opp_elo'] = float(away_row.get('team_elo', 1500))
+    # Mapear atributos del rival actual (away_row) en lugar de arrastrar el rival previo de home_row
+    input_data['team_elo'] = float(home_row.get('team_elo', 1500.0) or 1500.0)
+    input_data['opp_elo'] = float(away_row.get('team_elo', 1500.0) or 1500.0)
     input_data['elo_diff'] = input_data['team_elo'] - input_data['opp_elo']
 
-    input_data['team_squad_value'] = float(home_row.get('team_squad_value', 0))
-    input_data['opp_squad_value'] = float(away_row.get('team_squad_value', 0))
+    input_data['team_squad_value'] = float(home_row.get('team_squad_value', 0.0) or 0.0)
+    input_data['opp_squad_value'] = float(away_row.get('team_squad_value', 0.0) or 0.0)
     input_data['squad_value_diff'] = input_data['team_squad_value'] - input_data['opp_squad_value']
 
-    if 'xg_created_ema5' in away_row:
-        input_data['opp_xg_created_ema5'] = float(away_row['xg_created_ema5'])
-    if 'xg_conceded_ema5' in away_row:
-        input_data['opp_xg_conceded_ema5'] = float(away_row['xg_conceded_ema5'])
+    input_data['team_att_rating'] = float(home_row.get('team_att_rating', 1.0) or 1.0)
+    input_data['team_def_rating'] = float(home_row.get('team_def_rating', 1.0) or 1.0)
+    input_data['opp_att_rating'] = float(away_row.get('team_att_rating', 1.0) or 1.0)
+    input_data['opp_def_rating'] = float(away_row.get('team_def_rating', 1.0) or 1.0)
 
-    impl_win = 1.0 / odds_1
-    impl_draw = 1.0 / odds_X
-    impl_loss = 1.0 / odds_2
-    margin = impl_win + impl_draw + impl_loss
+    input_data['rest_days'] = float(home_row.get('rest_days', 4.0) or 4.0)
+    input_data['opp_rest_days'] = float(away_row.get('rest_days', 4.0) or 4.0)
+    input_data['rest_diff'] = input_data['rest_days'] - input_data['opp_rest_days']
 
+    input_data['win_streak_3'] = float(home_row.get('win_streak_3', 0.0) or 0.0)
+    input_data['loss_streak_3'] = float(home_row.get('loss_streak_3', 0.0) or 0.0)
+    input_data['xg_momentum_macd'] = float(home_row.get('xg_momentum_macd', 0.0) or 0.0)
+    input_data['opp_win_streak_3'] = float(away_row.get('win_streak_3', 0.0) or 0.0)
+    input_data['opp_loss_streak_3'] = float(away_row.get('loss_streak_3', 0.0) or 0.0)
+    input_data['opp_xg_momentum_macd'] = float(away_row.get('xg_momentum_macd', 0.0) or 0.0)
+
+    input_data['fatigue_index'] = float(home_row.get('fatigue_index', 0.0) or 0.0)
+    input_data['opp_fatigue_index'] = float(away_row.get('fatigue_index', 0.0) or 0.0)
+    input_data['fatigue_diff'] = input_data['fatigue_index'] - input_data['opp_fatigue_index']
+
+    input_data['xg_volatility_5'] = float(home_row.get('xg_volatility_5', 0.5) or 0.5)
+    input_data['opp_xg_volatility_5'] = float(away_row.get('xg_volatility_5', 0.5) or 0.5)
+    input_data['volatility_diff'] = input_data['xg_volatility_5'] - input_data['opp_xg_volatility_5']
+
+    # Mapear todas las EMAs disponibles del rival actual (away_row -> opp_*_ema*)
+    for col in away_row.index:
+        if (col.endswith('_ema3') or col.endswith('_ema5')) and not col.startswith('opp_'):
+            val = away_row[col]
+            if isinstance(val, (int, float, np.number)) and not pd.isna(val):
+                input_data[f'opp_{col}'] = float(val)
+
+    input_data['relative_attack_strength'] = float(
+        input_data.get('xg_created_ema5', 1.2) - input_data.get('opp_xg_conceded_ema5', 1.2)
+    )
+
+    # Feature Engineering de Contexto (Paridad 1:1 con train_context.py)
+    home_adv = 100.0 if input_data.get('is_home', 1) == 1 else -100.0
+    input_data['elo_prob_win'] = float(1.0 / (1.0 + 10.0 ** (-(input_data['elo_diff'] + home_adv) / 400.0)))
+    input_data['log_squad_ratio'] = float(
+        np.log1p(max(input_data['team_squad_value'], 0.0)) - np.log1p(max(input_data['opp_squad_value'], 0.0))
+    )
+    rest_team = max(input_data['rest_days'], 0.0)
+    rest_opp = max(input_data['opp_rest_days'], 0.0)
+    input_data['recovery_index_team'] = float(1.0 - np.exp(-rest_team / 3.0))
+    input_data['recovery_index_opp'] = float(1.0 - np.exp(-rest_opp / 3.0))
+    input_data['recovery_diff'] = float(input_data['recovery_index_team'] - input_data['recovery_index_opp'])
+    vol = max(input_data['xg_volatility_5'], 0.05)
+    input_data['elo_sharpe_ratio'] = float(input_data['elo_diff'] / (vol + 1e-4))
+    input_data['elo_momentum_interaction'] = float((input_data['elo_prob_win'] - 0.5) * input_data['xg_momentum_macd'])
+
+    # Feature Engineering de Empates (Paridad 1:1 con train_draws.py)
+    lh_draw = max(float(input_data.get('xg_created_ema5', 1.2)), 0.05)
+    la_draw = max(float(input_data.get('opp_xg_created_ema5', 1.2)), 0.05)
+    input_data['poisson_draw_prob'] = float(sum(poisson.pmf(k, lh_draw) * poisson.pmf(k, la_draw) for k in range(10)))
+    input_data['expected_match_xg'] = float(lh_draw + la_draw)
+    input_data['abs_elo_diff'] = float(abs(input_data['elo_diff']))
+
+    comp_draw_rate = 0.26
+    if 'competition' in df.columns and 'outcome' in df.columns:
+        sub_comp = df[df['competition'] == comp]
+        if as_of_date is not None and 'match_date' in sub_comp.columns:
+            sub_comp = sub_comp[sub_comp['match_date'] < as_of_date]
+        if len(sub_comp) > 0:
+            draws_cnt = float((sub_comp['outcome'] == 0).sum())
+            comp_draw_rate = float((draws_cnt + 10.0 * 0.26) / (len(sub_comp) + 10.0))
+    input_data['competition_draw_rate'] = comp_draw_rate
+
+    # Feature Engineering de Mercado y GBM (Paridad 1:1 con train_market.py y train_gbm_model.py)
     open_1 = float(open_odds_win if open_odds_win is not None else odds_1)
     open_X = float(open_odds_draw if open_odds_draw is not None else odds_X)
     open_2 = float(open_odds_loss if open_odds_loss is not None else odds_2)
@@ -641,71 +791,106 @@ def build_live_match_features(
     input_data['open_odds_win'] = open_1
     input_data['open_odds_draw'] = open_X
     input_data['open_odds_loss'] = open_2
-    input_data['odds_win'] = odds_1
-    input_data['odds_draw'] = odds_X
-    input_data['odds_loss'] = odds_2
+    input_data['odds_win'] = float(odds_1)
+    input_data['odds_draw'] = float(odds_X)
+    input_data['odds_loss'] = float(odds_2)
 
-    input_data['open_prob_win'] = (1.0 / max(open_1, 1.01))
-    input_data['open_prob_draw'] = (1.0 / max(open_X, 1.01))
-    input_data['open_prob_loss'] = (1.0 / max(open_2, 1.01))
-    input_data['prob_win_implied'] = impl_win / margin
-    input_data['prob_draw_implied'] = impl_draw / margin
-    input_data['prob_loss_implied'] = impl_loss / margin
-    input_data['vig_open'] = margin - 1.0
-    input_data['vig_close'] = margin - 1.0
+    input_data['implied_prob_draw'] = float(1.0 / max(odds_X, 1.01))
+    input_data['open_implied_prob_draw'] = float(1.0 / max(open_X, 1.01))
+    input_data['odds_match_balance'] = float(abs((1.0 / max(odds_1, 1.01)) - (1.0 / max(odds_2, 1.01))))
 
-    input_data['steam_win'] = float((1.0 / max(odds_1, 1.01)) - (1.0 / max(open_1, 1.01)))
-    input_data['steam_draw'] = float((1.0 / max(odds_X, 1.01)) - (1.0 / max(open_X, 1.01)))
-    input_data['steam_loss'] = float((1.0 / max(odds_2, 1.01)) - (1.0 / max(open_2, 1.01)))
+    sum_implied_o = (1.0 / max(open_1, 1.01)) + (1.0 / max(open_X, 1.01)) + (1.0 / max(open_2, 1.01))
+    input_data['vig_open'] = float(sum_implied_o - 1.0)
+    input_data['open_prob_win'] = float((1.0 / max(open_1, 1.01)) / sum_implied_o)
+    input_data['open_prob_draw'] = float((1.0 / max(open_X, 1.01)) / sum_implied_o)
+    input_data['open_prob_loss'] = float((1.0 / max(open_2, 1.01)) / sum_implied_o)
 
-    sw, sd, sl, sz = compute_shin_probs([odds_1], [odds_X], [odds_2])
+    input_data['prob_win_implied'] = input_data['open_prob_win']
+    input_data['prob_draw_implied'] = input_data['open_prob_draw']
+    input_data['prob_loss_implied'] = input_data['open_prob_loss']
+
+    sw, sd, sl, sz = compute_shin_probs([open_1], [open_X], [open_2])
     input_data['shin_prob_win'] = float(sw[0])
     input_data['shin_prob_draw'] = float(sd[0])
     input_data['shin_prob_loss'] = float(sl[0])
     input_data['shin_z_param'] = float(sz.item() if hasattr(sz, 'item') else sz)
 
-    pw_pow, pd_pow, pl_pow = compute_power_probs([odds_1], [odds_X], [odds_2])
+    pw_pow, pd_pow, pl_pow = compute_power_probs([open_1], [open_X], [open_2])
     input_data['power_prob_win'] = float(pw_pow[0])
     input_data['power_prob_draw'] = float(pd_pow[0])
     input_data['power_prob_loss'] = float(pl_pow[0])
 
-    input_data['log_steam_win'] = float(np.log(max(input_data['prob_win_implied'], 1e-4) / max(input_data['open_prob_win'], 1e-4)))
-    input_data['log_steam_draw'] = float(np.log(max(input_data['prob_draw_implied'], 1e-4) / max(input_data['open_prob_draw'], 1e-4)))
-    input_data['log_steam_loss'] = float(np.log(max(input_data['prob_loss_implied'], 1e-4) / max(input_data['open_prob_loss'], 1e-4)))
-
-    input_data['rel_steam_win'] = float(input_data['steam_win'] / max(input_data['open_prob_win'], 1e-4))
-    input_data['rel_steam_draw'] = float(input_data['steam_draw'] / max(input_data['open_prob_draw'], 1e-4))
-    input_data['rel_steam_loss'] = float(input_data['steam_loss'] / max(input_data['open_prob_loss'], 1e-4))
-
-    p_close = np.array([input_data['prob_win_implied'], input_data['prob_draw_implied'], input_data['prob_loss_implied']])
-    p_open = np.array([input_data['open_prob_win'], input_data['open_prob_draw'], input_data['open_prob_loss']])
-
     input_data['shin_base_prob_win'] = float(sw[0])
     input_data['shin_base_prob_draw'] = float(sd[0])
     input_data['shin_base_prob_loss'] = float(sl[0])
-    input_data['shin_insider_close'] = float(input_data['shin_z_param'])
     input_data['shin_insider_open'] = float(input_data['shin_z_param'])
-    input_data['shin_insider_drift'] = float(input_data['steam_win'])
-    input_data['gbm_mu_win'] = float(input_data['log_steam_win'])
-    input_data['gbm_mu_draw'] = float(input_data['log_steam_draw'])
-    input_data['gbm_mu_loss'] = float(input_data['log_steam_loss'])
-    input_data['gbm_sigma_win'] = 0.05
-    input_data['gbm_sigma_draw'] = 0.05
-    input_data['gbm_sigma_loss'] = 0.05
-    input_data['gbm_mean_win'] = float(input_data['log_steam_win'])
-    input_data['gbm_mean_draw'] = float(input_data['log_steam_draw'])
-    input_data['gbm_mean_loss'] = float(input_data['log_steam_loss'])
-    input_data['gbm_ewma_mu_win'] = float(input_data['log_steam_win'])
-    input_data['gbm_ewma_mu_draw'] = float(input_data['log_steam_draw'])
-    input_data['gbm_ewma_mu_loss'] = float(input_data['log_steam_loss'])
 
-    input_data['market_entropy'] = float(-np.sum(p_close * np.log(np.maximum(p_close, 1e-9))))
+    p_open = np.array([input_data['open_prob_win'], input_data['open_prob_draw'], input_data['open_prob_loss']])
     input_data['open_market_entropy'] = float(-np.sum(p_open * np.log(np.maximum(p_open, 1e-9))))
-    input_data['entropy_change'] = float(input_data['market_entropy'] - input_data['open_market_entropy'])
-
-    sorted_p = np.sort(p_close)
+    input_data['market_entropy'] = input_data['open_market_entropy']
+    sorted_p = np.sort(p_open)
     input_data['fav_prob_gap'] = float(sorted_p[2] - sorted_p[1])
-    input_data['overround_drop'] = float(input_data['vig_open'] - input_data['vig_close'])
+
+    # Si las cuotas en vivo difieren de la apertura, medir deriva en vivo; si no, usar deriva histórica (t-1) del equipo
+    has_live_movement = (abs(odds_1 - open_1) > 1e-4 or abs(odds_X - open_X) > 1e-4 or abs(odds_2 - open_2) > 1e-4)
+    if has_live_movement:
+        sum_implied_c = (1.0 / max(odds_1, 1.01)) + (1.0 / max(odds_X, 1.01)) + (1.0 / max(odds_2, 1.01))
+        close_prob_w = (1.0 / max(odds_1, 1.01)) / sum_implied_c
+        close_prob_d = (1.0 / max(odds_X, 1.01)) / sum_implied_c
+        close_prob_l = (1.0 / max(odds_2, 1.01)) / sum_implied_c
+        input_data['vig_close'] = float(sum_implied_c - 1.0)
+        input_data['overround_drop'] = float(input_data['vig_open'] - input_data['vig_close'])
+        input_data['steam_win'] = float(close_prob_w - input_data['open_prob_win'])
+        input_data['steam_draw'] = float(close_prob_d - input_data['open_prob_draw'])
+        input_data['steam_loss'] = float(close_prob_l - input_data['open_prob_loss'])
+        input_data['log_steam_win'] = float(np.log(max(close_prob_w, 1e-4) / max(input_data['open_prob_win'], 1e-4)))
+        input_data['log_steam_draw'] = float(np.log(max(close_prob_d, 1e-4) / max(input_data['open_prob_draw'], 1e-4)))
+        input_data['log_steam_loss'] = float(np.log(max(close_prob_l, 1e-4) / max(input_data['open_prob_loss'], 1e-4)))
+        input_data['rel_steam_win'] = float(input_data['steam_win'] / max(input_data['open_prob_win'], 1e-4))
+        input_data['rel_steam_draw'] = float(input_data['steam_draw'] / max(input_data['open_prob_draw'], 1e-4))
+        input_data['rel_steam_loss'] = float(input_data['steam_loss'] / max(input_data['open_prob_loss'], 1e-4))
+        p_close = np.array([close_prob_w, close_prob_d, close_prob_l])
+        close_entropy = float(-np.sum(p_close * np.log(np.maximum(p_close, 1e-9))))
+        input_data['entropy_change'] = float(close_entropy - input_data['open_market_entropy'])
+    else:
+        # Deriva histórica (t-1) desde home_row (sin contaminar ni sobreescribir con 0.0 las columnas gbm_* precalculadas)
+        prev_ow = float(home_row.get('open_odds_win', open_1) or open_1)
+        prev_od = float(home_row.get('open_odds_draw', open_X) or open_X)
+        prev_ol = float(home_row.get('open_odds_loss', open_2) or open_2)
+        prev_cw = float(home_row.get('closing_odds_win', prev_ow) or prev_ow)
+        prev_cd = float(home_row.get('closing_odds_draw', prev_od) or prev_od)
+        prev_cl = float(home_row.get('closing_odds_loss', prev_ol) or prev_ol)
+        s_o = (1.0 / max(prev_ow, 1.01)) + (1.0 / max(prev_od, 1.01)) + (1.0 / max(prev_ol, 1.01))
+        s_c = (1.0 / max(prev_cw, 1.01)) + (1.0 / max(prev_cd, 1.01)) + (1.0 / max(prev_cl, 1.01))
+        po_w, po_d, po_l = (1.0 / max(prev_ow, 1.01)) / s_o, (1.0 / max(prev_od, 1.01)) / s_o, (1.0 / max(prev_ol, 1.01)) / s_o
+        pc_w, pc_d, pc_l = (1.0 / max(prev_cw, 1.01)) / s_c, (1.0 / max(prev_cd, 1.01)) / s_c, (1.0 / max(prev_cl, 1.01)) / s_c
+        input_data['vig_close'] = float(s_c - 1.0)
+        input_data['overround_drop'] = float((s_o - 1.0) - (s_c - 1.0))
+        input_data['steam_win'] = float(pc_w - po_w)
+        input_data['steam_draw'] = float(pc_d - po_d)
+        input_data['steam_loss'] = float(pc_l - po_l)
+        input_data['log_steam_win'] = float(np.log(max(pc_w, 1e-4) / max(po_w, 1e-4)))
+        input_data['log_steam_draw'] = float(np.log(max(pc_d, 1e-4) / max(po_d, 1e-4)))
+        input_data['log_steam_loss'] = float(np.log(max(pc_l, 1e-4) / max(po_l, 1e-4)))
+        input_data['rel_steam_win'] = float(input_data['steam_win'] / max(po_w, 1e-4))
+        input_data['rel_steam_draw'] = float(input_data['steam_draw'] / max(po_d, 1e-4))
+        input_data['rel_steam_loss'] = float(input_data['steam_loss'] / max(po_l, 1e-4))
+        po_arr = np.array([po_w, po_d, po_l])
+        pc_arr = np.array([pc_w, pc_d, pc_l])
+        input_data['entropy_change'] = float(
+            (-np.sum(pc_arr * np.log(np.maximum(pc_arr, 1e-9)))) - (-np.sum(po_arr * np.log(np.maximum(po_arr, 1e-9))))
+        )
+
+    # Preservar variables GBM históricas desde home_row si existen; usar defaults sólo si no están presentes
+    input_data.setdefault('shin_insider_close', float(input_data['shin_z_param']))
+    input_data.setdefault('shin_insider_drift', 0.0)
+    for out_k in ['win', 'draw', 'loss']:
+        input_data.setdefault(f'gbm_mu_{out_k}', float(input_data[f'log_steam_{out_k}']))
+        input_data.setdefault(f'gbm_sigma_{out_k}', 0.05)
+        input_data.setdefault(f'gbm_mean_{out_k}', float(input_data[f'log_steam_{out_k}']))
+        input_data.setdefault(f'gbm_ewma_mu_{out_k}', float(input_data[f'log_steam_{out_k}']))
+        input_data.setdefault(f'gbm_ewma_std_{out_k}', 0.05)
+        input_data.setdefault(f'gbm_z_{out_k}', 0.0)
 
     return input_data
 
@@ -750,9 +935,9 @@ def predict_match(
 
     league_kelly = get_param_by_comp(kelly_fractions, comp, 0.015)
     league_ev_thresh = get_param_by_comp(ev_thresholds, comp, 0.015)
-    league_alpha_low = get_param_by_comp(alpha_div_low_dict, comp, 0.85)
-    league_alpha_med = get_param_by_comp(alpha_div_med_dict, comp, 0.70)
-    league_alpha_high = get_param_by_comp(alpha_div_high_dict, comp, 0.50)
+    league_alpha_low = get_param_by_comp(alpha_div_low_dict, comp, 0.35)
+    league_alpha_med = get_param_by_comp(alpha_div_med_dict, comp, 0.25)
+    league_alpha_high = get_param_by_comp(alpha_div_high_dict, comp, 0.15)
 
     input_data = build_live_match_features(
         df, home_team, away_team, comp, odds_1, odds_X, odds_2,
@@ -836,7 +1021,11 @@ def predict_match(
     df_mkt = pd.DataFrame({'prob_loss_mkt': [mkt_probs[0]], 'prob_draw_mkt': [mkt_probs[1]], 'prob_win_mkt': [mkt_probs[2]],
                            'prob_loss_gbm': [gbm_probs[0]], 'prob_draw_gbm': [gbm_probs[1]], 'prob_win_gbm': [gbm_probs[2]]})
     
-    df_final = compute_meta_features_live(pd.concat([df_fund_out, df_mkt], axis=1), odds_1, odds_X, odds_2, input_data['competition_id'])
+    df_final = compute_meta_features_live(
+        pd.concat([df_fund_out, df_mkt], axis=1),
+        input_data['open_odds_win'], input_data['open_odds_draw'], input_data['open_odds_loss'],
+        input_data['competition_id']
+    )
     
     for feat in final_data['features']:
         if feat not in df_final.columns:
@@ -884,18 +1073,36 @@ def predict_match(
     corners_data = models_dict.get('corners')
     home_row_corners = get_latest_team_row(df, home_team, as_of_date=as_of_date)
     away_row_corners = get_latest_team_row(df, away_team, as_of_date=as_of_date)
-    exp_corners_home, exp_corners_away, exp_corners, prob_over95_corners = predict_corners_live(
+    exp_corners_home, exp_corners_away, exp_corners, prob_over95_corners, prob_under95_corners = predict_corners_live(
         corners_data, home_row_corners, away_row_corners
     )
 
-    cards_data = models_dict['cards']
+    cards_data = models_dict.get('cards')
     exp_cards = 4.2
-    if cards_data:
-        try:
-            exp_cards = float(cards_data.predict(df_input_full)[0]) if hasattr(cards_data, 'predict') else 4.2
-        except Exception: pass
-
     prob_over45_cards = float(1.0 - sum(poisson.pmf(k, exp_cards) for k in range(5)))
+    if isinstance(cards_data, dict) and 'home' in cards_data and 'away' in cards_data:
+        try:
+            df_c_h = build_perspective_features(df_input_full, perspective='home')
+            df_c_a = build_perspective_features(df_input_full, perspective='away')
+            req_h = list(getattr(cards_data['home'], 'feature_names_in_', df_c_h.columns))
+            req_a = list(getattr(cards_data['away'], 'feature_names_in_', df_c_a.columns))
+            for col in req_h:
+                if col not in df_c_h.columns: df_c_h[col] = 0.0
+            for col in req_a:
+                if col not in df_c_a.columns: df_c_a[col] = 0.0
+            lam_c_h = float(np.clip(cards_data['home'].predict(df_c_h[req_h])[0], 0.3, 6.5))
+            lam_c_a = float(np.clip(cards_data['away'].predict(df_c_a[req_a])[0], 0.3, 6.5))
+            exp_cards = float(lam_c_h + lam_c_a)
+            c_probs = calc_cards_probabilities_vectorized(np.array([lam_c_h]), np.array([lam_c_a]))
+            prob_over45_cards = float(c_probs['prob_over_4_5_cards'][0])
+        except Exception:
+            pass
+    elif cards_data and hasattr(cards_data, 'predict'):
+        try:
+            exp_cards = float(cards_data.predict(df_input_full)[0])
+            prob_over45_cards = float(1.0 - sum(poisson.pmf(k, exp_cards) for k in range(5)))
+        except Exception:
+            pass
 
     impl_win, impl_draw, impl_loss = 1.0/odds_1, 1.0/odds_X, 1.0/odds_2
     margin = impl_win + impl_draw + impl_loss
@@ -927,29 +1134,38 @@ def predict_match(
     blend_X2 = blend_draw + blend_loss
     ev_X2 = (blend_X2 * net_combined_X2) - 1.0 - EXPECTED_CLV_DROP
 
-    odd_ou25 = float(extra_odds.get('ou25_over', 1.95))
-    ev_ou25 = (prob_over25_goals * (1.0 + (odd_ou25 - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
+    # Mercados secundarios: sólo elegibles para asignación de capital si se proveen cuotas reales en extra_odds
+    xg_tot = float(xg_s + xg_c)
+    p_ov25_base = float(1.0 - poisson.cdf(2, xg_tot))
+    default_odd_ov25 = float(np.clip(1.0 / (max(p_ov25_base, 0.15) * 1.03), 1.30, 3.50))
+    default_odd_un25 = float(np.clip(1.0 / (max(1.0 - p_ov25_base, 0.15) * 1.03), 1.30, 3.50))
 
-    implied_over = 1.0 / max(odd_ou25, 1.01)
-    implied_under_est = max(1.0 - implied_over, 0.05)
-    odd_ou25_under = float(extra_odds.get('ou25_under', 1.0 / implied_under_est))
-    ev_ou25_under = (prob_under25_goals * (1.0 + (odd_ou25_under - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
+    odd_ou25 = float(extra_odds.get('ou25_over', default_odd_ov25))
+    odd_ou25_under = float(extra_odds.get('ou25_under', default_odd_un25))
+    ev_ou25 = ((prob_over25_goals * (1.0 + (odd_ou25 - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP) if 'ou25_over' in extra_odds else -1.0
+    ev_ou25_under = ((prob_under25_goals * (1.0 + (odd_ou25_under - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP) if 'ou25_under' in extra_odds else -1.0
 
-    odd_btts = float(extra_odds.get('btts_yes', 1.85))
-    ev_btts = (prob_btts_yes * (1.0 + (odd_btts - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
+    default_odd_btts = float(np.clip(1.0 / (max(prob_btts_yes, 0.20) * 1.03), 1.40, 2.80))
+    odd_btts = float(extra_odds.get('btts_yes', default_odd_btts))
+    ev_btts = ((prob_btts_yes * (1.0 + (odd_btts - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP) if 'btts_yes' in extra_odds else -1.0
 
-    odd_corners = float(extra_odds.get('corners_over95', 1.85))
-    ev_corners = (prob_over95_corners * (1.0 + (odd_corners - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
+    default_odd_corn_ov = float(np.clip(1.0 / (max(prob_over95_corners, 0.20) * 1.03), 1.40, 2.80))
+    default_odd_corn_un = float(np.clip(1.0 / (max(prob_under95_corners, 0.20) * 1.03), 1.40, 2.80))
+    odd_corners = float(extra_odds.get('corners_over95', default_odd_corn_ov))
+    odd_corners_under = float(extra_odds.get('corners_under95', default_odd_corn_un))
+    ev_corners = ((prob_over95_corners * (1.0 + (odd_corners - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP) if 'corners_over95' in extra_odds else -1.0
+    ev_corners_under = ((prob_under95_corners * (1.0 + (odd_corners_under - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP) if 'corners_under95' in extra_odds else -1.0
 
-    odd_cards = float(extra_odds.get('cards_over45', 1.85))
-    ev_cards = (prob_over45_cards * (1.0 + (odd_cards - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP
+    default_odd_card = float(np.clip(1.0 / (max(prob_over45_cards, 0.20) * 1.03), 1.40, 2.80))
+    odd_cards = float(extra_odds.get('cards_over45', default_odd_card))
+    ev_cards = ((prob_over45_cards * (1.0 + (odd_cards - 1.0) * (1 - TAX_RETENTION_RATE))) - 1.0 - EXPECTED_CLV_DROP) if 'cards_over45' in extra_odds else -1.0
 
     max_liquidity = get_param_by_comp(MAX_BET_LIQUIDITY, comp, 2000.0)
 
     corr_matrix = compute_poisson_market_correlations(poisson_matrix)
-    ev_vector = [ev_win, ev_draw, ev_loss, ev_1X, ev_X2, ev_ou25, ev_btts, ev_corners, ev_cards]
-    odds_vector = [odds_1, odds_X, odds_2, combined_odds_1X, combined_odds_X2, odd_ou25, odd_btts, odd_corners, odd_cards]
-    prob_vector = [blend_win, blend_draw, blend_loss, blend_1X, blend_X2, prob_over25_goals, prob_btts_yes, prob_over95_corners, prob_over45_cards]
+    ev_vector = [ev_win, ev_draw, ev_loss, ev_1X, ev_X2, ev_ou25, ev_ou25_under, ev_btts, ev_corners, ev_corners_under, ev_cards]
+    odds_vector = [odds_1, odds_X, odds_2, combined_odds_1X, combined_odds_X2, odd_ou25, odd_ou25_under, odd_btts, odd_corners, odd_corners_under, odd_cards]
+    prob_vector = [blend_win, blend_draw, blend_loss, blend_1X, blend_X2, prob_over25_goals, prob_under25_goals, prob_btts_yes, prob_over95_corners, prob_under95_corners, prob_over45_cards]
 
     avg_penalty = np.mean([pen_win, pen_draw, pen_loss])
     multi_stakes, multi_pcts = solve_multi_asset_kelly(
@@ -957,8 +1173,8 @@ def predict_match(
         penalty=avg_penalty, max_liquidity=max_liquidity, league_kelly=league_kelly
     )
 
-    s_win, s_draw, s_loss, s_1X, s_X2, s_ou25, s_btts, s_corn, s_cards = multi_stakes
-    p_win_stk, p_draw_stk, p_loss_stk, p_1X_stk, p_X2_stk, p_ou25_stk, p_btts_stk, p_corn_stk, p_cards_stk = multi_pcts
+    s_win, s_draw, s_loss, s_1X, s_X2, s_ou25, s_un25, s_btts, s_corn, s_corn_un, s_cards = multi_stakes
+    p_win_stk, p_draw_stk, p_loss_stk, p_1X_stk, p_X2_stk, p_ou25_stk, p_un25_stk, p_btts_stk, p_corn_stk, p_corn_un_stk, p_cards_stk = multi_pcts
 
     eff_1 = calculate_market_slippage(odds_1, s_win, max_liquidity)
     eff_X = calculate_market_slippage(odds_X, s_draw, max_liquidity)
@@ -976,20 +1192,16 @@ def predict_match(
         ("Doble Oportunidad 1X", ev_1X, s_1X, p_1X_stk, combined_odds_1X, eff_1X, blend_1X),
         ("Doble Oportunidad X2", ev_X2, s_X2, p_X2_stk, combined_odds_X2, eff_X2, blend_X2),
         ("Over 2.5 Goles", ev_ou25, s_ou25, p_ou25_stk, odd_ou25, odd_ou25, prob_over25_goals),
+        ("Under 2.5 Goles", ev_ou25_under, s_un25, p_un25_stk, odd_ou25_under, odd_ou25_under, prob_under25_goals),
         ("BTTS (Ambos Anotan)", ev_btts, s_btts, p_btts_stk, odd_btts, odd_btts, prob_btts_yes),
         ("Over 9.5 Córneres", ev_corners, s_corn, p_corn_stk, odd_corners, odd_corners, prob_over95_corners),
+        ("Under 9.5 Córneres", ev_corners_under, s_corn_un, p_corn_un_stk, odd_corners_under, odd_corners_under, prob_under95_corners),
         ("Over 4.5 Tarjetas", ev_cards, s_cards, p_cards_stk, odd_cards, odd_cards, prob_over45_cards)
     ]
     
-    # Criterio de Selección de Apostado Cuantitativo (Simulador Bankroll)
-    # Si tanto Local como Empate tienen EV+, o Visita y Empate tienen EV+, priorizar Doble Oportunidad / Dutching
-    if ev_win > league_ev_thresh and ev_draw > league_ev_thresh:
-        best_bet = (("Doble Oportunidad 1X", ev_1X, s_1X, p_1X_stk, combined_odds_1X, eff_1X, blend_1X))
-    elif ev_loss > league_ev_thresh and ev_draw > league_ev_thresh:
-        best_bet = (("Doble Oportunidad X2", ev_X2, s_X2, p_X2_stk, combined_odds_X2, eff_X2, blend_X2))
-    else:
-        sorted_bets = sorted(all_bets, key=lambda x: x[1], reverse=True)
-        best_bet = sorted_bets[0]
+    # Criterio de Selección de Apostado Cuantitativo: Ranking uniforme por EV neto esperado
+    sorted_bets = sorted(all_bets, key=lambda x: x[1], reverse=True)
+    best_bet = sorted_bets[0]
 
     return {
         'home_team': home_team, 'away_team': away_team, 'competition': comp,
@@ -1004,17 +1216,28 @@ def predict_match(
         'blend_win': blend_win, 'blend_draw': blend_draw, 'blend_loss': blend_loss,
         'prob_over25_goals': prob_over25_goals, 'prob_under25_goals': prob_under25_goals,
         'prob_btts_yes': prob_btts_yes, 'prob_btts_no': prob_btts_no,
-        'prob_over95_corners': prob_over95_corners, 'prob_over45_cards': prob_over45_cards,
+        'prob_over95_corners': prob_over95_corners, 'prob_under95_corners': prob_under95_corners,
+        'prob_over45_cards': prob_over45_cards,
         'ev_win': ev_win, 'ev_draw': ev_draw, 'ev_loss': ev_loss,
-        'ev_1X': ev_1X, 'ev_X2': ev_X2, 'ev_ou25': ev_ou25, 'ev_ou25_under': ev_ou25_under, 'ev_btts': ev_btts,
-        'odd_ou25_under': odd_ou25_under,
-        'ev_corners': ev_corners, 'ev_cards': ev_cards,
+        'ev_1X': ev_1X, 'ev_X2': ev_X2,
+        'ev_ou25': ev_ou25, 'ev_ou25_under': ev_ou25_under,
+        'ev_btts': ev_btts,
+        'odd_ou25': odd_ou25, 'odd_ou25_under': odd_ou25_under,
+        'odd_btts': odd_btts, 'odd_corners': odd_corners, 'odd_corners_under': odd_corners_under, 'odd_cards': odd_cards,
+        'ev_corners': ev_corners, 'ev_corners_under': ev_corners_under,
+        'ev_cards': ev_cards,
         'stake_win': s_win, 'stake_draw': s_draw, 'stake_loss': s_loss,
-        'stake_1X': s_1X, 'stake_X2': s_X2, 'stake_ou25': s_ou25, 'stake_btts': s_btts,
-        'stake_corners': s_corn, 'stake_cards': s_cards,
+        'stake_1X': s_1X, 'stake_X2': s_X2,
+        'stake_ou25': s_ou25, 'stake_ou25_under': s_un25,
+        'stake_btts': s_btts,
+        'stake_corners': s_corn, 'stake_corners_under': s_corn_un,
+        'stake_cards': s_cards,
         'pct_win': p_win_stk, 'pct_draw': p_draw_stk, 'pct_loss': p_loss_stk,
-        'pct_1X': p_1X_stk, 'pct_X2': p_X2_stk, 'pct_ou25': p_ou25_stk, 'pct_btts': p_btts_stk,
-        'pct_corners': p_corn_stk, 'pct_cards': p_cards_stk,
+        'pct_1X': p_1X_stk, 'pct_X2': p_X2_stk,
+        'pct_ou25': p_ou25_stk, 'pct_ou25_under': p_un25_stk,
+        'pct_btts': p_btts_stk,
+        'pct_corners': p_corn_stk, 'pct_corners_under': p_corn_un_stk,
+        'pct_cards': p_cards_stk,
         'eff_1': eff_1, 'eff_X': eff_X, 'eff_2': eff_2, 'eff_1X': eff_1X, 'eff_X2': eff_X2,
         'league_ev_thresh': league_ev_thresh, 'league_kelly': league_kelly,
         'bayesian_penalty': avg_penalty, 'all_bets': all_bets, 'best_bet': best_bet
@@ -1162,6 +1385,28 @@ def main():
     except (ValueError, TypeError):
         injuries_home, injuries_away, bankroll = 0, 0, 1000.0
 
+    try:
+        custom_props = questionary.confirm(
+            "¿Deseas personalizar las cuotas de Mercados Derivados (Over/Under, BTTS, Córneres, Tarjetas)?",
+            default=False,
+            style=CUSTOM_QUESTIONARY_STYLE
+        ).ask()
+        if custom_props:
+            ou25_in = questionary.text("Cuota Over 2.5 Goles:", default=str(extra_odds.get('ou25_over', '1.95')), style=CUSTOM_QUESTIONARY_STYLE).ask()
+            un25_in = questionary.text("Cuota Under 2.5 Goles:", default=str(extra_odds.get('ou25_under', '1.85')), style=CUSTOM_QUESTIONARY_STYLE).ask()
+            btts_in = questionary.text("Cuota BTTS Ambos Anotan:", default=str(extra_odds.get('btts_yes', '1.85')), style=CUSTOM_QUESTIONARY_STYLE).ask()
+            corn_in = questionary.text("Cuota Over 9.5 Córneres:", default=str(extra_odds.get('corners_over95', '1.85')), style=CUSTOM_QUESTIONARY_STYLE).ask()
+            corn_un_in = questionary.text("Cuota Under 9.5 Córneres:", default=str(extra_odds.get('corners_under95', '1.85')), style=CUSTOM_QUESTIONARY_STYLE).ask()
+            card_in = questionary.text("Cuota Over 4.5 Tarjetas:", default=str(extra_odds.get('cards_over45', '1.85')), style=CUSTOM_QUESTIONARY_STYLE).ask()
+            extra_odds['ou25_over'] = float(ou25_in)
+            extra_odds['ou25_under'] = float(un25_in)
+            extra_odds['btts_yes'] = float(btts_in)
+            extra_odds['corners_over95'] = float(corn_in)
+            extra_odds['corners_under95'] = float(corn_un_in)
+            extra_odds['cards_over45'] = float(card_in)
+    except Exception:
+        pass
+
     res = predict_match(
         home_team, away_team, comp, odds_1, odds_X, odds_2,
         open_odds_win=open_odds_win, open_odds_draw=open_odds_draw, open_odds_loss=open_odds_loss,
@@ -1240,16 +1485,18 @@ def main():
     t2.add_column("Net EV", justify="right")
     t2.add_column("Stake Kelly Multi ($ / %)", justify="right")
 
-    odd_ou25 = float(extra_odds.get('ou25_over', 1.95))
+    odd_ou25 = float(res.get('odd_ou25', 1.95))
     odd_ou25_under = float(res.get('odd_ou25_under', 1.85))
-    odd_btts = float(extra_odds.get('btts_yes', 1.85))
-    odd_corn = float(extra_odds.get('corners_over95', 1.85))
-    odd_card = float(extra_odds.get('cards_over45', 1.85))
+    odd_btts = float(res.get('odd_btts', 1.85))
+    odd_corn = float(res.get('odd_corners', 1.85))
+    odd_corn_un = float(res.get('odd_corners_under', 1.85))
+    odd_card = float(res.get('odd_cards', 1.85))
 
     t2.add_row("Over 2.5 Goles Totales", f"{odd_ou25:.2f}", f"{res['prob_over25_goals']*100:.1f}%", c_ev(res['ev_ou25']), c_stake(res['stake_ou25'], res['pct_ou25']))
-    t2.add_row("Under 2.5 Goles Totales", f"{odd_ou25_under:.2f}", f"{res['prob_under25_goals']*100:.1f}%", c_ev(res['ev_ou25_under']), "$0.00 [dim](0.00%)[/dim]")
+    t2.add_row("Under 2.5 Goles Totales", f"{odd_ou25_under:.2f}", f"{res['prob_under25_goals']*100:.1f}%", c_ev(res['ev_ou25_under']), c_stake(res['stake_ou25_under'], res['pct_ou25_under']))
     t2.add_row("Both Teams to Score (BTTS Yes)", f"{odd_btts:.2f}", f"{res['prob_btts_yes']*100:.1f}%", c_ev(res['ev_btts']), c_stake(res['stake_btts'], res['pct_btts']))
     t2.add_row("Over 9.5 Córneres Totales", f"{odd_corn:.2f}", f"{res['prob_over95_corners']*100:.1f}%", c_ev(res['ev_corners']), c_stake(res['stake_corners'], res['pct_corners']))
+    t2.add_row("Under 9.5 Córneres Totales", f"{odd_corn_un:.2f}", f"{res['prob_under95_corners']*100:.1f}%", c_ev(res['ev_corners_under']), c_stake(res['stake_corners_under'], res['pct_corners_under']))
     t2.add_row("Over 4.5 Tarjetas Totales", f"{odd_card:.2f}", f"{res['prob_over45_cards']*100:.1f}%", c_ev(res['ev_cards']), c_stake(res['stake_cards'], res['pct_cards']))
     console.print(t2)
 

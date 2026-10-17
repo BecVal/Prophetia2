@@ -28,27 +28,25 @@ class PortfolioManager:
         }
         
         # Cargar parámetros óptimos por liga
-        self.kelly_fractions = {'DEFAULT': 0.015}
-        self.ev_thresholds = {'DEFAULT': 0.015}
-        self.alpha_div_low = {'DEFAULT': 0.85}
-        self.alpha_div_med = {'DEFAULT': 0.70}
-        self.alpha_div_high = {'DEFAULT': 0.50}
+        self.kelly_fractions = {'DEFAULT': 0.15}
+        self.ev_thresholds = {'DEFAULT': 0.04}
+        self.alpha_max = {'DEFAULT': 0.45}
+        self.alpha_min = {'DEFAULT': 0.10}
         
-        params_file = os.path.join(core_dir, '..', 'data', 'processed', 'models_best_parameters', 'optimal_bankroll_params.json')  # <-- NUEVA RUTA: models_best_parameters
+        params_file = os.path.join(core_dir, '..', 'data', 'processed', 'models_best_parameters', 'optimal_bankroll_params.json')
         if os.path.exists(params_file):
             try:
                 with open(params_file, 'r') as f:
                     data = json.load(f)
-                    self.kelly_fractions.update(data.get('KELLY_FRACTIONS', {}))
+                    self.kelly_fractions.update(data.get('KELLY_MULTIPLIERS', data.get('KELLY_FRACTIONS', {})))
                     self.ev_thresholds.update(data.get('EV_THRESHOLDS', {}))
-                    self.alpha_div_low.update(data.get('ALPHA_DIV_LOW', {}))
-                    self.alpha_div_med.update(data.get('ALPHA_DIV_MED', {}))
-                    self.alpha_div_high.update(data.get('ALPHA_DIV_HIGH', {}))
+                    self.alpha_max.update(data.get('ALPHA_MAX', {}))
+                    self.alpha_min.update(data.get('ALPHA_MIN', {}))
                 logger.info(f"Parámetros óptimos cargados de {params_file}")
             except Exception as e:
                 logger.error(f"Error leyendo parámetros óptimos: {e}")
 
-    def evaluate_opportunities(self, match_id, competition, probs, poly_prices, pred_clv):
+    def evaluate_opportunities(self, match_id, competition, probs, poly_prices, pred_clv=None):
         """
         Calcula el EV considerando impuestos y CLV drop. 
         Soporta Single Bets y Dutching (1X, X2) adaptado al formato de Polymarket (comprar 2 tokens).
@@ -57,11 +55,12 @@ class PortfolioManager:
         poly_prices: dict {'home': 0.50, 'draw': 0.25, 'away': 0.25}
         pred_clv: dict {'home': 0.012, 'draw': -0.005, 'away': -0.015}
         """
-        league_ev_thresh = self.ev_thresholds.get(competition, self.ev_thresholds.get('DEFAULT', 0.015))
-        league_kelly = self.kelly_fractions.get(competition, self.kelly_fractions.get('DEFAULT', 0.015))
-        league_alpha_low = self.alpha_div_low.get(competition, self.alpha_div_low.get('DEFAULT', 0.85))
-        league_alpha_med = self.alpha_div_med.get(competition, self.alpha_div_med.get('DEFAULT', 0.70))
-        league_alpha_high = self.alpha_div_high.get(competition, self.alpha_div_high.get('DEFAULT', 0.50))
+        if pred_clv is None:
+            pred_clv = {}
+        league_ev_thresh = self.ev_thresholds.get(competition, self.ev_thresholds.get('DEFAULT', 0.04))
+        league_kelly = self.kelly_fractions.get(competition, self.kelly_fractions.get('DEFAULT', 0.15))
+        a_max = self.alpha_max.get(competition, self.alpha_max.get('DEFAULT', 0.45))
+        a_min = self.alpha_min.get(competition, self.alpha_min.get('DEFAULT', 0.10))
         
         # Calcular Net Odds y EV por cada token en Polymarket
         net_odds = {}
@@ -69,9 +68,8 @@ class PortfolioManager:
         
         for outcome in ['home', 'draw', 'away']:
             if outcome in poly_prices and poly_prices[outcome] > 0:
-                # REGLA CLV: Si el CLV esperado es menor a 0.005 (0.5%), rechazamos el trade inmediatamente
-                clv_val = pred_clv.get(outcome, 0)
-                if clv_val < 0.005:
+                clv_val = pred_clv.get(outcome, 0.0)
+                if clv_val < -0.015:
                     logger.debug(f"[{match_id}] {outcome} rechazado por bajo CLV esperado ({clv_val*100:.2f}%)")
                     evs[outcome] = -1.0
                     continue
@@ -82,19 +80,10 @@ class PortfolioManager:
                 # Aplicamos impuesto sobre las ganancias
                 net_odd = 1 + (gross_odd - 1) * (1 - self.tax_retention_rate)
                 
-                # Dynamic Alpha Blending
+                # Dynamic Alpha Blending basado en divergencia relativa
                 prob = probs[f"{outcome}_prob"]
-                divergence = abs(prob - market_prob)
-                if divergence > 0.20:
-                    dynamic_alpha = 0.30
-                elif divergence > 0.15:
-                    dynamic_alpha = 0.50
-                elif divergence > 0.10:
-                    dynamic_alpha = league_alpha_high
-                elif divergence > 0.05:
-                    dynamic_alpha = league_alpha_med
-                else:
-                    dynamic_alpha = league_alpha_low
+                rel_div = abs(prob - market_prob) / max(market_prob, 0.05)
+                dynamic_alpha = a_min + (a_max - a_min) * np.exp(-6.0 * (rel_div ** 2))
                     
                 blended_prob = (dynamic_alpha * prob) + ((1 - dynamic_alpha) * market_prob)
                 
@@ -102,7 +91,6 @@ class PortfolioManager:
                 
                 net_odds[outcome] = net_odd
                 evs[outcome] = ev
-                # Guardamos la blended_prob para cálculos posteriores
                 probs[f"{outcome}_prob"] = blended_prob
             else:
                 evs[outcome] = -1.0

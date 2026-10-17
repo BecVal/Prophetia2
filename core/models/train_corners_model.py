@@ -7,7 +7,7 @@ from xgboost import XGBRegressor
 from scipy.stats import poisson, nbinom
 from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
 from sklearn.isotonic import IsotonicRegression
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import TimeSeriesSplit
 import json
 import optuna
 
@@ -258,11 +258,15 @@ def train_corners():
     splits = list(tscv.split(X_home_train))
     first_train_idx = splits[0][0]
     
-    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} partidos) con GroupKFold(5)...")
-    kf = GroupKFold(n_splits=5)
-    groups_first = match_ids_train.iloc[first_train_idx]
+    logger.info(f"  -> Procesando Primer Fold Inicial ({len(first_train_idx)} partidos) con TimeSeriesSplit(3) causal...")
+    init_tscv = TimeSeriesSplit(n_splits=3)
+    init_splits = list(init_tscv.split(first_train_idx))
     
-    for kf_tr, kf_va in kf.split(first_train_idx, groups=groups_first):
+    burn_indices = first_train_idx[init_splits[0][0]]
+    pred_home_train[burn_indices] = y_home_train.iloc[burn_indices].shift(1).expanding(min_periods=1).mean().fillna(5.2).values
+    pred_away_train[burn_indices] = y_away_train.iloc[burn_indices].shift(1).expanding(min_periods=1).mean().fillna(4.3).values
+    
+    for kf_tr, kf_va in init_splits:
         tr_indices = first_train_idx[kf_tr]
         va_indices = first_train_idx[kf_va]
         
@@ -335,17 +339,25 @@ def train_corners():
         lines=lines
     )
 
-    logger.info("=== CALIBRANDO PROBABILIDADES (ISOTONIC REGRESSION) ===")
+    logger.info("=== CALIBRANDO PROBABILIDADES (ISOTONIC REGRESSION OOF TEMPORAL) ===")
     calibrators = {}
     calibrated_train_probs = {}
     calibrated_test_probs = {}
+    cal_splits = list(TimeSeriesSplit(n_splits=5).split(lambda_total_train))
     
     for line in lines:
         col = f'prob_over_{line}'
         true_over_train = (true_total_train > line).astype(int)
+        raw_tr_p = np.asarray(train_probs_dict[col], dtype=float)
+        oof_cal_p = raw_tr_p.copy()
+        for c_tr, c_va in cal_splits:
+            ir_fold = IsotonicRegression(out_of_bounds='clip')
+            ir_fold.fit(raw_tr_p[c_tr], true_over_train[c_tr])
+            oof_cal_p[c_va] = ir_fold.predict(raw_tr_p[c_va])
+        calibrated_train_probs[col] = oof_cal_p
         
         ir = IsotonicRegression(out_of_bounds='clip')
-        calibrated_train_probs[col] = ir.fit_transform(train_probs_dict[col], true_over_train)
+        ir.fit(raw_tr_p, true_over_train)
         calibrated_test_probs[col] = ir.predict(test_probs_dict[col])
         calibrators[line] = ir
 
