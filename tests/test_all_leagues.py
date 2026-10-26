@@ -11,6 +11,28 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'c
 
 from core.cli_predictor import load_data, load_all_models, predict_match
 from core.league_mapping import CANONICAL_LEAGUES, normalize_league, get_param_by_comp
+from core.models.train_nn import SklearnPyTorchWrapper10, PyTorchGatedResNet10, GatedContext, ResidualBlock
+from core.models.train_draws import HybridDrawsEnsemble
+from core.models.train_stacker import TemperatureScaledClassifier, RegimeGatedMetaStacker
+from core.models.train_shots_on_goal import (
+    DualPerspectiveShotsModel,
+    PerspectiveDistributionalEnsemble,
+    PyTorchMLPRegressor,
+    SklearnPyTorchRegressorWrapper
+)
+import __main__
+__main__.SklearnPyTorchWrapper10 = SklearnPyTorchWrapper10
+__main__.PyTorchGatedResNet10 = PyTorchGatedResNet10
+__main__.GatedContext = GatedContext
+__main__.ResidualBlock = ResidualBlock
+__main__.SklearnPyTorchWrapper = SklearnPyTorchWrapper10
+__main__.HybridDrawsEnsemble = HybridDrawsEnsemble
+__main__.TemperatureScaledClassifier = TemperatureScaledClassifier
+__main__.RegimeGatedMetaStacker = RegimeGatedMetaStacker
+__main__.DualPerspectiveShotsModel = DualPerspectiveShotsModel
+__main__.PerspectiveDistributionalEnsemble = PerspectiveDistributionalEnsemble
+__main__.PyTorchMLPRegressor = PyTorchMLPRegressor
+__main__.SklearnPyTorchRegressorWrapper = SklearnPyTorchRegressorWrapper
 
 # Parámetros institucionales
 TAX_RETENTION_RATE = 0.0075
@@ -84,10 +106,14 @@ def evaluate_league(comp_name, df_all, models_dict, sample_size=100):
         
         if best_ev > league_ev_thresh and best_stake >= 1.0:
             actual_outcome = row.get('outcome')
-            if actual_outcome == -1: actual_outcome = 0
             
             goals_home = row.get('goals_scored', 0)
             goals_away = row.get('goals_conceded', 0)
+            try:
+                goals_home = float(goals_home) if pd.notna(goals_home) else 0.0
+                goals_away = float(goals_away) if pd.notna(goals_away) else 0.0
+            except (TypeError, ValueError):
+                goals_home, goals_away = 0.0, 0.0
             total_goals = goals_home + goals_away
             
             is_win = False
@@ -95,22 +121,25 @@ def evaluate_league(comp_name, df_all, models_dict, sample_size=100):
             
             if best_bet_name.startswith("1 ") or "Local" in best_bet_name:
                 mkt_label = "1 (Local)"
-                if actual_outcome == 2: is_win = True
+                if actual_outcome == 1 or goals_home > goals_away: is_win = True
             elif best_bet_name.startswith("X ") or "Empate" in best_bet_name:
                 mkt_label = "X (Empate)"
-                if actual_outcome == 1: is_win = True
+                if actual_outcome == 0 or goals_home == goals_away: is_win = True
             elif best_bet_name.startswith("2 ") or "Visitante" in best_bet_name:
                 mkt_label = "2 (Visitante)"
-                if actual_outcome in [0, -1]: is_win = True
-            elif "Doble Oportunidad 1X" in best_bet_name:
+                if actual_outcome == -1 or goals_away > goals_home: is_win = True
+            elif "Doble Oportunidad 1X" in best_bet_name or "1X" in best_bet_name:
                 mkt_label = "Doble Oportunidad 1X"
-                if actual_outcome in [1, 2]: is_win = True
-            elif "Doble Oportunidad X2" in best_bet_name:
+                if actual_outcome in [1, 0] or goals_home >= goals_away: is_win = True
+            elif "Doble Oportunidad X2" in best_bet_name or "X2" in best_bet_name:
                 mkt_label = "Doble Oportunidad X2"
-                if actual_outcome in [0, 1, -1]: is_win = True
+                if actual_outcome in [-1, 0] or goals_away >= goals_home: is_win = True
             elif "Over 2.5" in best_bet_name:
                 mkt_label = "Over 2.5 Goles"
                 if total_goals > 2.5: is_win = True
+            elif "Under 2.5" in best_bet_name:
+                mkt_label = "Under 2.5 Goles"
+                if total_goals < 2.5: is_win = True
             elif "BTTS" in best_bet_name:
                 mkt_label = "BTTS"
                 if goals_home > 0 and goals_away > 0: is_win = True

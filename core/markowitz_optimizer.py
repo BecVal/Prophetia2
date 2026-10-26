@@ -28,6 +28,52 @@ class MarkowitzPortfolioOptimizer:
         self.max_daily_portfolio_pct = float(max_daily_portfolio_pct)
 
     @staticmethod
+    def build_bernoulli_correlation_matrix(candidates: List[Dict]) -> np.ndarray:
+        """
+        Construye la matriz de correlación analítica exacta entre activos compuestos
+        de Bernoulli (Singles, Dutching y Parlays de 2 o 3 patas) cuando comparten partidos
+        en la misma jornada:
+            Cov(R_A, R_B) = O_A * O_B * P_A * P_B * (1 / P_{A cap B} - 1)
+            rho_{A,B} = sqrt((P_A * P_B) / ((1 - P_A) * (1 - P_B))) * (1 / P_{A cap B} - 1)
+        """
+        n = len(candidates)
+        corr_matrix = np.eye(n, dtype=np.float64)
+        if n <= 1:
+            return corr_matrix
+
+        for i in range(n):
+            set_a = candidates[i].get('match_indices')
+            if not set_a:
+                continue
+            p_a = float(np.clip(candidates[i].get('prob', 0.5), 1e-4, 1.0 - 1e-4))
+            leg_probs_a = candidates[i].get('leg_probs', {})
+            for j in range(i + 1, n):
+                set_b = candidates[j].get('match_indices')
+                if not set_b:
+                    continue
+                shared = set_a.intersection(set_b)
+                if not shared:
+                    continue
+                p_b = float(np.clip(candidates[j].get('prob', 0.5), 1e-4, 1.0 - 1e-4))
+                leg_probs_b = candidates[j].get('leg_probs', {})
+                p_shared = 1.0
+                for m_idx in shared:
+                    p_m = leg_probs_a.get(m_idx, leg_probs_b.get(m_idx, max(p_a, p_b)))
+                    p_shared *= float(np.clip(p_m, 1e-4, 1.0 - 1e-4))
+                if p_shared < 1.0:
+                    denom = np.sqrt(max((1.0 - p_a) * (1.0 - p_b), 1e-8))
+                    num = np.sqrt(p_a * p_b) * ((1.0 / p_shared) - 1.0)
+                    raw_rho = float(np.clip(num / denom, 0.0, 0.90))
+                    # Ponderación estructural de solapamiento de patas (permite cobertura escalonada Dutching + Parlay)
+                    overlap_cap = 0.70 * (len(shared) / np.sqrt(len(set_a) * len(set_b)))
+                    rho = min(raw_rho, float(overlap_cap))
+                else:
+                    rho = 0.0
+                corr_matrix[i, j] = corr_matrix[j, i] = rho
+
+        return corr_matrix
+
+    @staticmethod
     def compute_asset_covariance(prob_vec: np.ndarray, odds_vec: np.ndarray, corr_matrix: Optional[np.ndarray] = None, shrinkage: float = 0.1) -> np.ndarray:
         """
         Calcula la matriz de covarianza de los retornos de las apuestas.
@@ -94,12 +140,10 @@ class MarkowitzPortfolioOptimizer:
 
         cov_matrix = self.compute_asset_covariance(prob_arr, odds_arr, corr_matrix)
 
-        # Definir límites por activo (Box Constraints)
+        # Definir límites por activo (Box Constraints sin topes arbitrarios contra favoritos/Dutching)
         bounds = []
         for i in range(n):
             upper_bound = self.max_stake_pct
-            if odds_arr[i] < 1.30:
-                upper_bound = min(upper_bound, 0.01)
             if liquidity_caps is not None and bankroll > 0:
                 upper_bound = min(upper_bound, liquidity_caps[i] / bankroll)
             bounds.append((0.0, max(0.0, upper_bound)))

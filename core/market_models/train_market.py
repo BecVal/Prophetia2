@@ -21,8 +21,8 @@ from core.logger_config import get_logger
 # ==============================================================================
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
 # ==============================================================================
-RUN_OPTUNA = False
-OPTUNA_TRIALS = 20
+RUN_OPTUNA = True
+OPTUNA_TRIALS = 30
 # ==============================================================================
 
 OPTUNA_PARAMS_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed/models_best_parameters/optuna_params_market.json'))

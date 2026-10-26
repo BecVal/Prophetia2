@@ -3,6 +3,7 @@ import sys
 import requests
 import pandas as pd
 import numpy as np
+from scipy.stats import poisson
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
@@ -130,7 +131,7 @@ class LiveOddsFeedFetcher:
                 away = normalize_team_name(item.get('away_team', ''))
                 bms = item.get('bookmakers', [])
                 odds_1, odds_X, odds_2 = None, None, None
-                ou25 = 1.95
+                extra_odds = {}
                 for bm in bms:
                     if bm.get('key') == 'pinnacle':
                         for mkt in bm.get('markets', []):
@@ -142,13 +143,15 @@ class LiveOddsFeedFetcher:
                             elif mkt.get('key') == 'totals':
                                 for out in mkt.get('outcomes', []):
                                     if out.get('name') == 'Over' and out.get('point') == 2.5:
-                                        ou25 = float(out.get('price'))
+                                        extra_odds['ou25_over'] = float(out.get('price'))
+                                    elif out.get('name') == 'Under' and out.get('point') == 2.5:
+                                        extra_odds['ou25_under'] = float(out.get('price'))
                 if odds_1 and odds_X and odds_2:
                     matches.append({
                         'home_team': home, 'away_team': away, 'competition': comp,
                         'odds_1': odds_1, 'odds_X': odds_X, 'odds_2': odds_2,
                         'open_odds_win': odds_1, 'open_odds_draw': odds_X, 'open_odds_loss': odds_2,
-                        'extra_odds': {'ou25_over': ou25, 'btts_yes': 1.85, 'corners_over95': 1.85, 'cards_over45': 1.85},
+                        'extra_odds': extra_odds,
                         'date': item.get('commence_time', ''),
                         'source': 'The-Odds-API (Pinnacle)'
                     })
@@ -207,7 +210,7 @@ class LiveOddsFeedFetcher:
 
                     odds_1, odds_X, odds_2 = 2.10, 3.30, 3.40
                     open_1, open_X, open_2 = 2.10, 3.30, 3.40
-                    ou25 = 1.95
+                    extra_odds = {}
 
                     has_live_odds = False
                     odds_list = comp_info.get('odds', [])
@@ -250,16 +253,70 @@ class LiveOddsFeedFetcher:
                                     has_live_odds = True
 
                             tot_dict = o.get('total') or {}
+                            line_val = None
+                            if o.get('overUnder') is not None:
+                                try:
+                                    line_val = float(o.get('overUnder'))
+                                except Exception:
+                                    pass
+                            ov_am, un_am = o.get('overOdds'), o.get('underOdds')
+                            ov_open_am, un_open_am = None, None
+                            open_line_val = None
                             if isinstance(tot_dict, dict):
                                 ov_dict = tot_dict.get('over') or {}
+                                un_dict = tot_dict.get('under') or {}
                                 if isinstance(ov_dict, dict):
-                                    cl_dict = ov_dict.get('close') or {}
-                                    tot = cl_dict.get('line') if isinstance(cl_dict, dict) else None
-                                    if tot:
-                                        try:
-                                            ou25 = float(str(tot).replace('o', ''))
-                                        except Exception:
-                                            pass
+                                    op_ov = ov_dict.get('open') or {}
+                                    if isinstance(op_ov, dict):
+                                        ov_open_am = op_ov.get('odds')
+                                        if op_ov.get('line'):
+                                            try:
+                                                open_line_val = float(str(op_ov.get('line')).lstrip('oOuU'))
+                                            except Exception:
+                                                pass
+                                    cl_ov = ov_dict.get('close') or op_ov or {}
+                                    if isinstance(cl_ov, dict):
+                                        if cl_ov.get('odds') is not None:
+                                            ov_am = cl_ov.get('odds')
+                                        raw_line = cl_ov.get('line')
+                                        if raw_line:
+                                            try:
+                                                line_val = float(str(raw_line).lstrip('oOuU'))
+                                            except Exception:
+                                                pass
+                                if isinstance(un_dict, dict):
+                                    op_un = un_dict.get('open') or {}
+                                    if isinstance(op_un, dict):
+                                        un_open_am = op_un.get('odds')
+                                    cl_un = un_dict.get('close') or op_un or {}
+                                    if isinstance(cl_un, dict) and cl_un.get('odds') is not None:
+                                        un_am = cl_un.get('odds')
+
+                            ov_dec = american_to_decimal(ov_am)
+                            un_dec = american_to_decimal(un_am)
+                            ov_open_dec = american_to_decimal(ov_open_am)
+                            un_open_dec = american_to_decimal(un_open_am)
+                            if ov_dec and ov_dec > 1.02:
+                                line_target = line_val if (line_val and line_val >= 0.5) else 2.5
+                                if abs(line_target - 2.5) < 0.1:
+                                    extra_odds['ou25_over'] = float(np.clip(ov_dec, 1.18, 3.35))
+                                    if un_dec and un_dec > 1.02:
+                                        extra_odds['ou25_under'] = float(np.clip(un_dec, 1.18, 3.35))
+                                elif open_line_val and abs(open_line_val - 2.5) < 0.1 and ov_open_dec and ov_open_dec > 1.02:
+                                    extra_odds['ou25_over'] = float(np.clip(ov_open_dec, 1.18, 3.35))
+                                    if un_open_dec and un_open_dec > 1.02:
+                                        extra_odds['ou25_under'] = float(np.clip(un_open_dec, 1.18, 3.35))
+                                else:
+                                    # Proyectar de la línea publicada (ej. 3.5) a la línea 2.5 vía inversión de Poisson
+                                    vig_tot = (1.0 / ov_dec + 1.0 / un_dec) if (un_dec and un_dec > 1.02) else 1.05
+                                    p_ov_line = np.clip((1.0 / ov_dec) / vig_tot, 0.05, 0.95)
+                                    k_floor = max(int(np.floor(line_target)), 0)
+                                    lams = np.linspace(0.6, 6.0, 541)
+                                    lam_mkt = float(lams[np.argmin(np.abs((1.0 - poisson.cdf(k_floor, lams)) - p_ov_line))])
+                                    p_ov25_mkt = float(np.clip(1.0 - poisson.cdf(2, lam_mkt), 0.08, 0.92))
+                                    p_un25_mkt = 1.0 - p_ov25_mkt
+                                    extra_odds['ou25_over'] = round(float(np.clip(1.0 / (p_ov25_mkt * vig_tot), 1.18, 3.35)), 2)
+                                    extra_odds['ou25_under'] = round(float(np.clip(1.0 / (p_un25_mkt * vig_tot), 1.18, 3.35)), 2)
 
                     date_str = event.get('date', '')
                     matches.append({
@@ -272,7 +329,7 @@ class LiveOddsFeedFetcher:
                         'open_odds_win': open_1,
                         'open_odds_draw': open_X,
                         'open_odds_loss': open_2,
-                        'extra_odds': {'ou25_over': ou25, 'btts_yes': 1.85, 'corners_over95': 1.85, 'cards_over45': 1.85},
+                        'extra_odds': extra_odds,
                         'date': date_str,
                         'has_live_odds': has_live_odds,
                         'source': 'ESPN Live Schedule & Odds' if has_live_odds else 'ESPN Live Schedule (Cuotas Aún No Publicadas)'
@@ -321,8 +378,16 @@ class LiveOddsFeedFetcher:
             open_draw = float(row.get('PSD', row.get('B365D', p_draw)))
             open_loss = float(row.get('PSA', row.get('B365A', p_loss)))
 
-            ou25 = float(row.get('B365>2.5', row.get('Avg>2.5', row.get('Max>2.5', 1.95))))
-            btts = float(row.get('B365BBTS', row.get('AvgBBTS', 1.85)))
+            ou25 = float(row.get('B365>2.5', row.get('Avg>2.5', row.get('Max>2.5', 0.0))))
+            un25 = float(row.get('B365<2.5', row.get('Avg<2.5', row.get('Max<2.5', 0.0))))
+            btts = float(row.get('B365BBTS', row.get('AvgBBTS', 0.0)))
+            extra_odds = {}
+            if ou25 > 1.02:
+                extra_odds['ou25_over'] = ou25
+            if un25 > 1.02:
+                extra_odds['ou25_under'] = un25
+            if btts > 1.02:
+                extra_odds['btts_yes'] = btts
 
             if p_win > 1.01 and p_draw > 1.01 and p_loss > 1.01:
                 date_str = str(row.get('Date', ''))
@@ -336,7 +401,7 @@ class LiveOddsFeedFetcher:
                     'open_odds_win': open_win,
                     'open_odds_draw': open_draw,
                     'open_odds_loss': open_loss,
-                    'extra_odds': {'ou25_over': ou25 if ou25 > 1.0 else 1.95, 'btts_yes': btts if btts > 1.0 else 1.85, 'corners_over95': 1.85, 'cards_over45': 1.85},
+                    'extra_odds': extra_odds,
                     'date': date_str,
                     'source': 'Football-Data Live Feed'
                 })

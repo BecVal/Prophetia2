@@ -27,7 +27,7 @@ FILTER_BY_WHITELIST = False  # True: ignora partidos fuera de Whitelist en la si
 # USE_LIVE_MODELS = False
 # BENEFICIOS: Usa las predicciones estáticas pre-calculadas (`test_predictions.parquet`).
 # Es ideal para probar cambios en la gestión de capital (Markowitz/Kelly) sobre 20,000+ partidos al instante.
-USE_LIVE_MODELS = False
+USE_LIVE_MODELS = True
 LIVE_MODEL_MATCH_LIMIT = 1000 # Cantidad máxima de partidos a analizar si USE_LIVE_MODELS = True
 
 from core.league_mapping import CANONICAL_LEAGUES, COMPETITION_MAPPING, WHITELIST_LEAGUES, normalize_league, get_param_by_comp
@@ -56,7 +56,7 @@ MAX_BET_LIQUIDITY = {             # Límites de liquidez absolutos por competici
 }
 
 # CONFIGURACIÓN DE OPTIMIZACIÓN
-OPTIMIZATION_MODE = 'NONE'  # 'NONE' para evaluación instantánea, 'ALL' o 'WHITELIST' para optimizar con Optuna
+OPTIMIZATION_MODE = 'False'  # 'NONE' para evaluación instantánea, 'ALL' o 'WHITELIST' para optimizar con Optuna
 OPTUNA_TRIALS = 100
 OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankroll_params.json'
 
@@ -64,9 +64,9 @@ OPTIMIZED_PARAMS_FILE = '../data/processed/models_best_parameters/optimal_bankro
 KELLY_FRACTIONS = {'D2': 0.03, 'I1': 0.01, 'SP1': 0.03, 'F2': 0.02, 'G1': 0.01, 'D1': 0.02, 'T1': 0.03, 'F1': 0.02, 'E1': 0.02, 'N1': 0.01, 'SP2': 0.01, 'P1': 0.01, 'MEX': 0.02, 'DEFAULT': 0.015}
 EV_THRESHOLDS = {'D2': 0.015, 'I1': 0.02, 'SP1': 0.01, 'F2': 0.015, 'G1': 0.02, 'D1': 0.015, 'T1': 0.01, 'F1': 0.015, 'E1': 0.015, 'N1': 0.02, 'SP2': 0.02, 'P1': 0.02, 'MEX': 0.015, 'DEFAULT': 0.015}
 
-ALPHA_DIV_LOW = {'DEFAULT': 0.35}
-ALPHA_DIV_MED = {'DEFAULT': 0.25}
-ALPHA_DIV_HIGH = {'DEFAULT': 0.15}
+ALPHA_DIV_LOW = {'DEFAULT': 0.85}
+ALPHA_DIV_MED = {'DEFAULT': 0.70}
+ALPHA_DIV_HIGH = {'DEFAULT': 0.50}
 
 def load_optimized_params():
     global KELLY_FRACTIONS, EV_THRESHOLDS, ALPHA_DIV_LOW, ALPHA_DIV_MED, ALPHA_DIV_HIGH
@@ -153,6 +153,10 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
     if has_pred_clv:
         pred_clv_vals = df[['pred_clv_loss', 'pred_clv_draw', 'pred_clv_win']].values
 
+    has_meta_std = all(c in df.columns for c in ['meta_std_loss', 'meta_std_draw', 'meta_std_win'])
+    if has_meta_std:
+        meta_std_vals = df[['meta_std_loss', 'meta_std_draw', 'meta_std_win']].values
+
     liquid_bankroll = 1000.0
     bankroll_history = [liquid_bankroll]
     daily_multipliers = []
@@ -176,8 +180,9 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
         start_of_day_bankroll = liquid_bankroll
         day_indices = np.where(dates == current_date)[0]
         candidate_bets = []
+        safe_parlay_pool = []
 
-        # 1. EVALUACIÓN Y SELECCIÓN DE OPORTUNIDADES EV+
+        # 1. EVALUACIÓN Y SELECCIÓN DE OPORTUNIDADES EV+ (SINGLES, DUTCHING Y POOL DE PATAS SEGURAS PARA PARLAYS)
         for i in day_indices:
             comp = competitions[i]
             if not is_in_whitelist(comp):
@@ -197,14 +202,16 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
             margin = sum(market_implied)
             market_probs = [p / margin for p in market_implied]
 
-            a_low = get_param_by_comp(alpha_low_dict, comp, 0.35)
-            a_med = get_param_by_comp(alpha_med_dict, comp, 0.25)
-            a_high = get_param_by_comp(alpha_high_dict, comp, 0.15)
+            a_low = get_param_by_comp(alpha_low_dict, comp, 0.85)
+            a_med = get_param_by_comp(alpha_med_dict, comp, 0.70)
+            a_high = get_param_by_comp(alpha_high_dict, comp, 0.50)
 
             blended_probs = []
             for j in range(3):
                 dyn_alpha = calculate_dynamic_alpha(probs[j], market_probs[j], a_low, a_med, a_high)
                 blended_probs.append((dyn_alpha * probs[j]) + ((1.0 - dyn_alpha) * market_probs[j]))
+            b_sum = max(sum(blended_probs), 1e-6)
+            blended_probs = [p / b_sum for p in blended_probs]
 
             net_odds = [1.0 + (odds[j] - 1.0) * (1.0 - TAX_RETENTION_RATE) for j in range(3)]
             evs = [(blended_probs[j] * net_odds[j]) - 1.0 - EXPECTED_CLV_DROP for j in range(3)]
@@ -215,22 +222,67 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
 
             ev_loss, ev_draw, ev_win = evs[0], evs[1], evs[2]
 
-            # Doble Oportunidad 1X y X2 (Dutching Multi-Mercado Cuantitativo)
-            total_implied_1X = (1.0 / odds[2]) + (1.0 / odds[1])
+            # Doble Oportunidad 1X y X2 (Dutching Multi-Mercado Cuantitativo):
+            # Ponderación exacta de CLV por inversión (q_a, q_b), preservación del posterior calibrado
+            # del Stacker Nivel 2 en eventos de alta certeza (p >= 0.68) y fricción proporcional al beneficio.
+            q_1, q_X, q_2 = 1.0 / odds[2], 1.0 / odds[1], 1.0 / odds[0]
+            total_implied_1X = q_1 + q_X
             combined_odds_1X = 1.0 / total_implied_1X
             net_combined_1X = 1.0 + (combined_odds_1X - 1.0) * (1.0 - TAX_RETENTION_RATE)
-            blend_1X = blended_probs[2] + blended_probs[1]
-            ev_1X = (blend_1X * net_combined_1X) - 1.0 - EXPECTED_CLV_DROP
+            stacker_1X = probs[2] + probs[1]
+            mkt_1X = market_probs[2] + market_probs[1]
+            dutch_alpha_1X = max(a_low, 0.65) if stacker_1X >= 0.68 else a_low
+            blend_1X = (dutch_alpha_1X * stacker_1X) + ((1.0 - dutch_alpha_1X) * mkt_1X)
+            friction_1X = EXPECTED_CLV_DROP * min(combined_odds_1X - 1.0, 0.60)
+            ev_1X = (blend_1X * net_combined_1X) - 1.0 - friction_1X
+            clv_1X = (q_1 * pred_clv[2] + q_X * pred_clv[1]) / total_implied_1X
 
-            total_implied_X2 = (1.0 / odds[0]) + (1.0 / odds[1])
+            total_implied_X2 = q_2 + q_X
             combined_odds_X2 = 1.0 / total_implied_X2
             net_combined_X2 = 1.0 + (combined_odds_X2 - 1.0) * (1.0 - TAX_RETENTION_RATE)
-            blend_X2 = blended_probs[0] + blended_probs[1]
-            ev_X2 = (blend_X2 * net_combined_X2) - 1.0 - EXPECTED_CLV_DROP
+            stacker_X2 = probs[0] + probs[1]
+            mkt_X2 = market_probs[0] + market_probs[1]
+            dutch_alpha_X2 = max(a_low, 0.65) if stacker_X2 >= 0.68 else a_low
+            blend_X2 = (dutch_alpha_X2 * stacker_X2) + ((1.0 - dutch_alpha_X2) * mkt_X2)
+            friction_X2 = EXPECTED_CLV_DROP * min(combined_odds_X2 - 1.0, 0.60)
+            ev_X2 = (blend_X2 * net_combined_X2) - 1.0 - friction_X2
+            clv_X2 = (q_2 * pred_clv[0] + q_X * pred_clv[1]) / total_implied_X2
+
+            # Recolectar patas seguras de alta probabilidad (p >= 0.72, bajo riesgo) para armar Parlays (2 y 3 patas)
+            raw_cands_for_parlay = [
+                ('1 (Local)', probs[2], odds[2], real_outcome == 2, pred_clv[2], 'single', 2, None),
+                ('2 (Visitante)', probs[0], odds[0], real_outcome == 0, pred_clv[0], 'single', 0, None),
+                ('Doble Oportunidad 1X', stacker_1X, combined_odds_1X, real_outcome in [1, 2], clv_1X, 'dutching', 2, 1),
+                ('Doble Oportunidad X2', stacker_X2, combined_odds_X2, real_outcome in [0, 1], clv_X2, 'dutching', 0, 1),
+            ]
+            valid_safe_legs = []
+            for lbl_s, p_s, o_s, win_s, clv_s, bt_s, bc_s, sc_s in raw_cands_for_parlay:
+                net_o_s = 1.0 + (o_s - 1.0) * (1.0 - TAX_RETENTION_RATE)
+                ev_s = (p_s * net_o_s) - 1.0
+                if p_s >= 0.72 and 1.14 <= o_s <= 1.72 and ev_s >= 0.005:
+                    valid_safe_legs.append({
+                        'label': lbl_s,
+                        'prob': p_s,
+                        'raw_odd': o_s,
+                        'net_odd': net_o_s,
+                        'ev': ev_s,
+                        'is_win': win_s,
+                        'clv': clv_s,
+                        'bet_type': bt_s,
+                        'index': i,
+                        'comp': comp,
+                        'kelly_fraction': league_kelly,
+                        'best_choice': bc_s,
+                        'secondary_choice': sc_s,
+                        'odds': odds
+                    })
+            if valid_safe_legs:
+                best_safe_leg = max(valid_safe_legs, key=lambda x: x['prob'])
+                safe_parlay_pool.append(best_safe_leg)
 
             MIN_EXPECTED_CLV = 0.0001
 
-            # Criterio Cuantitativo de Selección: Ranking uniforme por EV esperado neto entre todos los mercados
+            # Criterio Cuantitativo de Selección Intrapartido: Ratio de Sharpe de Bernoulli (EV / sigma_R)
             mkt_candidates = [
                 {
                     'label': '1 (Local)',
@@ -241,7 +293,8 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     'raw_odd': odds[2],
                     'net_odd': net_odds[2],
                     'prob': blended_probs[2],
-                    'is_win': real_outcome == 2
+                    'is_win': real_outcome == 2,
+                    'clv': pred_clv[2]
                 },
                 {
                     'label': 'X (Empate)',
@@ -252,7 +305,8 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     'raw_odd': odds[1],
                     'net_odd': net_odds[1],
                     'prob': blended_probs[1],
-                    'is_win': real_outcome == 1
+                    'is_win': real_outcome == 1,
+                    'clv': pred_clv[1]
                 },
                 {
                     'label': '2 (Visitante)',
@@ -263,7 +317,8 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     'raw_odd': odds[0],
                     'net_odd': net_odds[0],
                     'prob': blended_probs[0],
-                    'is_win': real_outcome == 0
+                    'is_win': real_outcome == 0,
+                    'clv': pred_clv[0]
                 },
                 {
                     'label': 'Doble Oportunidad 1X',
@@ -274,7 +329,8 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     'raw_odd': combined_odds_1X,
                     'net_odd': net_combined_1X,
                     'prob': blend_1X,
-                    'is_win': real_outcome in [1, 2]
+                    'is_win': real_outcome in [1, 2],
+                    'clv': clv_1X
                 },
                 {
                     'label': 'Doble Oportunidad X2',
@@ -285,7 +341,8 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     'raw_odd': combined_odds_X2,
                     'net_odd': net_combined_X2,
                     'prob': blend_X2,
-                    'is_win': real_outcome in [0, 1]
+                    'is_win': real_outcome in [0, 1],
+                    'clv': clv_X2
                 }
             ]
 
@@ -294,25 +351,35 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     cand['best_ev'] = -1.0
                     continue
                 if has_pred_clv:
-                    c_idx = cand['best_choice']
-                    if cand['bet_type'] == 'single':
-                        cand_clv = pred_clv[c_idx]
-                    else:
-                        s_idx = cand['secondary_choice']
-                        cand_clv = 0.5 * (pred_clv[c_idx] + pred_clv[s_idx])
-                    if cand_clv < MIN_EXPECTED_CLV:
+                    min_clv = -0.0010 if cand['bet_type'] == 'dutching' else MIN_EXPECTED_CLV
+                    if cand['clv'] < min_clv:
                         cand['best_ev'] = -1.0
 
             mkt_candidates.sort(
-                key=lambda x: x['best_ev'] / np.sqrt(max(x['net_odd'] - 1.0, 0.20)) if x['best_ev'] > 0 else x['best_ev'],
+                key=lambda x: (x['best_ev'] / (x['net_odd'] * np.sqrt(max(x['prob'] * (1.0 - x['prob']), 0.02)))) if x['best_ev'] > 0 else x['best_ev'],
                 reverse=True
             )
             best_bet = mkt_candidates[0]
+            eff_ev_thresh = league_ev_thresh * 0.85 if best_bet['bet_type'] == 'dutching' else league_ev_thresh
 
-            if best_bet['best_ev'] > league_ev_thresh:
+            if best_bet['best_ev'] > eff_ev_thresh:
+                uncert_mult = 1.0
+                if has_meta_std:
+                    c_idx_u = best_bet['best_choice']
+                    s_idx_u = best_bet['secondary_choice']
+                    std_u = (
+                        meta_std_vals[i, c_idx_u]
+                        if s_idx_u is None
+                        else 0.5 * (meta_std_vals[i, c_idx_u] + meta_std_vals[i, s_idx_u])
+                    )
+                    uncert_mult = float(np.clip(1.0 - (std_u * 2.5), 0.35, 1.0))
+
                 candidate_bets.append({
-                    'kelly_fraction': league_kelly,
+                    'kelly_fraction': league_kelly * uncert_mult,
                     'index': i,
+                    'match_indices': {i},
+                    'leg_probs': {i: best_bet['prob']},
+                    'legs': None,
                     'chosen_label': best_bet['label'],
                     'best_choice': best_bet['best_choice'],
                     'secondary_choice': best_bet['secondary_choice'],
@@ -328,6 +395,68 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
                     'real_outcome': real_outcome,
                     'comp': comp
                 })
+
+        # 1B. CONSTRUCTOR DE MULTIAPUESTAS SEGURAS DE BAJO RIESGO (PARLAYS DE 2 Y 3 PATAS)
+        if len(safe_parlay_pool) >= 2:
+            # Filtro de Estadísticos de Orden: priorizar las selecciones EV+ más seguras del día
+            safe_parlay_pool.sort(key=lambda x: x['prob'], reverse=True)
+            for idx_p in range(0, min(len(safe_parlay_pool) - 1, 4), 2):
+                l1, l2 = safe_parlay_pool[idx_p], safe_parlay_pool[idx_p + 1]
+                comb_raw_odd = l1['raw_odd'] * l2['raw_odd']
+                comb_net_odd = 1.0 + (comb_raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
+                comb_prob = l1['prob'] * l2['prob']
+                comb_ev = (comb_prob * comb_net_odd) - 1.0 - (EXPECTED_CLV_DROP * 0.5)
+                if comb_ev > 0.015:
+                    candidate_bets.append({
+                        'kelly_fraction': 0.5 * (l1['kelly_fraction'] + l2['kelly_fraction']),
+                        'index': l1['index'],
+                        'match_indices': {l1['index'], l2['index']},
+                        'leg_probs': {l1['index']: l1['prob'], l2['index']: l2['prob']},
+                        'legs': [l1, l2],
+                        'chosen_label': f"Parlay 2-Legs ({l1['label']} + {l2['label']})",
+                        'best_choice': l1['best_choice'],
+                        'secondary_choice': l1['secondary_choice'],
+                        'best_ev': comb_ev,
+                        'raw_odd': comb_raw_odd,
+                        'net_odd': comb_net_odd,
+                        'prob': comb_prob,
+                        'bet_type': 'parlay',
+                        'is_win': bool(l1['is_win'] and l2['is_win']),
+                        'odds': l1['odds'],
+                        'probs': None,
+                        'blended_probs': None,
+                        'real_outcome': None,
+                        'comp': l1['comp']
+                    })
+
+            if len(safe_parlay_pool) >= 3:
+                l1, l2, l3 = safe_parlay_pool[0], safe_parlay_pool[1], safe_parlay_pool[2]
+                comb_raw_odd = l1['raw_odd'] * l2['raw_odd'] * l3['raw_odd']
+                comb_net_odd = 1.0 + (comb_raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
+                comb_prob = l1['prob'] * l2['prob'] * l3['prob']
+                comb_ev = (comb_prob * comb_net_odd) - 1.0 - (EXPECTED_CLV_DROP * 0.5)
+                if comb_ev > 0.020:
+                    candidate_bets.append({
+                        'kelly_fraction': (l1['kelly_fraction'] + l2['kelly_fraction'] + l3['kelly_fraction']) / 3.0,
+                        'index': l1['index'],
+                        'match_indices': {l1['index'], l2['index'], l3['index']},
+                        'leg_probs': {l1['index']: l1['prob'], l2['index']: l2['prob'], l3['index']: l3['prob']},
+                        'legs': [l1, l2, l3],
+                        'chosen_label': f"Parlay 3-Legs ({l1['label']} + {l2['label']} + {l3['label']})",
+                        'best_choice': l1['best_choice'],
+                        'secondary_choice': l1['secondary_choice'],
+                        'best_ev': comb_ev,
+                        'raw_odd': comb_raw_odd,
+                        'net_odd': comb_net_odd,
+                        'prob': comb_prob,
+                        'bet_type': 'parlay',
+                        'is_win': bool(l1['is_win'] and l2['is_win'] and l3['is_win']),
+                        'odds': l1['odds'],
+                        'probs': None,
+                        'blended_probs': None,
+                        'real_outcome': None,
+                        'comp': l1['comp']
+                    })
 
         if not candidate_bets:
             bankroll_history.append(liquid_bankroll)
@@ -361,6 +490,8 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
             liquidity_caps.append(max_liquidity)
             bet_metadata.append(bet)
 
+        corr_matrix = MarkowitzPortfolioOptimizer.build_bernoulli_correlation_matrix(bet_metadata)
+
         markowitz = MarkowitzPortfolioOptimizer(
             risk_aversion=2.0,
             max_stake_pct=MAX_STAKE_PCT,
@@ -371,6 +502,7 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
             ev_vec=ev_vec,
             odds_vec=odds_vec,
             prob_vec=prob_vec,
+            corr_matrix=corr_matrix,
             bankroll=start_of_day_bankroll,
             uncertainty_penalties=penalties,
             liquidity_caps=liquidity_caps
@@ -426,25 +558,60 @@ def run_bankroll_engine(df, custom_ev_thresholds=None, custom_kelly_fractions=No
 
             true_clv = np.nan
             if has_closing_odds:
-                idx = bet['index']
-                c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
-                has_distinct_close = (
-                    not np.isnan([c_loss, c_draw, c_win]).any()
-                    and min(c_loss, c_draw, c_win) > 1.01
-                    and (abs(c_loss - odds[0]) > 1e-4 or abs(c_draw - odds[1]) > 1e-4 or abs(c_win - odds[2]) > 1e-4)
-                )
-                if has_distinct_close:
-                    c_margin = (1/c_loss) + (1/c_draw) + (1/c_win)
-                    fair_closing_odds = [1 / ((1/c_loss)/c_margin), 1 / ((1/c_draw)/c_margin), 1 / ((1/c_win)/c_margin)]
-                    if bet_type == 'single':
-                        true_clv = (eff_odds / fair_closing_odds[best_choice]) - 1.0
-                    else:
-                        fair_prob_1 = (1/c_win) / c_margin if best_choice == 2 else (1/c_loss) / c_margin
-                        fair_prob_X = (1/c_draw) / c_margin
-                        fair_c_combined = 1.0 / (fair_prob_1 + fair_prob_X)
-                        true_clv = (eff_odds / fair_c_combined) - 1.0
-                    clv_list.append(true_clv)
-                    league_stats[comp]['clv_list'].append(true_clv)
+                slippage_factor = eff_odds / max(raw_odd, 1.001)
+                if bet_type == 'parlay' and bet.get('legs'):
+                    clv_ratio_prod = 1.0
+                    valid_parlay_clv = True
+                    for leg in bet['legs']:
+                        l_idx = leg['index']
+                        l_odds = leg['odds']
+                        c_loss_l, c_draw_l, c_win_l = c_odds_loss[l_idx], c_odds_draw[l_idx], c_odds_win[l_idx]
+                        has_dist_l = (
+                            not np.isnan([c_loss_l, c_draw_l, c_win_l]).any()
+                            and min(c_loss_l, c_draw_l, c_win_l) > 1.01
+                            and (abs(c_loss_l - l_odds[0]) > 1e-4 or abs(c_draw_l - l_odds[1]) > 1e-4 or abs(c_win_l - l_odds[2]) > 1e-4)
+                        )
+                        if not has_dist_l:
+                            valid_parlay_clv = False
+                            break
+                        o_marg_l = (1.0 / l_odds[0]) + (1.0 / l_odds[1]) + (1.0 / l_odds[2])
+                        c_marg_l = (1.0 / c_loss_l) + (1.0 / c_draw_l) + (1.0 / c_win_l)
+                        c_arr_l = [c_loss_l, c_draw_l, c_win_l]
+                        if leg['bet_type'] == 'single':
+                            bc_l = leg['best_choice']
+                            p_open_fair_l = (1.0 / l_odds[bc_l]) / o_marg_l
+                            p_close_fair_l = (1.0 / c_arr_l[bc_l]) / c_marg_l
+                        else:
+                            bc_l = leg['best_choice']
+                            p_open_fair_l = ((1.0 / l_odds[bc_l]) + (1.0 / l_odds[1])) / o_marg_l
+                            p_close_fair_l = ((1.0 / c_arr_l[bc_l]) + (1.0 / c_arr_l[1])) / c_marg_l
+                        clv_ratio_prod *= (p_close_fair_l / max(p_open_fair_l, 1e-6))
+                    if valid_parlay_clv:
+                        true_clv = (slippage_factor * clv_ratio_prod) - 1.0
+                        clv_list.append(true_clv)
+                        league_stats[comp]['clv_list'].append(true_clv)
+                else:
+                    idx = bet['index']
+                    bet_odds = bet['odds']
+                    c_loss, c_draw, c_win = c_odds_loss[idx], c_odds_draw[idx], c_odds_win[idx]
+                    has_distinct_close = (
+                        not np.isnan([c_loss, c_draw, c_win]).any()
+                        and min(c_loss, c_draw, c_win) > 1.01
+                        and (abs(c_loss - bet_odds[0]) > 1e-4 or abs(c_draw - bet_odds[1]) > 1e-4 or abs(c_win - bet_odds[2]) > 1e-4)
+                    )
+                    if has_distinct_close:
+                        o_margin = (1.0 / bet_odds[0]) + (1.0 / bet_odds[1]) + (1.0 / bet_odds[2])
+                        c_margin = (1.0 / c_loss) + (1.0 / c_draw) + (1.0 / c_win)
+                        c_arr = [c_loss, c_draw, c_win]
+                        if bet_type == 'single':
+                            fair_closing_odds = [1.0 / ((1.0 / c_loss) / c_margin), 1.0 / ((1.0 / c_draw) / c_margin), 1.0 / ((1.0 / c_win) / c_margin)]
+                            true_clv = (eff_odds / fair_closing_odds[best_choice]) - 1.0
+                        else:
+                            p_open_fair = ((1.0 / bet_odds[best_choice]) + (1.0 / bet_odds[1])) / o_margin
+                            p_close_fair = ((1.0 / c_arr[best_choice]) + (1.0 / c_arr[1])) / c_margin
+                            true_clv = (slippage_factor * (p_close_fair / max(p_open_fair, 1e-6))) - 1.0
+                        clv_list.append(true_clv)
+                        league_stats[comp]['clv_list'].append(true_clv)
 
             league_stats[comp]['bets'] += 1
             league_stats[comp]['staked'] += stake
@@ -544,11 +711,11 @@ def optimize_league(df, league_name):
         return None
 
     def objective(trial):
-        ev_thresh = trial.suggest_float('ev_thresh', 0.010, 0.045)
-        kelly_fraction = trial.suggest_float('kelly_fraction', 0.005, 0.030)
-        alpha_low = trial.suggest_float('alpha_low', 0.15, 0.55)
-        alpha_med = trial.suggest_float('alpha_med', 0.10, alpha_low)
-        alpha_high = trial.suggest_float('alpha_high', 0.05, alpha_med)
+        ev_thresh = trial.suggest_float('ev_thresh', 0.010, 0.030)
+        kelly_fraction = trial.suggest_float('kelly_fraction', 0.010, 0.030)
+        alpha_low = trial.suggest_float('alpha_low', 0.65, 0.90)
+        alpha_med = trial.suggest_float('alpha_med', 0.50, alpha_low)
+        alpha_high = trial.suggest_float('alpha_high', 0.35, alpha_med)
 
         roi, mdd, bets_placed, real_yield, x_yield = evaluate_league_params(
             df_league, ev_thresh, kelly_fraction, alpha_low, alpha_med, alpha_high
@@ -677,164 +844,311 @@ def run_simulation():
         placed_bets_history = []
         historical_peak = liquid_bankroll
         historical_mdd = 0.0
-        current_date = None
-        start_of_day_bankroll = initial_bankroll
+        if 'match_date_dt' not in eval_df.columns:
+            eval_df['match_date_dt'] = pd.to_datetime(eval_df['match_date'], errors='coerce')
 
-        for idx, row in eval_df.iterrows():
-            home_team = row['team']
-            away_team = row['opponent']
-            comp = row['competition']
-            match_date = row.get('match_date')
-            
-            odds_1 = row.get('open_odds_win')
-            if pd.isna(odds_1) or odds_1 <= 1.01:
-                odds_1 = float(row.get('odds_win', 0.0))
-                
-            odds_X = row.get('open_odds_draw')
-            if pd.isna(odds_X) or odds_X <= 1.01:
-                odds_X = float(row.get('odds_draw', 0.0))
-                
-            odds_2 = row.get('open_odds_loss')
-            if pd.isna(odds_2) or odds_2 <= 1.01:
-                odds_2 = float(row.get('odds_loss', 0.0))
-                
-            if pd.isna(odds_1) or pd.isna(odds_X) or pd.isna(odds_2) or odds_1 <= 1.01 or odds_X <= 1.01 or odds_2 <= 1.01:
-                continue
+        for date_val, day_group in eval_df.groupby('match_date_dt'):
+            if liquid_bankroll < 1.0:
+                break
+            start_of_day_bankroll = liquid_bankroll
+            daily_bets = []
+            safe_parlay_legs = []
 
-            open_w = row.get('open_odds_win')
-            open_d = row.get('open_odds_draw')
-            open_l = row.get('open_odds_loss')
-            if pd.isna(open_w) or open_w <= 1.01: open_w = odds_1
-            if pd.isna(open_d) or open_d <= 1.01: open_d = odds_X
-            if pd.isna(open_l) or open_l <= 1.01: open_l = odds_2
+            for idx, row in day_group.iterrows():
+                home_team = row['team']
+                away_team = row['opponent']
+                comp = row['competition']
+                match_date = row.get('match_date')
 
-            res_pred = predict_match(
-                home_team, away_team, comp, odds_1, odds_X, odds_2,
-                open_odds_win=open_w, open_odds_draw=open_d, open_odds_loss=open_l,
-                bankroll=liquid_bankroll, df=cli_df, models_dict=models_dict,
-                as_of_date=match_date
-            )
+                odds_1 = row.get('open_odds_win')
+                if pd.isna(odds_1) or odds_1 <= 1.01:
+                    odds_1 = float(row.get('odds_win', 0.0))
 
-            if res_pred is None or 'best_bet' not in res_pred:
-                continue
+                odds_X = row.get('open_odds_draw')
+                if pd.isna(odds_X) or odds_X <= 1.01:
+                    odds_X = float(row.get('odds_draw', 0.0))
 
-            best_bet_name, best_ev, best_stake, best_pct, best_raw_odd, best_eff_odd, blend_prob = res_pred['best_bet']
-            league_ev_thresh = res_pred.get('league_ev_thresh', get_param_by_comp(EV_THRESHOLDS, comp, 0.015))
+                odds_2 = row.get('open_odds_loss')
+                if pd.isna(odds_2) or odds_2 <= 1.01:
+                    odds_2 = float(row.get('odds_loss', 0.0))
 
-            if best_ev > league_ev_thresh and best_stake >= 1.0:
+                if pd.isna(odds_1) or pd.isna(odds_X) or pd.isna(odds_2) or odds_1 <= 1.01 or odds_X <= 1.01 or odds_2 <= 1.01:
+                    continue
+
+                open_w = row.get('open_odds_win')
+                open_d = row.get('open_odds_draw')
+                open_l = row.get('open_odds_loss')
+                if pd.isna(open_w) or open_w <= 1.01: open_w = odds_1
+                if pd.isna(open_d) or open_d <= 1.01: open_d = odds_X
+                if pd.isna(open_l) or open_l <= 1.01: open_l = odds_2
+
+                res_pred = predict_match(
+                    home_team, away_team, comp, odds_1, odds_X, odds_2,
+                    open_odds_win=open_w, open_odds_draw=open_d, open_odds_loss=open_l,
+                    bankroll=liquid_bankroll, df=cli_df, models_dict=models_dict,
+                    as_of_date=match_date
+                )
+
+                if res_pred is None or 'best_bet' not in res_pred:
+                    continue
+
                 actual_outcome = row.get('outcome')
                 goals_home = row.get('goals_scored', 0)
                 goals_away = row.get('goals_conceded', 0)
                 total_goals = (goals_home or 0) + (goals_away or 0)
 
-                is_win = False
-                mkt_cat = best_bet_name
+                best_bet_name, best_ev, best_stake, best_pct, best_raw_odd, best_eff_odd, blend_prob = res_pred['best_bet']
+                league_ev_thresh = res_pred.get('league_ev_thresh', get_param_by_comp(EV_THRESHOLDS, comp, 0.015))
+                league_kelly = get_param_by_comp(KELLY_FRACTIONS, comp, 0.05)
 
-                # Resolución cuantitativa estricta según codificación {-1: Loss, 0: Draw, 1: Win}
-                if best_bet_name.startswith("1 ") or "Local" in best_bet_name:
-                    mkt_cat = "1 (Local)"
-                    if actual_outcome == 1: is_win = True
-                elif best_bet_name.startswith("X ") or "Empate" in best_bet_name:
-                    mkt_cat = "X (Empate)"
-                    if actual_outcome == 0: is_win = True
-                elif best_bet_name.startswith("2 ") or "Visitante" in best_bet_name:
-                    mkt_cat = "2 (Visitante)"
-                    if actual_outcome == -1: is_win = True
-                elif "Doble Oportunidad 1X" in best_bet_name:
-                    mkt_cat = "Doble Oportunidad 1X"
-                    if actual_outcome in [1, 0]: is_win = True
-                elif "Doble Oportunidad X2" in best_bet_name:
-                    mkt_cat = "Doble Oportunidad X2"
-                    if actual_outcome in [-1, 0]: is_win = True
-                elif "Over 2.5" in best_bet_name:
-                    mkt_cat = "Over 2.5 Goles"
-                    if total_goals > 2.5: is_win = True
-                elif "BTTS" in best_bet_name:
-                    mkt_cat = "BTTS (Ambos Anotan)"
-                    if (goals_home or 0) > 0 and (goals_away or 0) > 0: is_win = True
+                if best_ev > league_ev_thresh and best_stake >= 1.0:
+                    is_win = False
+                    b_type = 'single'
+                    mkt_code = '1'
+                    if best_bet_name.startswith("1 ") or "Local" in best_bet_name:
+                        mkt_code = '1'
+                        if actual_outcome == 1: is_win = True
+                    elif best_bet_name.startswith("X ") or "Empate" in best_bet_name:
+                        mkt_code = 'X'
+                        if actual_outcome == 0: is_win = True
+                    elif best_bet_name.startswith("2 ") or "Visitante" in best_bet_name:
+                        mkt_code = '2'
+                        if actual_outcome == -1: is_win = True
+                    elif "Doble Oportunidad 1X" in best_bet_name:
+                        b_type = 'dutching'
+                        mkt_code = '1X'
+                        if actual_outcome in [1, 0]: is_win = True
+                    elif "Doble Oportunidad X2" in best_bet_name:
+                        b_type = 'dutching'
+                        mkt_code = 'X2'
+                        if actual_outcome in [-1, 0]: is_win = True
+                    elif "Over 2.5" in best_bet_name:
+                        mkt_code = 'O25'
+                        if total_goals > 2.5: is_win = True
+                    elif "BTTS" in best_bet_name:
+                        mkt_code = 'BTTS'
+                        if (goals_home or 0) > 0 and (goals_away or 0) > 0: is_win = True
 
-                stake = min(best_stake, liquid_bankroll * MAX_STAKE_PCT)
+                    daily_bets.append({
+                        'row': row,
+                        'comp': comp,
+                        'chosen_idx': mkt_code,
+                        'chosen_label': best_bet_name,
+                        'ev': float(best_ev),
+                        'prob': float(blend_prob),
+                        'odds': float(best_eff_odd),
+                        'kelly_fraction': min(float(best_pct), MAX_STAKE_PCT),
+                        'league_kelly': league_kelly,
+                        'is_win': is_win,
+                        'bet_type': b_type,
+                        'match_indices': {idx},
+                        'leg_probs': {idx: float(blend_prob)}
+                    })
+
+                s_leg = res_pred.get('safe_parlay_leg')
+                if s_leg is not None:
+                    leg_lbl = str(s_leg.get('label', ''))
+                    leg_win = False
+                    if "1X" in leg_lbl:
+                        leg_win = (actual_outcome in [1, 0])
+                    elif "X2" in leg_lbl:
+                        leg_win = (actual_outcome in [-1, 0])
+                    elif leg_lbl.startswith("1"):
+                        leg_win = (actual_outcome == 1)
+                    elif leg_lbl.startswith("2"):
+                        leg_win = (actual_outcome == -1)
+
+                    leg_odd = float(s_leg.get('raw_odd', s_leg.get('odds', 1.40)))
+                    leg_prob = float(s_leg.get('prob', 0.72))
+                    leg_ev = float(s_leg.get('ev', 0.01))
+                    leg_net_b = max((leg_odd - 1.0) * (1.0 - TAX_RETENTION_RATE), 1e-4)
+                    leg_sharpe = leg_ev / (leg_net_b * np.sqrt(max(leg_prob * (1.0 - leg_prob), 1e-4)))
+
+                    safe_parlay_legs.append({
+                        'match_id': idx,
+                        'comp': comp,
+                        'label': leg_lbl,
+                        'prob': leg_prob,
+                        'odds': leg_odd,
+                        'ev': leg_ev,
+                        'sharpe': float(leg_sharpe),
+                        'league_kelly': league_kelly,
+                        'league_ev_thresh': league_ev_thresh,
+                        'is_win': leg_win,
+                        'row': row
+                    })
+
+            if len(safe_parlay_legs) >= 2:
+                safe_parlay_legs.sort(key=lambda x: x['prob'], reverse=True)
+                top_legs = safe_parlay_legs[:6]
+                parlay_candidates = []
+
+                for leg_a, leg_b in itertools.combinations(top_legs, 2):
+                    if leg_a['match_id'] == leg_b['match_id']:
+                        continue
+                    comb_prob = leg_a['prob'] * leg_b['prob']
+                    comb_odds = leg_a['odds'] * leg_b['odds']
+                    if comb_odds > 3.40 or comb_prob < 0.50:
+                        continue
+                    net_b = (comb_odds - 1.0) * (1.0 - TAX_RETENTION_RATE)
+                    comb_ev = (comb_prob * (1.0 + net_b)) - 1.0 - (EXPECTED_CLV_DROP * 0.5)
+                    if comb_ev > 0.015 and net_b > 0:
+                        b_std = np.sqrt(max(comb_prob * (1.0 - comb_prob), 1e-6)) * net_b
+                        c_sharpe = comb_ev / max(b_std, 1e-6)
+                        f_star = max(0.0, (comb_prob * (net_b + 1.0) - 1.0) / net_b)
+                        avg_lk = 0.5 * (leg_a['league_kelly'] + leg_b['league_kelly'])
+                        k_frac = min(f_star * avg_lk, MAX_STAKE_PCT)
+                        if k_frac > 0.001:
+                            parlay_candidates.append({
+                                'row': leg_a['row'],
+                                'parlay_rows': [(leg_a['row'], leg_a['label']), (leg_b['row'], leg_b['label'])],
+                                'comp': leg_a['comp'] if leg_a['comp'] == leg_b['comp'] else f"{leg_a['comp']} (Parlay Mix)",
+                                'chosen_idx': 'PARLAY_2',
+                                'chosen_label': f"Parlay 2-Leg ({leg_a['label']} + {leg_b['label']})",
+                                'ev': float(comb_ev),
+                                'prob': float(comb_prob),
+                                'odds': float(comb_odds),
+                                'kelly_fraction': float(k_frac),
+                                'league_kelly': avg_lk,
+                                'is_win': bool(leg_a['is_win'] and leg_b['is_win']),
+                                'bet_type': 'parlay',
+                                'match_indices': {leg_a['match_id'], leg_b['match_id']},
+                                'leg_probs': {leg_a['match_id']: leg_a['prob'], leg_b['match_id']: leg_b['prob']},
+                                'sharpe': float(c_sharpe)
+                            })
+
+                if len(top_legs) >= 3:
+                    for leg_a, leg_b, leg_c in itertools.combinations(top_legs[:4], 3):
+                        if len({leg_a['match_id'], leg_b['match_id'], leg_c['match_id']}) < 3:
+                            continue
+                        comb_prob = leg_a['prob'] * leg_b['prob'] * leg_c['prob']
+                        comb_odds = leg_a['odds'] * leg_b['odds'] * leg_c['odds']
+                        if comb_odds > 4.20 or comb_prob < 0.45:
+                            continue
+                        net_b = (comb_odds - 1.0) * (1.0 - TAX_RETENTION_RATE)
+                        comb_ev = (comb_prob * (1.0 + net_b)) - 1.0 - (EXPECTED_CLV_DROP * 0.5)
+                        if comb_ev > 0.020 and net_b > 0:
+                            b_std = np.sqrt(max(comb_prob * (1.0 - comb_prob), 1e-6)) * net_b
+                            c_sharpe = comb_ev / max(b_std, 1e-6)
+                            f_star = max(0.0, (comb_prob * (net_b + 1.0) - 1.0) / net_b)
+                            avg_lk = (leg_a['league_kelly'] + leg_b['league_kelly'] + leg_c['league_kelly']) / 3.0
+                            k_frac = min(f_star * avg_lk, MAX_STAKE_PCT)
+                            if k_frac > 0.001:
+                                parlay_candidates.append({
+                                    'row': leg_a['row'],
+                                    'parlay_rows': [(leg_a['row'], leg_a['label']), (leg_b['row'], leg_b['label']), (leg_c['row'], leg_c['label'])],
+                                    'comp': leg_a['comp'] if (leg_a['comp'] == leg_b['comp'] == leg_c['comp']) else f"{leg_a['comp']} (Parlay Mix)",
+                                    'chosen_idx': 'PARLAY_3',
+                                    'chosen_label': f"Parlay 3-Leg ({leg_a['label']}+{leg_b['label']}+{leg_c['label']})",
+                                    'ev': float(comb_ev),
+                                    'prob': float(comb_prob),
+                                    'odds': float(comb_odds),
+                                    'kelly_fraction': float(k_frac),
+                                    'league_kelly': avg_lk,
+                                    'is_win': bool(leg_a['is_win'] and leg_b['is_win'] and leg_c['is_win']),
+                                    'bet_type': 'parlay',
+                                    'match_indices': {leg_a['match_id'], leg_b['match_id'], leg_c['match_id']},
+                                    'leg_probs': {leg_a['match_id']: leg_a['prob'], leg_b['match_id']: leg_b['prob'], leg_c['match_id']: leg_c['prob']},
+                                    'sharpe': float(c_sharpe)
+                                })
+
+                if parlay_candidates:
+                    parlay_candidates.sort(key=lambda x: x['sharpe'], reverse=True)
+                    daily_bets.extend(parlay_candidates[:3])
+
+            if not daily_bets:
+                continue
+
+            if len(daily_bets) > 1 and MarkowitzPortfolioOptimizer is not None:
+                mkw = MarkowitzPortfolioOptimizer(
+                    risk_aversion=2.0,
+                    max_stake_pct=MAX_STAKE_PCT,
+                    max_daily_portfolio_pct=MAX_DAILY_PORTFOLIO_PCT
+                )
+                evs_arr = [b['ev'] for b in daily_bets]
+                odds_arr = [b['odds'] for b in daily_bets]
+                probs_arr = [b['prob'] for b in daily_bets]
+                penalties_arr = [b['league_kelly'] / 0.015 for b in daily_bets]
+                corr_mat = MarkowitzPortfolioOptimizer.build_bernoulli_correlation_matrix(daily_bets)
+                m_res = mkw.optimize_mean_variance(
+                    ev_vec=evs_arr,
+                    odds_vec=odds_arr,
+                    prob_vec=probs_arr,
+                    corr_matrix=corr_mat,
+                    bankroll=start_of_day_bankroll,
+                    uncertainty_penalties=penalties_arr
+                )
+                opt_weights = m_res['weights']
+                for idx_b, b in enumerate(daily_bets):
+                    b['final_weight'] = float(opt_weights[idx_b]) if idx_b < len(opt_weights) else 0.0
+            else:
+                total_kelly_day = sum(b['kelly_fraction'] for b in daily_bets)
+                scale_factor = (0.15 / total_kelly_day) if total_kelly_day > 0.15 else 1.0
+                for b in daily_bets:
+                    b['final_weight'] = b['kelly_fraction'] * scale_factor
+
+            day_net_profit = 0.0
+            for bet in daily_bets:
+                stake = start_of_day_bankroll * bet['final_weight']
+                if stake < 1.0:
+                    continue
                 if liquid_bankroll - stake < 0:
                     stake = liquid_bankroll
-                    if stake <= 0: break
+                    if stake <= 0:
+                        break
 
-                match_date_str = str(row.get('match_date', ''))
-                match_day = match_date_str.split(' ')[0] if match_date_str else None
-                if current_date is None:
-                    current_date = match_day
-                elif match_day != current_date and match_day is not None:
-                    if start_of_day_bankroll > 0:
-                        daily_multipliers.append(liquid_bankroll / start_of_day_bankroll)
-                    start_of_day_bankroll = liquid_bankroll
-                    current_date = match_day
+                row = bet['row']
+                comp = bet['comp']
+                bet_odds = float(bet['odds'])
 
-                net_odd = 1.0 + (best_raw_odd - 1.0) * (1.0 - TAX_RETENTION_RATE)
-                liquid_bankroll -= stake
                 total_staked += stake
                 bets_placed += 1
-                total_expected_profit += (stake * best_ev)
-                avg_odds_list.append(best_eff_odd)
+                total_expected_profit += (stake * bet['ev'])
+                avg_odds_list.append(bet_odds)
 
                 if comp not in league_stats:
                     league_stats[comp] = {'bets': 0, 'won': 0, 'staked': 0.0, 'profit': 0.0, 'clv_list': []}
-
                 league_stats[comp]['bets'] += 1
                 league_stats[comp]['staked'] += stake
 
-                if is_win:
-                    gross_profit = stake * (best_eff_odd - 1.0)
+                if bet['is_win']:
+                    gross_profit = stake * (bet_odds - 1.0)
                     net_profit = gross_profit * (1.0 - TAX_RETENTION_RATE)
-                    liquid_bankroll += stake + net_profit
+                    day_net_profit += net_profit
                     bets_won += 1
                     league_stats[comp]['profit'] += net_profit
                     league_stats[comp]['won'] += 1
                     gross_profit_sum += net_profit
-                    net_profit_record = net_profit
                 else:
-                    net_profit_record = -stake
+                    day_net_profit -= stake
+                    net_profit = -stake
                     league_stats[comp]['profit'] -= stake
                     gross_loss_sum += stake
-
-                # Calcular CLV real sólo si existen cuotas de cierre distintas de las de apertura
-                live_clv = np.nan
-                c_w = row.get('closing_odds_win')
-                c_d = row.get('closing_odds_draw')
-                c_l = row.get('closing_odds_loss')
-                if pd.notna(c_w) and pd.notna(c_d) and pd.notna(c_l) and min(c_w, c_d, c_l) > 1.01:
-                    if abs(c_w - odds_1) > 1e-4 or abs(c_d - odds_X) > 1e-4 or abs(c_l - odds_2) > 1e-4:
-                        c_margin = (1.0 / c_w) + (1.0 / c_d) + (1.0 / c_l)
-                        if mkt_cat == "1 (Local)":
-                            live_clv = (best_eff_odd / (c_w * c_margin)) - 1.0
-                        elif mkt_cat == "X (Empate)":
-                            live_clv = (best_eff_odd / (c_d * c_margin)) - 1.0
-                        elif mkt_cat == "2 (Visitante)":
-                            live_clv = (best_eff_odd / (c_l * c_margin)) - 1.0
-                        if not np.isnan(live_clv):
-                            clv_list.append(live_clv)
-                            league_stats[comp]['clv_list'].append(live_clv)
 
                 placed_bets_history.append({
                     'date': str(row.get('match_date', '')),
                     'comp': comp,
-                    'bet_type': mkt_cat,
-                    'chosen_label': best_bet_name,
-                    'ev': best_ev,
-                    'prob': blend_prob,
-                    'odds': best_eff_odd,
+                    'bet_type': bet.get('bet_type', 'single'),
+                    'chosen_label': bet['chosen_label'],
+                    'ev': bet['ev'],
+                    'prob': bet['prob'],
+                    'odds': bet_odds,
                     'stake': stake,
-                    'stake_pct': stake / initial_bankroll,
-                    'is_win': int(is_win),
-                    'net_profit': net_profit_record,
-                    'clv': live_clv
+                    'stake_pct': bet['final_weight'],
+                    'is_win': int(bet['is_win']),
+                    'net_profit': net_profit,
+                    'clv': np.nan
                 })
 
-                bankroll_history.append(liquid_bankroll)
-                if liquid_bankroll > historical_peak: historical_peak = liquid_bankroll
-                c_dd = (historical_peak - liquid_bankroll) / historical_peak if historical_peak > 0 else 0
-                if c_dd > historical_mdd: historical_mdd = c_dd
-
-        if start_of_day_bankroll > 0:
-            daily_multipliers.append(liquid_bankroll / start_of_day_bankroll)
+            liquid_bankroll += day_net_profit
+            bankroll_history.append(liquid_bankroll)
+            if start_of_day_bankroll > 0:
+                daily_multipliers.append(liquid_bankroll / start_of_day_bankroll)
+            if liquid_bankroll > historical_peak:
+                historical_peak = liquid_bankroll
+            c_dd = (historical_peak - liquid_bankroll) / historical_peak if historical_peak > 0 else 0
+            if c_dd > historical_mdd:
+                historical_mdd = c_dd
 
         total_analyzed_matches = sample_size
         res = {
@@ -924,6 +1238,24 @@ def run_simulation():
     logger.info(f"Profit Factor: {profit_factor:.2f} | ROI del Capital Inicial: {roi_pct:.2f}%")
     logger.info(f"Maximum Drawdown Histórico Real: {historical_mdd*100:.2f}%")
     logger.info(f"Ratio de Sharpe Anualizado: {sharpe_ratio:.2f} | Ratio de Sortino: {sortino_ratio:.2f}")
+
+    if placed_bets_history:
+        logger.info("=== DESGLOSE POR ESTRATEGIA DE PORTAFOLIO (SINGLES / DUTCHING / PARLAYS SEGUROS) ===")
+        df_strat = pd.DataFrame(placed_bets_history)
+        strat_map = {
+            'single': 'Single Bet (1X2)',
+            'dutching': 'Dutching (1X / X2)',
+            'parlay': 'Parlay Multi-Bet (2-3 Legs)'
+        }
+        for b_key, b_label in strat_map.items():
+            g_s = df_strat[df_strat['bet_type'] == b_key]
+            if len(g_s) > 0:
+                s_wr = g_s['is_win'].mean() * 100.0
+                s_staked = g_s['stake'].sum()
+                s_profit = g_s['net_profit'].sum()
+                s_yield = (s_profit / s_staked * 100.0) if s_staked > 0 else 0.0
+                s_odd = g_s['odds'].mean()
+                logger.info(f"Estrategia {b_label:28s}: {len(g_s):4d} apuestas | WinRate: {s_wr:5.1f}% | Cuota Media: {s_odd:4.2f} | Turnover: ${s_staked:9.2f} | Profit: ${s_profit:8.2f} | Yield: {s_yield:+6.2f}%")
 
     df_source = cli_df if cli_df is not None else (df if 'df' in locals() else None)
     if df_source is not None and 'closing_odds_win' in df_source.columns:
@@ -1328,7 +1660,12 @@ def run_simulation():
         # 7. BET TYPES & STRATEGIES REPORT (CSV + PNG)
         try:
             type_records = []
-            for b_type in ['single', 'dutching']:
+            label_map = {
+                'single': 'Single Bet (1X2)',
+                'dutching': 'Dutching (1X / X2)',
+                'parlay': 'Parlay Multi-Bet (2-3 Legs)'
+            }
+            for b_type, label_name in label_map.items():
                 group = df_bets[df_bets['bet_type'] == b_type]
                 cnt = len(group)
                 if cnt > 0:
@@ -1340,7 +1677,6 @@ def run_simulation():
                 else:
                     w_rate, staked, profit, yield_val, avg_clv_val = 0.0, 0.0, 0.0, 0.0, 0.0
 
-                label_name = 'Single Bet (1X2)' if b_type == 'single' else 'Dutching (1X / X2)'
                 type_records.append({
                     'bet_type': label_name,
                     'bets_placed': cnt,
@@ -1356,15 +1692,18 @@ def run_simulation():
             type_df.to_csv(type_csv_path, index=False)
             logger.info(f"Datos de tipos de apuesta exportados en: {type_csv_path}")
 
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-            ax1.bar(type_df['bet_type'], type_df['net_profit_usd'], color=['#1f77b4', '#ff7f0e'], alpha=0.8)
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            colors_bt = ['#1f77b4', '#ff7f0e', '#2ca02c']
+            ax1.bar(type_df['bet_type'], type_df['net_profit_usd'], color=colors_bt, alpha=0.85)
             ax1.set_title('Net Profit ($) by Bet Type', fontsize=11, fontweight='bold')
             ax1.set_ylabel('Net Profit ($)')
+            ax1.tick_params(axis='x', rotation=12)
             ax1.grid(True, alpha=0.3)
 
-            ax2.bar(type_df['bet_type'], type_df['yield_pct'], color=['#1f77b4', '#ff7f0e'], alpha=0.8)
+            ax2.bar(type_df['bet_type'], type_df['yield_pct'], color=colors_bt, alpha=0.85)
             ax2.set_title('Yield (%) by Bet Type', fontsize=11, fontweight='bold')
             ax2.set_ylabel('Yield (%)')
+            ax2.tick_params(axis='x', rotation=12)
             ax2.grid(True, alpha=0.3)
 
             plt.tight_layout()

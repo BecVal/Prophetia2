@@ -21,7 +21,7 @@ logger = get_logger(__name__, 'train_cards_model')
 # ==============================================================================
 # CONFIGURACIÓN DE OPTIMIZACIÓN (OPTUNA)
 # ==============================================================================
-RUN_OPTUNA = False  # Usa los parámetros óptimos ya encontrados o True para re-optimizar
+RUN_OPTUNA = True  # Usa los parámetros óptimos ya encontrados o True para re-optimizar
 OPTUNA_TRIALS = 100
 # ==============================================================================
 
